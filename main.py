@@ -75,7 +75,7 @@ def run_bot():
     products = read_products("products.csv")
     for product in products:
         post_to_channel(product)
-        time.sleep(1200)
+        time.sleep(60)  # 1 minute
 
 if __name__ == "__main__":
     run_bot()
