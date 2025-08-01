@@ -8,8 +8,7 @@ from urllib.parse import quote
 
 # Token and chat/channel setup
 BOT_TOKEN = "8371104768:AAE8GYjVBeF0H4fqOur9tMLe4_D4laCBRsk"
-CHANNEL_ID = "@nisayon121"
-"  # Use @username format for bot API
+CHANNEL_ID = "@nisayon121"  # Use @username format for bot API
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -76,7 +75,7 @@ def run_bot():
     products = read_products("products.csv")
     for product in products:
         post_to_channel(product)
-        time.sleep(1200)  # 20 minutes
+        time.sleep(1200)
 
 if __name__ == "__main__":
     run_bot()
