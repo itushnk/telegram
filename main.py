@@ -45,14 +45,14 @@ def format_post(product):
 
 {coupon_text}
 
-להזמנה מהירה לחצו כאן👉 {buy_link}
-
 מספר פריט: {item_id}
-להצטרפות לערוץ לחצו עליי👉 https://t.me/+LlMY8B9soOdhNmZk
 
 👇🛍הזמינו עכשיו🛍👇
 {buy_link}
+להצטרפות לערוץ לחצו עליי👈🏻 https://t.me/+LlMY8B9soOdhNmZk
+
 """
+
     return post, image_url
 
 def read_products(file_path):
