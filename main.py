@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 # Token and chat/channel setup
 BOT_TOKEN = "8371104768:AAE8GYjVBeF0H4fqOur9tMLe4_D4laCBRsk"
-CHANNEL_ID = "CHANNEL_ID = "@nisayon121"
+CHANNEL_ID = "@nisayon121"
 "  # Use @username format for bot API
 
 bot = telebot.TeleBot(BOT_TOKEN)
