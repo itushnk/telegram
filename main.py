@@ -45,10 +45,10 @@ def format_post(product):
 
 {coupon_text}
 
-להזמנה מהירה לחצו כאן👉 {buy_link}
+להזמנה מהירה לחצו כאן👉 [לחצו כאן]({buy_link})
 
 מספר פריט: {item_id}
-להצטרפות לערוץ לחצו עליי👉 https://t.me/+LlMY8B9soOdhNmZk
+להצטרפות לערוץ לחצו עליי👉 [לחצו כאן](https://t.me/+LlMY8B9soOdhNmZk)
 
 👇🛍הזמינו עכשיו🛍👇
 {buy_link}
@@ -72,7 +72,7 @@ def post_to_channel(product):
         print(f"Failed to post: {e}")
 
 def run_bot():
-    products = read_products("posts_ready_final_hebrew_format.csv")
+    products = read_products("posts_ready_hebrew_openings.csv")
     for product in products:
         post_to_channel(product)
         time.sleep(60)
