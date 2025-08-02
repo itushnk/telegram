@@ -12,24 +12,24 @@ CHANNEL_ID = "@nisayon121"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 def format_post(product):
-    item_id = product['ItemId']
-    image_url = product['ImageURL']
-    title = product['Title']
-    original_price = product['OriginalPrice']
-    sale_price = product['SalePrice']
-    discount = product['Discount']
-    rating = product['Rating']
-    orders = product['Orders']
-    buy_link = product['BuyLink']
-    coupon = product['CouponCode']
-    opening = product['Opening']
+    item_id = product.get('ItemId', 'ללא מספר')
+    image_url = product.get('ImageURL', '')
+    title = product.get('Title', '')
+    original_price = product.get('OriginalPrice', '')
+    sale_price = product.get('SalePrice', '')
+    discount = product.get('Discount', '')
+    rating = product.get('Rating', '')
+    orders = product.get('Orders', '')
+    buy_link = product.get('BuyLink', '')
+    coupon = product.get('CouponCode', '')
+    opening = product.get('Opening', '')
 
     rating_percent = rating if rating else "אין דירוג"
-    orders_text = f"{orders} הזמנות" if int(orders) >= 50 else "פריט חדש לחברי הערוץ"
+    orders_text = f"{orders} הזמנות" if orders and int(orders) >= 50 else "פריט חדש לחברי הערוץ"
     discount_text = f"💸 חיסכון של {discount}!" if discount != "0%" else ""
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if coupon.strip() else ""
 
-    post = f"""{opening}
+    post = '''{opening}
 
 {title}
 
@@ -52,7 +52,19 @@ def format_post(product):
 
 👇🛍הזמינו עכשיו🛍👇
 <a href="{buy_link}">לחצו כאן</a>
-"""
+'''.format(
+        opening=opening,
+        title=title,
+        sale_price=sale_price,
+        buy_link=buy_link,
+        original_price=original_price,
+        discount_text=discount_text,
+        rating_percent=rating_percent,
+        orders_text=orders_text,
+        coupon_text=coupon_text,
+        item_id=item_id
+    )
+
     return post, image_url
 
 def read_products(file_path):
@@ -72,7 +84,7 @@ def post_to_channel(product):
         print(f"Failed to post: {e}")
 
 def run_bot():
-    products = read_products("posts_ready_final_hebrew_format.csv")
+    products = read_products("posts_ready_hebrew_openings.csv")
     for product in products:
         post_to_channel(product)
         time.sleep(60)
