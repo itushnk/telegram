@@ -75,16 +75,18 @@ def read_products(file_path):
 def post_to_channel(product):
     try:
         post_text, image_url = format_post(product)
-        response = requests.get(image_url)
-        if image_url.endswith('.mp4'):
+        video_url = product.get('Video Url', '').strip()
+        if video_url.endswith('.mp4'):
+            response = requests.get(video_url)
             bot.send_video(CHANNEL_ID, response.content, caption=post_text, parse_mode='HTML')
         else:
+            response = requests.get(image_url)
             bot.send_photo(CHANNEL_ID, response.content, caption=post_text, parse_mode='HTML')
     except Exception as e:
         print(f"Failed to post: {e}")
 
 def run_bot():
-    products = read_products("posts_ready_final_hebrew_format.csv")
+    products = read_products("posts_ready_hebrew_openings.csv")
     for product in products:
         post_to_channel(product)
         time.sleep(60)
