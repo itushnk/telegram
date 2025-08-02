@@ -45,10 +45,10 @@ def format_post(product):
 
 {coupon_text}
 
-להזמנה מהירה לחצו כאן👉 <a href="{buy_link}">לחצו כאן</a>
+להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>
 
 מספר פריט: {item_id}
-להצטרפות לערוץ לחצו עליי👉 <a href="https://t.me/+LlMY8B9soOdhNmZk">לחצו כאן</a>
+להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">לחצו כאן</a>
 
 👇🛍הזמינו עכשיו🛍👇
 <a href="{buy_link}">לחצו כאן</a>
