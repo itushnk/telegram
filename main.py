@@ -45,10 +45,10 @@ def format_post(product):
 
 {coupon_text}
 
-להזמנה מהירה לחצו כאן👉 [לחצו כאן]({buy_link})
+להזמנה מהירה לחצו כאן👉 <a href="{buy_link}">לחצו כאן</a>
 
 מספר פריט: {item_id}
-להצטרפות לערוץ לחצו עליי👉 [לחצו כאן](https://t.me/+LlMY8B9soOdhNmZk)
+להצטרפות לערוץ לחצו עליי👉 <a href="https://t.me/+LlMY8B9soOdhNmZk">לחצו כאן</a>
 
 👇🛍הזמינו עכשיו🛍👇
 {buy_link}
@@ -65,14 +65,14 @@ def post_to_channel(product):
         post_text, image_url = format_post(product)
         response = requests.get(image_url)
         if image_url.endswith('.mp4'):
-            bot.send_video(CHANNEL_ID, response.content, caption=post_text, parse_mode='Markdown')
+            bot.send_video(CHANNEL_ID, response.content, caption=post_text, parse_mode='HTML')
         else:
-            bot.send_photo(CHANNEL_ID, response.content, caption=post_text, parse_mode='Markdown')
+            bot.send_photo(CHANNEL_ID, response.content, caption=post_text, parse_mode='HTML')
     except Exception as e:
         print(f"Failed to post: {e}")
 
 def run_bot():
-    products = read_products("posts_ready_final_hebrew_format.csv")
+    products = read_products("posts_ready_hebrew_openings.csv")
     for product in products:
         post_to_channel(product)
         time.sleep(60)
