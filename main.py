@@ -64,10 +64,11 @@ def post_to_channel(product):
     try:
         post_text, image_url = format_post(product)
         response = requests.get(image_url)
-        if image_url.endswith('.mp4'):
-            bot.send_video(CHANNEL_ID, response.content, caption=post_text, parse_mode='Markdown')
-        else:
-            bot.send_photo(CHANNEL_ID, response.content, caption=post_text, parse_mode='Markdown')
+  if image_url.endswith('.mp4'):
+    bot.send_video(CHANNEL_ID, response.content, caption=post_text)
+else:
+    bot.send_photo(CHANNEL_ID, response.content, caption=post_text)
+
     except Exception as e:
         print(f"Failed to post: {e}")
 
