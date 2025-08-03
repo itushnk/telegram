@@ -8,7 +8,7 @@ import os
 from datetime import datetime, timedelta
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAFUyKCfV_PtpTuebF2pBXA-5vLKBm0i6Ts"     # ← החלף לטוקן שלך
+BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep"     # ← החלף לטוקן שלך
 CHANNEL_ID = "@nisayon121"              # ← ערוץ היעד
 
 DATA_CSV = "workfile.csv"               # קובץ המקור
