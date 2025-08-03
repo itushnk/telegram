@@ -20,8 +20,18 @@ POST_DELAY_SECONDS = 60                 # מרווח בין פוסטים
 # מזהי משתמשים שמורשים לפקודות ניהול/העלאה
 ADMIN_IDS = {123456789}                 # ← החלף ל-user_id שלך (אפשר כמה: {111,222})
 
-# ========= TOKEN FROM ENV + VALIDATION =========
+# ========= TOKEN FROM ENV + DEBUG/VALIDATION =========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+def _token_shape(t: str) -> str:
+    """מדפיס רק צורת הטוקן ללא חשיפתו (לא כולל התוכן עצמו)."""
+    has_colon = ":" in t
+    prefix = t.split(":", 1)[0] if has_colon else t
+    prefix_digits = "".join(ch for ch in prefix if ch.isdigit())
+    return f"len={len(t)}, has_colon={has_colon}, prefix_digits_len={len(prefix_digits)}"
+
+print("[DEBUG] BOT_TOKEN shape ->", _token_shape(BOT_TOKEN))
+
 if not re.match(r"^\d+:[A-Za-z0-9_\-]{20,}$", BOT_TOKEN):
     print("[FATAL] BOT_TOKEN לא תקין או לא נטען מה-ENV. "
           "בדוק את Railway Variables והדבק את הטוקן המלא כולל נקודתיים.",
@@ -30,7 +40,7 @@ if not re.match(r"^\d+:[A-Za-z0-9_\-]{20,}$", BOT_TOKEN):
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# בריאות חיבור לטלגרם – נצא אם הטוקן לא עובד
+# בריאות חיבור לטלגרם – יציאה מידית אם הטוקן שגוי (ימנע 401 חוזר)
 try:
     me = bot.get_me()
     print(f"[OK] Bot connected as @{me.username} (id={me.id})")
