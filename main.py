@@ -1,19 +1,24 @@
+
+# -*- coding: utf-8 -*-
 import csv
 import requests
 import time
 import telebot
 import threading
 import os
-from datetime import datetime, timedelta
-# -*- coding: utf-8 -*-
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"
-CHANNEL_ID = "@nisayon121"  # עדכן לערוץ שלך
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"  # דוגמה: "@my_channel"
+# IDs שמורשים לשלוט במצב שינה ידני (מומלץ להגדיר את ה-ID שלך כדי למנוע שימוש לרעה)
+ADMIN_USER_IDS = set()  # לדוגמה: {123456789}
 
 # קבצים
 DATA_CSV = "workfile.csv"     # קובץ המקור שאתה מכין
 PENDING_CSV = "pending.csv"   # תור הפוסטים הממתינים
+MANUAL_SLEEP_FILE = "manual_sleep.flag"  # כאשר קיים => מצב שינה ידני פעיל
 
 # מרווח בין פוסטים בשניות
 POST_DELAY_SECONDS = 60
@@ -22,6 +27,9 @@ POST_DELAY_SECONDS = 60
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
+
+# אזור זמן ישראל
+IL_TZ = ZoneInfo("Asia/Jerusalem")
 
 
 # ========= UTILITIES =========
@@ -152,6 +160,59 @@ def init_pending():
         write_products(PENDING_CSV, src)
 
 
+# ========= BROADCAST WINDOW =========
+def should_broadcast(now: datetime | None = None) -> bool:
+    """
+    כללים (שעון ישראל):
+    - ראשון–חמישי: 06:00–23:59
+    - שישי: 06:00–17:59 (מ-18:00 מצב שקט)
+    - שבת: 20:15–23:59 בלבד
+    """
+    if now is None:
+        now = datetime.now(tz=IL_TZ)
+    else:
+        now = now.astimezone(IL_TZ)
+
+    wd = now.weekday()  # Mon=0 ... Sun=6 (אצלנו: ראשון=6)
+    t = now.time()
+
+    # ראשון (6) ושני-חמישי (0-3): מותר בין 06:00–23:59
+    if wd in (6, 0, 1, 2, 3):
+        return dtime(6, 0) <= t <= dtime(23, 59)
+
+    # שישי (4): מותר עד 17:59 בלבד
+    if wd == 4:
+        return dtime(6, 0) <= t <= dtime(17, 59)
+
+    # שבת (5): מ-20:15 עד 23:59
+    if wd == 5:
+        return dtime(20, 15) <= t <= dtime(23, 59)
+
+    return False
+
+
+# ========= MANUAL SLEEP MODE =========
+def is_manual_sleep() -> bool:
+    return os.path.exists(MANUAL_SLEEP_FILE)
+
+def set_manual_sleep(enabled: bool) -> None:
+    try:
+        if enabled:
+            with open(MANUAL_SLEEP_FILE, "w", encoding="utf-8") as f:
+                f.write("sleep=on")
+        else:
+            if os.path.exists(MANUAL_SLEEP_FILE):
+                os.remove(MANUAL_SLEEP_FILE)
+    except Exception as e:
+        print(f"[WARN] Failed to set manual sleep: {e}")
+
+def is_quiet_now(now: datetime | None = None) -> bool:
+    """
+    True אם צריך להיות בשקט עכשיו (מצב שינה ידני או חלון שקט קבוע).
+    """
+    return is_manual_sleep() or (not should_broadcast(now))
+
+
 # ========= POSTING =========
 def format_post(product):
     item_id = product.get('ItemId', 'ללא מספר')
@@ -172,7 +233,7 @@ def format_post(product):
     discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
 
-    post = f'''{opening}
+    post = f"""{opening}
 
 {title}
 
@@ -195,7 +256,7 @@ def format_post(product):
 
 👇🛍הזמינו עכשיו🛍👇
 <a href="{buy_link}">לחיצה וזה בדרך </a>
-'''
+"""
     return post, image_url
 
 
@@ -214,10 +275,16 @@ def post_to_channel(product):
             bot.send_photo(CHANNEL_ID, resp.content, caption=post_text)
 
     except Exception as e:
-        print(f"[{datetime.now()}] Failed to post: {e}")
+        print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}")
 
 
 # ========= ADMIN COMMANDS =========
+def user_is_admin(msg) -> bool:
+    if not ADMIN_USER_IDS:
+        # אם לא הוגדרו אדמינים — נאפשר לכל אחד (אפשר לשנות לפי הצורך)
+        return True
+    return msg.from_user and (msg.from_user.id in ADMIN_USER_IDS)
+
 def format_full_product_text(p):
     fields = [
         ("ItemId", p.get("ItemId", "")),
@@ -259,17 +326,26 @@ def list_pending(msg):
 
 @bot.message_handler(commands=['clear_pending'])
 def clear_pending(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
     write_products(PENDING_CSV, [])
     bot.reply_to(msg, "נוקה התור של הפוסטים הממתינים 🧹")
 
 @bot.message_handler(commands=['reset_pending'])
 def reset_pending(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
     src = read_products(DATA_CSV)
     write_products(PENDING_CSV, src)
     bot.reply_to(msg, "התור אופס מהקובץ הראשי והכול נטען מחדש 🔄")
 
 @bot.message_handler(commands=['skip_one'])
 def skip_one(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
     pending = read_products(PENDING_CSV)
     if not pending:
         bot.reply_to(msg, "אין מה לדלג – אין פוסטים ממתינים.")
@@ -310,32 +386,76 @@ def peek_idx(msg):
 def pending_status(msg):
     pending = read_products(PENDING_CSV)
     count = len(pending)
+    now_il = datetime.now(tz=IL_TZ)
     if count == 0:
         bot.reply_to(msg, "אין פוסטים ממתינים ✅")
         return
 
-    now = datetime.now()
     total_seconds = (count - 1) * POST_DELAY_SECONDS  # האחרון אחרי (count-1) מרווחים
-    eta = now + timedelta(seconds=total_seconds)
-    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S")
-    next_eta = now.strftime("%Y-%m-%d %H:%M:%S")
+    eta = now_il + timedelta(seconds=total_seconds)
+    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
+    next_eta = now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    status_line = "🎙️ מצב שידור: פעיל" if should_broadcast(now_il) else "⏸️ מצב שידור: שקט (חלון קבוע)"
+    if is_manual_sleep():
+        status_line = "⏸️ מצב שידור: שקט (שינה ידנית)"
 
     msg_text = (
+        f"{status_line}\n"
         f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
-        f"⏱️ השידור הבא: <b>{next_eta}</b>\n"
+        f"⏱️ השידור הבא (לפי מרווח קבוע): <b>{next_eta}</b>\n"
         f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
         f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
     )
     bot.reply_to(msg, msg_text, parse_mode='HTML')
+
+# ========= Manual sleep commands =========
+@bot.message_handler(commands=['sleep_on'])
+def cmd_sleep_on(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    set_manual_sleep(True)
+    bot.reply_to(msg, "מצב שינה ידני הופעל. הבוט לא ישדר עד לביטול.")
+
+@bot.message_handler(commands=['sleep_off'])
+def cmd_sleep_off(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    set_manual_sleep(False)
+    bot.reply_to(msg, "מצב שינה ידני בוטל.")
+
+@bot.message_handler(commands=['sleep_status'])
+def cmd_sleep_status(msg):
+    status = "פעיל" if is_manual_sleep() else "כבוי"
+    bot.reply_to(msg, f"סטטוס מצב שינה ידני: {status}")
+
+@bot.message_handler(commands=['sleep_toggle'])
+def cmd_sleep_toggle(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    cur = is_manual_sleep()
+    set_manual_sleep(not cur)
+    bot.reply_to(msg, f"מצב שינה ידני: {'פעיל' if not cur else 'כבוי'}")
 
 
 # ========= SENDER LOOP (BACKGROUND) =========
 def run_sender_loop():
     init_pending()
     while True:
+        # כיבוד חלון השידור (שעון ישראל) + מצב שינה ידני
+        if is_quiet_now():
+            now_il = datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
+            reason = "Manual sleep" if is_manual_sleep() else "Quiet window"
+            print(f"[{now_il}] Quiet hours — not broadcasting. ({reason})")
+            time.sleep(30)
+            continue
+
         pending = read_products(PENDING_CSV)
         if not pending:
-            print(f"[{datetime.now()}] No pending posts.")
+            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] No pending posts.")
             time.sleep(30)
             continue
 
@@ -365,5 +485,5 @@ if __name__ == "__main__":
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
         except Exception as e:
-            print(f"[{datetime.now()}] Polling error: {e}. Retrying in 5s...")
+            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in 5s...")
             time.sleep(5)
