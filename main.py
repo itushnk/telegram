@@ -48,10 +48,10 @@ def format_post(product):
 להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>
 
 מספר פריט: {item_id}
-להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">לחצו כאן</a>
+להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>
 
 👇🛍הזמינו עכשיו🛍👇
-<a href="{buy_link}">לחצו כאן</a>
+<a href="{buy_link}">לחיצה וזה בדרך </a>
 '''.format(
         opening=opening,
         title=title,
