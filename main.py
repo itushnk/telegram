@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # -*- coding: utf-8 -*-
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAGVOgerhE5X3n3C7Y-9D9EJHoDl05pqzbI"
+BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"
 CHANNEL_ID = "@nisayon121"  # עדכן לערוץ שלך
 
 # קבצים
