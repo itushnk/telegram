@@ -10,6 +10,37 @@ import os
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
+
+# ========= SINGLE INSTANCE LOCK =========
+# מונע הרצה כפולה של אותו בוט על אותה מכונה
+def acquire_single_instance_lock(lock_path: str = "bot.lock"):
+    try:
+        import os, sys
+        if os.name == "nt":
+            # Windows
+            import msvcrt
+            f = open(lock_path, "w")
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("Another instance is running. Exiting.")
+                sys.exit(1)
+            return f  # שמור כדי שלא ייסגר
+        else:
+            # POSIX (Linux)
+            import fcntl
+            f = open(lock_path, "w")
+            try:
+                fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("Another instance is running. Exiting.")
+                sys.exit(1)
+            return f  # שמור כדי שלא ייסגר
+    except Exception as e:
+        print(f"[WARN] Could not acquire single-instance lock: {e}")
+        return None
+
+
 # ========= CONFIG =========
 BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"
 CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"  # דוגמה: "@my_channel"
@@ -191,6 +222,24 @@ def should_broadcast(now: datetime | None = None) -> bool:
 
     return False
 
+
+
+# ========= WEBHOOK DIAGNOSTICS =========
+def print_webhook_info():
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
+        r = requests.get(url, timeout=10)
+        print("getWebhookInfo:", r.json())
+    except Exception as e:
+        print(f"[WARN] getWebhookInfo failed: {e}")
+
+def force_delete_webhook():
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        r = requests.get(url, params={"drop_pending_updates": True}, timeout=10)
+        print("deleteWebhook:", r.json())
+    except Exception as e:
+        print(f"[WARN] deleteWebhook failed: {e}")
 
 # ========= MANUAL SLEEP MODE =========
 def is_manual_sleep() -> bool:
@@ -493,14 +542,26 @@ def run_sender_loop():
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    # 0) ננקה Webhook כדי למנוע 409 בעת polling
+
+# -1) ודא מופע יחיד
+_lock_handle = acquire_single_instance_lock()
+
+# -0) אבחון webhook לפני מחיקה
+print_webhook_info()
+
+    # 0) ננקה Webhook כדי למנוע 409 בעת polling (אחרי הדפסת מצב קודם)
     try:
+        force_delete_webhook()  # ננסה קודם דרך ה-HTTP API
         bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         try:
             bot.remove_webhook()
         except Exception as e2:
             print(f"[WARN] remove_webhook failed: {e2}")
+
+
+# 0.5) אבחון webhook אחרי מחיקה
+print_webhook_info()
 
     # 1) חוט רקע ששולח פוסטים מהתור
     t = threading.Thread(target=run_sender_loop, daemon=True)
