@@ -6,7 +6,7 @@ import telebot
 from datetime import datetime
 
 # Token and chat/channel setup
-BOT_TOKEN = "8371104768:AAE8GYjVBeF0H4fqOur9tMLe4_D4laCBRsk"
+BOT_TOKEN = "8371104768:AAFUyKCfV_PtpTuebF2pBXA-5vLKBm0i6Ts"
 CHANNEL_ID = "@nisayon121"
 
 bot = telebot.TeleBot(BOT_TOKEN)
