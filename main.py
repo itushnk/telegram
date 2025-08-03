@@ -1,30 +1,30 @@
-# -*- coding: utf-8 -*-
+
 import csv
 import requests
 import time
 import telebot
 import threading
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# ========= CONFIG =========
+# ========== CONFIG ==========
 BOT_TOKEN = "8371104768:AAFUyKCfV_PtpTuebF2pBXA-5vLKBm0i6Ts"
 CHANNEL_ID = "@nisayon121"
 
 # קבצים
-DATA_CSV = "workfile.csv"     # קובץ המקור שאתה מכין
-PENDING_CSV = "pending.csv"   # תור הפוסטים הממתינים
+DATA_CSV = "workfile.csv"     # קובץ המקור שאתה מכין (נשאר כמו בקוד שלך)
+PENDING_CSV = "pending.csv"   # תור הפוסטים הממתינים לשידור
 
-# מרווח בין פוסטים בשניות
+# מרווח בין פוסטים
 POST_DELAY_SECONDS = 60
 
-# ========= INIT =========
+# ========== INIT ==========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 
 
-# ========= UTILITIES =========
+# ========== UTILITIES ==========
 def safe_int(value, default=0):
     try:
         if value is None or str(value).strip() == "":
@@ -35,7 +35,7 @@ def safe_int(value, default=0):
 
 def norm_percent(value, decimals=1, empty_fallback=""):
     """
-    קולט '91.9', '91.9%', '92' ומחזיר '91.9%' בפורמט קבוע.
+    מקבל ערכים כמו '91.9', '91.9%', '92' ומחזיר '91.9%' עם מספר ספרות אחרי נקודה.
     """
     s = str(value).strip() if value is not None else ""
     if not s:
@@ -43,19 +43,21 @@ def norm_percent(value, decimals=1, empty_fallback=""):
     s = s.replace("%", "")
     try:
         f = float(s)
-        return f"{round(f, decimals)}%"
+        s = f"{round(f, decimals)}%"
+        return s
     except Exception:
         return empty_fallback
 
 def clean_price_text(s):
     """
-    מנקה ILS/₪ ותווים לא-ספרתיים, משאיר מספר עם נקודה.
+    מנקה ILS/₪ ותווים לא־ספרתיים, משאיר מספר עם נקודה.
     """
     if s is None:
         return ""
     s = str(s)
     for junk in ["ILS", "₪"]:
         s = s.replace(junk, "")
+    # השארת ספרות ונקודה בלבד:
     out = "".join(ch for ch in s if ch.isdigit() or ch == ".")
     return out.strip()
 
@@ -66,45 +68,59 @@ def normalize_row_keys(row):
     """
     out = dict(row)
 
-    # תמונה / וידאו
+    # תמונה/וידאו
     if "ImageURL" not in out:
-        out["ImageURL"] = out.get("Image Url", "") or out.get("ImageURL", "")
+        out["ImageURL"] = out.get("Image Url", "")
     if "Video Url" not in out:
-        out["Video Url"] = out.get("Video Url", "")  # אם יש—נשאר
+        out["Video Url"] = out.get("Video Url", "")  # נשאר אותו שם אם קיים
 
     # קישורי רכישה
     if "BuyLink" not in out:
-        out["BuyLink"] = out.get("Promotion Url", "") or out.get("BuyLink", "")
+        out["BuyLink"] = out.get("Promotion Url", "")
 
     # מחירים
-    out["OriginalPrice"] = clean_price_text(out.get("OriginalPrice", "") or out.get("Origin Price", ""))
-    out["SalePrice"]     = clean_price_text(out.get("SalePrice", "") or out.get("Discount Price", ""))
+    if "OriginalPrice" not in out:
+        out["OriginalPrice"] = clean_price_text(out.get("Origin Price", ""))
+    else:
+        out["OriginalPrice"] = clean_price_text(out.get("OriginalPrice", ""))
+    if "SalePrice" not in out:
+        out["SalePrice"] = clean_price_text(out.get("Discount Price", ""))
+    else:
+        out["SalePrice"] = clean_price_text(out.get("SalePrice", ""))
 
     # הנחה / דירוג / הזמנות
-    disc = f"{out.get('Discount', '')}".strip()
-    if disc and not disc.endswith("%"):
-        try:
-            disc = f"{int(round(float(disc)))}%"
-        except Exception:
-            pass
-    out["Discount"] = disc
-
-    out["Rating"] = norm_percent(out.get("Rating", "") or out.get("Positive Feedback", ""), decimals=1, empty_fallback="")
-
-    if not str(out.get("Orders", "")).strip():
+    if "Discount" not in out:
+        out["Discount"] = out.get("Discount", "")
+    if "Rating" not in out:
+        out["Rating"] = norm_percent(out.get("Positive Feedback", ""), decimals=1, empty_fallback="")
+    if "Orders" not in out or not str(out.get("Orders", "")).strip():
         out["Orders"] = str(out.get("Sales180Day", "")).strip()
 
     # קופון
     if "CouponCode" not in out:
-        out["CouponCode"] = out.get("Code Name", "") or out.get("CouponCode", "")
+        out["CouponCode"] = out.get("Code Name", "") or ""
 
-    # מזהה / טקסטים
+    # מזהה פריט / טקסטים
     if "ItemId" not in out:
         out["ItemId"] = out.get("ProductId", "") or out.get("ItemId", "") or "ללא מספר"
     if "Opening" not in out:
         out["Opening"] = out.get("Opening", "") or ""
     if "Title" not in out:
+        # אם אין Title, ננסה Product Desc כפי שהוא
         out["Title"] = out.get("Title", "") or out.get("Product Desc", "") or ""
+
+    # גיבויים אחרונים
+    out["Discount"] = f"{out['Discount']}".strip()
+    if out["Discount"] and not out["Discount"].endswith("%"):
+        # אם הנחה ניתנה כמספר "55" נהפוך ל-"55%"
+        try:
+            d_float = float(out["Discount"])
+            out["Discount"] = f"{int(round(d_float))}%"
+        except Exception:
+            # השאר כמות שהוא
+            pass
+
+    out["Rating"] = norm_percent(out["Rating"], decimals=1, empty_fallback="")
 
     return out
 
@@ -119,11 +135,11 @@ def read_products(path):
 
 def write_products(path, rows):
     """
-    כותב רשומות ל-CSV. אם הרשימה ריקה, כותב רק כותרות.
+    כותב רשומות ל-CSV. אם הרשימה ריקה, כותב רק כותרות שידוע שהקוד צריך.
     """
     base_headers = [
         "ItemId","ImageURL","Title","OriginalPrice","SalePrice","Discount",
-        "Rating","Orders","BuyLink","CouponCode","Opening","Video Url","Strengths"
+        "Rating","Orders","BuyLink","CouponCode","Opening","Video Url"
     ]
     if not rows:
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -131,6 +147,7 @@ def write_products(path, rows):
             w.writeheader()
         return
 
+    # איחוד כותרות מכל הרשומות (שומר על הבסיס + כל שדה נוסף שקיים)
     headers = list(dict.fromkeys(base_headers + [k for r in rows for k in r.keys()]))
 
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -142,14 +159,15 @@ def write_products(path, rows):
 
 def init_pending():
     """
-    אם אין pending.csv – ניצור אותו מתוך workfile.csv.
+    אם אין pending.csv – ניצור אותו מתוך workfile.csv
+    אם יש – נשאיר כמו שהוא.
     """
     if not os.path.exists(PENDING_CSV):
         src = read_products(DATA_CSV)
         write_products(PENDING_CSV, src)
 
 
-# ========= POSTING =========
+# ========== POSTING ==========
 def format_post(product):
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
@@ -201,6 +219,7 @@ def post_to_channel(product):
         post_text, image_url = format_post(product)
         video_url = (product.get('Video Url') or "").strip()
 
+        # שליחת וידאו אם יש mp4 אחרת תמונה
         if video_url.endswith('.mp4'):
             resp = SESSION.get(video_url, timeout=20)
             resp.raise_for_status()
@@ -214,26 +233,7 @@ def post_to_channel(product):
         print(f"[{datetime.now()}] Failed to post: {e}")
 
 
-# ========= ADMIN COMMANDS =========
-def format_full_product_text(p):
-    fields = [
-        ("ItemId", p.get("ItemId", "")),
-        ("ImageURL", p.get("ImageURL", "")),
-        ("Title", p.get("Title", "")),
-        ("OriginalPrice", p.get("OriginalPrice", "")),
-        ("SalePrice", p.get("SalePrice", "")),
-        ("Discount", p.get("Discount", "")),
-        ("Rating", p.get("Rating", "")),
-        ("Orders", p.get("Orders", "")),
-        ("BuyLink", p.get("BuyLink", "")),
-        ("CouponCode", p.get("CouponCode", "")),
-        ("Opening", p.get("Opening", "")),
-        ("Video Url", p.get("Video Url", "")),
-        ("Strengths", p.get("Strengths", "")),
-    ]
-    lines = [f"<b>{k}:</b> {v if v is not None else ''}" for k, v in fields]
-    return "\n".join(lines)
-
+# ========== BOT COMMANDS ==========
 @bot.message_handler(commands=['list_pending'])
 def list_pending(msg):
     pending = read_products(PENDING_CSV)
@@ -254,16 +254,19 @@ def list_pending(msg):
         lines.append(f"...ועוד {more} בהמתנה")
     bot.reply_to(msg, "פוסטים ממתינים:\n\n" + "\n".join(lines))
 
+
 @bot.message_handler(commands=['clear_pending'])
 def clear_pending(msg):
     write_products(PENDING_CSV, [])
     bot.reply_to(msg, "נוקה התור של הפוסטים הממתינים 🧹")
+
 
 @bot.message_handler(commands=['reset_pending'])
 def reset_pending(msg):
     src = read_products(DATA_CSV)
     write_products(PENDING_CSV, src)
     bot.reply_to(msg, "התור אופס מהקובץ הראשי והכול נטען מחדש 🔄")
+
 
 @bot.message_handler(commands=['skip_one'])
 def skip_one(msg):
@@ -274,59 +277,8 @@ def skip_one(msg):
     write_products(PENDING_CSV, pending[1:])
     bot.reply_to(msg, "דילגתי על הפוסט הבא ✅")
 
-@bot.message_handler(commands=['peek_next'])
-def peek_next(msg):
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
-        return
-    nxt = pending[0]
-    txt = "<b>הפריט הבא בתור:</b>\n\n" + format_full_product_text(nxt)
-    bot.reply_to(msg, txt, parse_mode='HTML')
 
-@bot.message_handler(commands=['peek_idx'])
-def peek_idx(msg):
-    text = (msg.text or "").strip()
-    parts = text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        bot.reply_to(msg, "שימוש: /peek_idx N  (לדוגמה: /peek_idx 3)")
-        return
-    idx = int(parts[1])
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
-        return
-    if idx < 1 or idx > len(pending):
-        bot.reply_to(msg, f"אינדקס מחוץ לטווח. יש כרגע {len(pending)} פוסטים בתור.")
-        return
-    item = pending[idx-1]  # 1-based
-    txt = f"<b>פריט #{idx} בתור:</b>\n\n" + format_full_product_text(item)
-    bot.reply_to(msg, txt, parse_mode='HTML')
-
-@bot.message_handler(commands=['pending_status'])
-def pending_status(msg):
-    pending = read_products(PENDING_CSV)
-    count = len(pending)
-    if count == 0:
-        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
-        return
-
-    now = datetime.now()
-    total_seconds = (count - 1) * POST_DELAY_SECONDS  # האחרון אחרי (count-1) מרווחים
-    eta = now + timedelta(seconds=total_seconds)
-    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S")
-    next_eta = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    msg_text = (
-        f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
-        f"⏱️ השידור הבא: <b>{next_eta}</b>\n"
-        f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
-        f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
-    )
-    bot.reply_to(msg, msg_text, parse_mode='HTML')
-
-
-# ========= SENDER LOOP (BACKGROUND) =========
+# ========== BACKGROUND SENDER ==========
 def run_sender_loop():
     init_pending()
     while True:
@@ -336,13 +288,13 @@ def run_sender_loop():
             time.sleep(30)
             continue
 
-        product = pending[0]
+        product = pending[0]   # הבא בתור
         post_to_channel(product)
         write_products(PENDING_CSV, pending[1:])  # הסר את הראשון
         time.sleep(POST_DELAY_SECONDS)
 
 
-# ========= MAIN =========
+# ========== MAIN ==========
 if __name__ == "__main__":
     # חוט רקע ששולח פוסטים מהתור
     t = threading.Thread(target=run_sender_loop, daemon=True)
