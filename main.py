@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"
 CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"  # דוגמה: "@my_channel"
 # IDs שמורשים לשלוט במצב שינה ידני (מומלץ להגדיר את ה-ID שלך כדי למנוע שימוש לרעה)
 ADMIN_USER_IDS = set()  # לדוגמה: {123456789}
