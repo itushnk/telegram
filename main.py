@@ -489,29 +489,71 @@ def cmd_sleep_toggle(msg):
     bot.reply_to(msg, f"מצב שינה ידני: {'פעיל' if not cur else 'כבוי'}")
 
 
+# ========= Force send next =========
+@bot.message_handler(commands=['force_send_next'])
+def cmd_force_send_next(msg):
+    # שליחה כפויה של הפריט הבא בתור — עוקף חלונות שקט/שינה
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    item = pending[0]
+    try:
+        post_to_channel(item)
+        write_products(PENDING_CSV, pending[1:])  # הסר מהתור לאחר שידור
+        item_id = item.get("ItemId", "ללא מספר")
+        title = (item.get("Title","") or "")[:80]
+        bot.reply_to(msg, f"נשלח בכפייה ✅\nמספר פריט: {item_id}\nכותרת: {title}")
+    except Exception as e:
+        bot.reply_to(msg, f"שגיאה בשליחה כפויה: {e}")
+
+
 # ========= /start menu =========
+
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
-    # מקלדת כפתורים ציבורית (זמין לכולם כרגע)
+    # מקלדת כפתורים ציבורית (כל הפקודות)
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row('/list_pending', '/pending_status')
     kb.row('/peek_next', '/peek_idx')
+    kb.row('/skip_one', '/clear_pending')
+    kb.row('/reset_pending', '/force_send_next')
     kb.row('/sleep_status', '/sleep_toggle')
-    kb.row('/clear_pending', '/reset_pending')
-    kb.row('/skip_one')
+    kb.row('/sleep_on', '/sleep_off')
     text = (
-        "ברוך הבא! הנה פקודות שימושיות:\n"
-        "• /list_pending – פוסטים ממתינים\n"
-        "• /pending_status – סטטוס שידור ו-ETA\n"
-        "• /peek_next – הפריט הבא\n"
-        "• /peek_idx N – פריט לפי אינדקס\n"
-        "• /sleep_status – מצב שינה ידני\n"
-        "• /sleep_toggle – החלפת מצב שינה\n"
-        "• /clear_pending – ניקוי התור\n"
-        "• /reset_pending – טעינה מחדש מהקובץ\n"
-        "• /skip_one – דילוג על הבא\n\n"
+        "ברוך הבא! הנה כל הפקודות הזמינות:
+"
+        "• /list_pending – פוסטים ממתינים
+"
+        "• /pending_status – סטטוס שידור ו-ETA
+"
+        "• /peek_next – הפריט הבא
+"
+        "• /peek_idx N – פריט לפי אינדקס
+"
+        "• /skip_one – דילוג על הבא
+"
+        "• /clear_pending – ניקוי התור
+"
+        "• /reset_pending – טעינה מחדש מהקובץ
+"
+        "• /force_send_next – שליחה כפויה של הפריט הבא (עוקף שקט)
+"
+        "• /sleep_status – סטטוס מצב שינה ידני
+"
+        "• /sleep_toggle – החלפת מצב שינה
+"
+        "• /sleep_on – הפעלת מצב שינה ידני
+"
+        "• /sleep_off – ביטול מצב שינה ידני
+
+"
         "טיפ: פתח את תפריט הפקודות דרך כפתור התפריט או בהקלדת '/'.")
     bot.send_message(msg.chat.id, text, reply_markup=kb)
+
 
 
 # ========= SENDER LOOP (BACKGROUND) =========
