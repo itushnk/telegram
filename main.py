@@ -11,8 +11,8 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # ← עדכן כאן
-CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"       # ← עדכן כאן (למשל: "@my_channel")
+BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כאן
+CHANNEL_ID = "@nisayon121"       # ← עדכן כאן (למשל: "@my_channel")
 ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789}
 
 # קבצים
