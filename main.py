@@ -4,6 +4,7 @@ import csv
 import requests
 import time
 import telebot
+from telebot import types
 import threading
 import os
 from datetime import datetime, timedelta, time as dtime
@@ -440,6 +441,31 @@ def cmd_sleep_toggle(msg):
     set_manual_sleep(not cur)
     bot.reply_to(msg, f"מצב שינה ידני: {'פעיל' if not cur else 'כבוי'}")
 
+
+
+
+@bot.message_handler(commands=['start', 'help', 'menu'])
+def cmd_start(msg):
+    # מקלדת כפתורים ציבורית (זמין לכולם כרגע)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row('/list_pending', '/pending_status')
+    kb.row('/peek_next', '/peek_idx')
+    kb.row('/sleep_status', '/sleep_toggle')
+    kb.row('/clear_pending', '/reset_pending')
+    kb.row('/skip_one')
+    text = (
+        "ברוך הבא! הנה פקודות שימושיות:\n"
+        "• /list_pending – פוסטים ממתינים\n"
+        "• /pending_status – סטטוס שידור ו-ETA\n"
+        "• /peek_next – הפריט הבא\n"
+        "• /peek_idx N – פריט לפי אינדקס\n"
+        "• /sleep_status – מצב שינה ידני\n"
+        "• /sleep_toggle – החלפת מצב שינה\n"
+        "• /clear_pending – ניקוי התור\n"
+        "• /reset_pending – טעינה מחדש מהקובץ\n"
+        "• /skip_one – דילוג על הבא\n\n"
+        "טיפ: פתח את תפריט הפקודות דרך כפתור התפריט או בהקלדת '/'.")
+    bot.send_message(msg.chat.id, text, reply_markup=kb)
 
 # ========= SENDER LOOP (BACKGROUND) =========
 def run_sender_loop():
