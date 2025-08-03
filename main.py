@@ -10,12 +10,33 @@ import os
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
+# ========= CONFIG =========
+BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כאן
+CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"       # ← עדכן כאן (למשל: "@my_channel")
+ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789}
+
+# קבצים
+DATA_CSV = "workfile.csv"           # קובץ המקור שאתה מכין
+PENDING_CSV = "pending.csv"         # תור הפוסטים הממתינים
+MANUAL_SLEEP_FILE = "manual_sleep.flag"  # דגל מצב שינה ידני
+
+# מרווח בין פוסטים בשניות
+POST_DELAY_SECONDS = 60
+
+# ========= INIT =========
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
+
+# אזור זמן ישראל
+IL_TZ = ZoneInfo("Asia/Jerusalem")
+
 
 # ========= SINGLE INSTANCE LOCK =========
 # מונע הרצה כפולה של אותו בוט על אותה מכונה
 def acquire_single_instance_lock(lock_path: str = "bot.lock"):
     try:
-        import os, sys
+        import sys
         if os.name == "nt":
             # Windows
             import msvcrt
@@ -41,27 +62,22 @@ def acquire_single_instance_lock(lock_path: str = "bot.lock"):
         return None
 
 
-# ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"
-CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"  # דוגמה: "@my_channel"
-# IDs שמורשים לשלוט במצב שינה ידני (מומלץ להגדיר את ה-ID שלך כדי למנוע שימוש לרעה)
-ADMIN_USER_IDS = set()  # לדוגמה: {123456789}
+# ========= WEBHOOK DIAGNOSTICS =========
+def print_webhook_info():
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
+        r = requests.get(url, timeout=10)
+        print("getWebhookInfo:", r.json())
+    except Exception as e:
+        print(f"[WARN] getWebhookInfo failed: {e}")
 
-# קבצים
-DATA_CSV = "workfile.csv"     # קובץ המקור שאתה מכין
-PENDING_CSV = "pending.csv"   # תור הפוסטים הממתינים
-MANUAL_SLEEP_FILE = "manual_sleep.flag"  # כאשר קיים => מצב שינה ידני פעיל
-
-# מרווח בין פוסטים בשניות
-POST_DELAY_SECONDS = 60
-
-# ========= INIT =========
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
-
-# אזור זמן ישראל
-IL_TZ = ZoneInfo("Asia/Jerusalem")
+def force_delete_webhook():
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        r = requests.get(url, params={"drop_pending_updates": True}, timeout=10)
+        print("deleteWebhook:", r.json())
+    except Exception as e:
+        print(f"[WARN] deleteWebhook failed: {e}")
 
 
 # ========= UTILITIES =========
@@ -223,24 +239,6 @@ def should_broadcast(now: datetime | None = None) -> bool:
     return False
 
 
-
-# ========= WEBHOOK DIAGNOSTICS =========
-def print_webhook_info():
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
-        r = requests.get(url, timeout=10)
-        print("getWebhookInfo:", r.json())
-    except Exception as e:
-        print(f"[WARN] getWebhookInfo failed: {e}")
-
-def force_delete_webhook():
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        r = requests.get(url, params={"drop_pending_updates": True}, timeout=10)
-        print("deleteWebhook:", r.json())
-    except Exception as e:
-        print(f"[WARN] deleteWebhook failed: {e}")
-
 # ========= MANUAL SLEEP MODE =========
 def is_manual_sleep() -> bool:
     return os.path.exists(MANUAL_SLEEP_FILE)
@@ -331,7 +329,7 @@ def post_to_channel(product):
 # ========= ADMIN COMMANDS =========
 def user_is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
-        # אם לא הוגדרו אדמינים — נאפשר לכל אחד (אפשר לשנות לפי הצורך)
+        # אם לא הוגדרו אדמינים — נאפשר לכל אחד (כרגע ביקשת זמין לכולם)
         return True
     return msg.from_user and (msg.from_user.id in ADMIN_USER_IDS)
 
@@ -491,8 +489,7 @@ def cmd_sleep_toggle(msg):
     bot.reply_to(msg, f"מצב שינה ידני: {'פעיל' if not cur else 'כבוי'}")
 
 
-
-
+# ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
     # מקלדת כפתורים ציבורית (זמין לכולם כרגע)
@@ -515,6 +512,7 @@ def cmd_start(msg):
         "• /skip_one – דילוג על הבא\n\n"
         "טיפ: פתח את תפריט הפקודות דרך כפתור התפריט או בהקלדת '/'.")
     bot.send_message(msg.chat.id, text, reply_markup=kb)
+
 
 # ========= SENDER LOOP (BACKGROUND) =========
 def run_sender_loop():
@@ -542,12 +540,11 @@ def run_sender_loop():
 
 # ========= MAIN =========
 if __name__ == "__main__":
+    # -1) ודא מופע יחיד
+    _lock_handle = acquire_single_instance_lock()
 
-# -1) ודא מופע יחיד
-_lock_handle = acquire_single_instance_lock()
-
-# -0) אבחון webhook לפני מחיקה
-print_webhook_info()
+    # -0) אבחון webhook לפני מחיקה
+    print_webhook_info()
 
     # 0) ננקה Webhook כדי למנוע 409 בעת polling (אחרי הדפסת מצב קודם)
     try:
@@ -559,9 +556,8 @@ print_webhook_info()
         except Exception as e2:
             print(f"[WARN] remove_webhook failed: {e2}")
 
-
-# 0.5) אבחון webhook אחרי מחיקה
-print_webhook_info()
+    # 0.5) אבחון webhook אחרי מחיקה
+    print_webhook_info()
 
     # 1) חוט רקע ששולח פוסטים מהתור
     t = threading.Thread(target=run_sender_loop, daemon=True)
