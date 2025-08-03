@@ -5,24 +5,40 @@ import time
 import telebot
 import threading
 import os
+import re
+import sys
 from datetime import datetime, timedelta
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep"     # ← החלף לטוקן שלך
-CHANNEL_ID = "@nisayon121"              # ← ערוץ היעד
-
+CHANNEL_ID = "@nisayon121"              # עדכן לערוץ שלך
 DATA_CSV = "workfile.csv"               # קובץ המקור
 PENDING_CSV = "pending.csv"             # תור הפוסטים הממתינים
 UPLOAD_MODE_FILE = "upload_mode.txt"    # שמירת מצב העלאה (replace/append/defer)
 DEFAULT_UPLOAD_MODE = "replace"         # ברירת מחדל
-
 POST_DELAY_SECONDS = 60                 # מרווח בין פוסטים
 
 # מזהי משתמשים שמורשים לפקודות ניהול/העלאה
 ADMIN_IDS = {123456789}                 # ← החלף ל-user_id שלך (אפשר כמה: {111,222})
 
-# ========= INIT =========
+# ========= TOKEN FROM ENV + VALIDATION =========
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not re.match(r"^\d+:[A-Za-z0-9_\-]{20,}$", BOT_TOKEN):
+    print("[FATAL] BOT_TOKEN לא תקין או לא נטען מה-ENV. "
+          "בדוק את Railway Variables והדבק את הטוקן המלא כולל נקודתיים.",
+          file=sys.stderr)
+    sys.exit(1)
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+# בריאות חיבור לטלגרם – נצא אם הטוקן לא עובד
+try:
+    me = bot.get_me()
+    print(f"[OK] Bot connected as @{me.username} (id={me.id})")
+except Exception as e:
+    print(f"[FATAL] bot.get_me() נכשל: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# ========= INIT =========
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 
@@ -226,25 +242,6 @@ def post_to_channel(product):
 
 
 # ========= ADMIN COMMANDS =========
-def format_full_product_text(p):
-    fields = [
-        ("ItemId", p.get("ItemId", "")),
-        ("ImageURL", p.get("ImageURL", "")),
-        ("Title", p.get("Title", "")),
-        ("OriginalPrice", p.get("OriginalPrice", "")),
-        ("SalePrice", p.get("SalePrice", "")),
-        ("Discount", p.get("Discount", "")),
-        ("Rating", p.get("Rating", "")),
-        ("Orders", p.get("Orders", "")),
-        ("BuyLink", p.get("BuyLink", "")),
-        ("CouponCode", p.get("CouponCode", "")),
-        ("Opening", p.get("Opening", "")),
-        ("Video Url", p.get("Video Url", "")),
-        ("Strengths", p.get("Strengths", "")),
-    ]
-    lines = [f"<b>{k}:</b> {v if v is not None else ''}" for k, v in fields]
-    return "\n".join(lines)
-
 @bot.message_handler(commands=['upload_mode'])
 def upload_mode_cmd(msg):
     if not is_admin(msg):
@@ -483,7 +480,7 @@ def run_sender_loop():
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    # מניעת 409: ננקה Webhook לפני polling
+    # מניעת 409: ננקה Webhook לפני polling (אם אין הרשאה/טוקן גרוע—נדפיס אזהרה)
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
@@ -496,7 +493,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_sender_loop, daemon=True)
     t.start()
 
-    # Polling עם Retry לטיפול בשגיאות זמניות (כולל 409)
+    # Polling עם Retry לטיפול בשגיאות זמניות
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
