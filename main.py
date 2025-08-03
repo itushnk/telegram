@@ -21,7 +21,7 @@ POST_DELAY_SECONDS = 60                 # מרווח בין פוסטים
 ADMIN_IDS = {123456789}                 # ← החלף ל-user_id שלך (אפשר כמה: {111,222})
 
 # ========= TOKEN FROM ENV + DEBUG/VALIDATION =========
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4", "").strip()
 
 def _token_shape(t: str) -> str:
     """מדפיס רק צורת הטוקן ללא חשיפתו (לא כולל התוכן עצמו)."""
