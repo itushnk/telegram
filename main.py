@@ -86,7 +86,7 @@ def post_to_channel(product):
         print(f"Failed to post: {e}")
 
 def run_bot():
-    products = read_products("posts_ready_hebrew_openings.csv")
+    products = read_products("posts_ready_hebrew_openings (7).csv")
     for product in products:
         post_to_channel(product)
         time.sleep(60)
