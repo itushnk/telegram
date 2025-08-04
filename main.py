@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 import csv
 import requests
@@ -587,6 +588,7 @@ def cmd_channel_status(msg):
     typ = "פרטי (-100…)" if isinstance(cur, int) else "ציבורי (@name)"
     bot.reply_to(msg, f"Channel target: {cur} ({typ})")
 
+# ========= Public/Private preset commands (improved prompts) =========
 @bot.message_handler(commands=['set_public'])
 def cmd_set_public(msg):
     if not user_is_admin(msg):
@@ -594,9 +596,18 @@ def cmd_set_public(msg):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(msg, "שימוש: /set_public @name או -100xxxxxxxxxxxx")
+        m = bot.reply_to(msg, "שלח עכשיו את שם הערוץ הציבורי (@name) או מזהה -100…")
+        bot.register_next_step_handler(m, _set_public_from_reply)
         return
-    v = parts[1].strip()
+    _handle_set_public_value(msg, parts[1].strip())
+
+def _set_public_from_reply(reply_msg):
+    if not reply_msg or not reply_msg.text:
+        bot.reply_to(reply_msg, "לא התקבל טקסט. נסה שוב: /set_public")
+        return
+    _handle_set_public_value(reply_msg, reply_msg.text.strip())
+
+def _handle_set_public_value(msg, v):
     try:
         if v.startswith("-"):
             v = int(v)
@@ -613,9 +624,18 @@ def cmd_set_private(msg):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(msg, "שימוש: /set_private @name או -100xxxxxxxxxxxx")
+        m = bot.reply_to(msg, "שלח עכשיו את מזהה הערוץ הפרטי (-100… ) או @name (לפרטי מומלץ -100…).")
+        bot.register_next_step_handler(m, _set_private_from_reply)
         return
-    v = parts[1].strip()
+    _handle_set_private_value(msg, parts[1].strip())
+
+def _set_private_from_reply(reply_msg):
+    if not reply_msg or not reply_msg.text:
+        bot.reply_to(reply_msg, "לא התקבל טקסט. נסה שוב: /set_private")
+        return
+    _handle_set_private_value(reply_msg, reply_msg.text.strip())
+
+def _handle_set_private_value(msg, v):
     try:
         if v.startswith("-"):
             v = int(v)
