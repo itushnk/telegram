@@ -12,15 +12,15 @@ from zoneinfo import ZoneInfo
 # ========= CONFIG =========
 BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כאן אם צריך
 CHANNEL_ID = "@nisayon121"       # ← עדכן כאן (למשל: "@my_channel")
-ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789}
+ADMIN_USER_IDS = set()           # מומלץ להגדיר: {123456789}
 
 # קבצים
-DATA_CSV = "workfile.csv"           # קובץ המקור שאתה מכין
-PENDING_CSV = "pending.csv"         # תור הפוסטים הממתינים
-DELAY_FILE = "post_delay.txt"       # שמירת מרווח שנבחר
+DATA_CSV = "workfile.csv"        # קובץ המקור
+PENDING_CSV = "pending.csv"      # תור הפוסטים
+DELAY_FILE = "post_delay.txt"    # שמירת מרווח שנבחר
 
 # מצב עבודה: 'מתוזמן' או 'תמיד-פעיל' באמצעות דגל קובץ
-SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (מצב שינה פעיל), לא קיים => תמיד משדר
+SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (שינה פעיל), לא קיים => תמיד משדר
 
 # ========= INIT =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -29,6 +29,9 @@ SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 
 # אזור זמן ישראל
 IL_TZ = ZoneInfo("Asia/Jerusalem")
+
+# Event שמעיר את לולאת השליחה כשמשנים מרווח
+DELAY_EVENT = threading.Event()
 
 
 # ========= SINGLE INSTANCE LOCK =========
@@ -272,9 +275,7 @@ def post_to_channel(product):
 
 # ========= DELAY (מרווח בין פוסטים) =========
 def load_delay_seconds(default_seconds: int = 1500) -> int:
-    """
-    טוען מרווח מהקובץ; אם אין, מחזיר ברירת מחדל (25 דקות = 1500ש').
-    """
+    """טוען מרווח מהקובץ; אם אין, מחזיר ברירת מחדל (25 דקות = 1500ש')."""
     try:
         if os.path.exists(DELAY_FILE):
             with open(DELAY_FILE, "r", encoding="utf-8") as f:
@@ -385,8 +386,9 @@ def pending_status(msg):
     count = len(pending)
     now_il = datetime.now(tz=IL_TZ)
     schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל (שינה כבוי)"
+    delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
     if count == 0:
-        bot.reply_to(msg, f"{schedule_line}\nאין פוסטים ממתינים ✅")
+        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\nאין פוסטים ממתינים ✅")
         return
     total_seconds = (count - 1) * POST_DELAY_SECONDS
     eta = now_il + timedelta(seconds=total_seconds)
@@ -396,6 +398,7 @@ def pending_status(msg):
     msg_text = (
         f"{schedule_line}\n"
         f"{status_line}\n"
+        f"{delay_line}\n"
         f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
         f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
         f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
@@ -520,8 +523,9 @@ def on_inline_click(c):
         count = len(pending)
         now_il = datetime.now(tz=IL_TZ)
         schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
+        delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
         if count == 0:
-            text = f"{schedule_line}\nאין פוסטים ממתינים ✅"
+            text = f"{schedule_line}\n{delay_line}\nאין פוסטים ממתינים ✅"
         else:
             total_seconds = (count - 1) * POST_DELAY_SECONDS
             eta = now_il + timedelta(seconds=total_seconds)
@@ -531,6 +535,7 @@ def on_inline_click(c):
             text = (
                 f"{schedule_line}\n"
                 f"{status_line}\n"
+                f"{delay_line}\n"
                 f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
                 f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
                 f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
@@ -557,10 +562,16 @@ def on_inline_click(c):
         # delay_60 / delay_900 / delay_1200 / delay_1500 / delay_1800
         try:
             seconds = int(data.split("_", 1)[1])
+            if seconds <= 0:
+                raise ValueError("מרווח חייב להיות חיובי")
             POST_DELAY_SECONDS = seconds
             save_delay_seconds(seconds)
+            DELAY_EVENT.set()  # מעיר את הלולאה מיד
             mins = seconds // 60
-            bot.edit_message_text(f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות).", chat_id, c.message.message_id, reply_markup=inline_menu())
+            bot.edit_message_text(
+                f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות).",
+                chat_id, c.message.message_id, reply_markup=inline_menu()
+            )
         except Exception as e:
             bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
 
@@ -587,17 +598,26 @@ def run_sender_loop():
         if is_quiet_now():
             now_il = datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
             print(f"[{now_il}] Quiet (schedule enforced) — not broadcasting.")
-            time.sleep(30)
+            # נישן קצר, כדי שהתעוררות מרווח תהיה מהירה גם בזמנים שקטים
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
             continue
+
         pending = read_products(PENDING_CSV)
         if not pending:
             print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] No pending posts.")
-            time.sleep(30)
+            # גם כאן נמתין קצר כדי לאפשר שינוי מרווח מיידי
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
             continue
+
         product = pending[0]
         post_to_channel(product)
         write_products(PENDING_CSV, pending[1:])
-        time.sleep(POST_DELAY_SECONDS)
+
+        # שינה חכמה: נישן עד תום המרווח או עד שבוצע שינוי מרווח (DELAY_EVENT.set)
+        DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
+        DELAY_EVENT.clear()
 
 
 # ========= MAIN =========
@@ -613,8 +633,10 @@ if __name__ == "__main__":
         except Exception as e2:
             print(f"[WARN] remove_webhook failed: {e2}")
     print_webhook_info()
+
     t = threading.Thread(target=run_sender_loop, daemon=True)
     t.start()
+
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
