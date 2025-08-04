@@ -379,6 +379,36 @@ def post_to_channel(product):
         print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}")
 
 
+
+
+# ========= Permissions / Debug helpers =========
+def _check_target_permissions(target):
+    """Return (ok: bool, details: str, status: str|None). Tries getChat, getChatMember."""
+    try:
+        # getChat
+        try:
+            chat = bot.get_chat(target)
+            chat_info = f"getChat: OK | title={getattr(chat,'title',None)} | type={getattr(chat,'type',None)} | id={getattr(chat,'id',None)}"
+        except Exception as e:
+            return False, f"getChat: ERROR -> {e}", None
+
+        # getChatMember for this bot
+        try:
+            bot_id = bot.get_me().id
+            member = bot.get_chat_member(target, bot_id)
+            status = getattr(member, "status", None)
+            can_post = getattr(member, "can_post_messages", None)
+            can_edit = getattr(member, "can_edit_messages", None)
+            can_invite = getattr(member, "can_invite_users", None)
+            details = f"{chat_info}\ngetChatMember: status={status} | can_post={can_post} | can_edit={can_edit} | can_invite={can_invite}"
+            # In channels, to post the bot must be 'administrator' (or 'creator'), and can_post_messages True (some libs omit it => assume True if admin)
+            ok = (status in ("administrator","creator")) and (can_post in (True, None))
+            return ok, details, status
+        except Exception as e:
+            return False, chat_info + f"\ngetChatMember: ERROR -> {e}", None
+    except Exception as e:
+        return False, f"check failed: {e}", None
+
 # ========= ADMIN COMMANDS =========
 def user_is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
@@ -580,7 +610,11 @@ def cmd_set_channel_id(msg):
         bot.reply_to(msg, "chat_id לא חוקי.")
         return
     save_channel_id(new_id)
-    bot.reply_to(msg, f"עודכן יעד השידור ל־{new_id}")
+    ok, details, _ = _check_target_permissions(new_id)
+    if ok:
+        bot.reply_to(msg, f"עודכן יעד השידור ל־{new_id} ✅\n{details}")
+    else:
+        bot.reply_to(msg, f"עודכן יעד השידור ל־{new_id}, אך יש בעיה בהרשאות/זיהוי היעד ⚠️\n{details}\nודא שהבוט Admin ושהמספר נכון (לפרטי עדיף -100…).")
 
 @bot.message_handler(commands=['channel_status'])
 def cmd_channel_status(msg):
@@ -655,7 +689,11 @@ def cmd_use_public(msg):
         bot.reply_to(msg, "לא הוגדר פריסט ציבורי. השתמש ב-/set_public קודם.")
         return
     save_channel_id(v)
-    bot.reply_to(msg, f"עברתי לשידור ליעד הציבורי: {v}")
+    ok, details, _ = _check_target_permissions(v)
+    if ok:
+        bot.reply_to(msg, f"עברתי לשידור ליעד הציבורי: {v} ✅\n{details}")
+    else:
+        bot.reply_to(msg, f"עודכן יעד ציבורי: {v}, אך יש בעיה בהרשאות/זיהוי היעד ⚠️\n{details}")
 
 @bot.message_handler(commands=['use_private'])
 def cmd_use_private(msg):
@@ -667,7 +705,11 @@ def cmd_use_private(msg):
         bot.reply_to(msg, "לא הוגדר פריסט פרטי. השתמש ב-/set_private קודם.")
         return
     save_channel_id(v)
-    bot.reply_to(msg, f"עברתי לשידור ליעד הפרטי: {v}")
+    ok, details, _ = _check_target_permissions(v)
+    if ok:
+        bot.reply_to(msg, f"עברתי לשידור ליעד הפרטי: {v} ✅\n{details}")
+    else:
+        bot.reply_to(msg, f"עודכן יעד פרטי: {v}, אך יש בעיה בהרשאות/זיהוי היעד ⚠️\n{details}\nודא שהבוט Admin ושהמספר נכון (לפרטי עדיף -100…).")
 
 
 # ========= Force send next =========
@@ -691,6 +733,28 @@ def cmd_force_send_next(msg):
         bot.reply_to(msg, f"שגיאה בשליחה כפויה: {e}")
 
 
+
+
+@bot.message_handler(commands=['debug_check_target'])
+def cmd_debug_check_target(msg):
+    try:
+        target = load_channel_id()
+        ok, details, status = _check_target_permissions(target)
+        prefix = "OK ✅" if ok else "בעיה ⚠️"
+        bot.reply_to(msg, f"{prefix}\nTarget: {target} ({'INT' if isinstance(target,int) else 'STR'})\n{details}")
+    except Exception as e:
+        bot.reply_to(msg, f"debug_check_target failed: {e}")
+
+@bot.message_handler(commands=['debug_send'])
+def cmd_debug_send(msg):
+    try:
+        target = load_channel_id()
+        ts = datetime.now(tz=IL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        bot.send_message(target, f"DEBUG PING {ts}")
+        bot.reply_to(msg, "ניסיתי לשלוח הודעת טקסט פשוטה ליעד. בדוק אם הופיע בערוץ.")
+    except Exception as e:
+        bot.reply_to(msg, f"debug_send error: {e}")
+
 # ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
@@ -706,6 +770,7 @@ def cmd_start(msg):
     kb.row('/channel_status', '/set_channel_id')
     kb.row('/use_public', '/use_private')
     kb.row('/set_public', '/set_private')
+    kb.row('/debug_check_target', '/debug_send')
 
     text = f"""ברוך הבא! פקודות שימושיות:
 
@@ -734,6 +799,8 @@ def cmd_start(msg):
 • /clear_pending – ניקוי התור
 • /reset_pending – טעינה מחדש מהקובץ
 • /force_send_next – שליחה כפויה (עוקף שקט)
+• /debug_check_target – בדיקת יעד והרשאות
+• /debug_send – שליחת טקסט בדיקה לערוץ היעד
 """
     bot.send_message(msg.chat.id, text, reply_markup=kb, disable_web_page_preview=True)
 
