@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
+import os, sys
+# לוגים ללא באפר
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 import csv
 import requests
 import time
 import telebot
 from telebot import types
 import threading
-import os
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 import socket
@@ -41,6 +48,9 @@ DELAY_EVENT = threading.Event()
 # מצב בחירת יעד (באמצעות Forward)
 EXPECTING_TARGET = {}  # dict[user_id] = "public"|"private"
 
+# נעילה לפעולות על התור כדי למנוע כפילות בין הלולאה לכפתור ידני
+FILE_LOCK = threading.Lock()
+
 
 # ========= SINGLE INSTANCE LOCK =========
 def acquire_single_instance_lock(lock_path: str = "bot.lock"):
@@ -52,7 +62,7 @@ def acquire_single_instance_lock(lock_path: str = "bot.lock"):
             try:
                 msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError:
-                print("Another instance is running. Exiting.")
+                print("Another instance is running. Exiting.", flush=True)
                 sys.exit(1)
             return f
         else:
@@ -61,11 +71,11 @@ def acquire_single_instance_lock(lock_path: str = "bot.lock"):
             try:
                 fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                print("Another instance is running. Exiting.")
+                print("Another instance is running. Exiting.", flush=True)
                 sys.exit(1)
             return f
     except Exception as e:
-        print(f"[WARN] Could not acquire single-instance lock: {e}")
+        print(f"[WARN] Could not acquire single-instance lock: {e}", flush=True)
         return None
 
 
@@ -74,17 +84,17 @@ def print_webhook_info():
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
         r = requests.get(url, timeout=10)
-        print("getWebhookInfo:", r.json())
+        print("getWebhookInfo:", r.json(), flush=True)
     except Exception as e:
-        print(f"[WARN] getWebhookInfo failed: {e}")
+        print(f"[WARN] getWebhookInfo failed: {e}", flush=True)
 
 def force_delete_webhook():
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
         r = requests.get(url, params={"drop_pending_updates": True}, timeout=10)
-        print("deleteWebhook:", r.json())
+        print("deleteWebhook:", r.json(), flush=True)
     except Exception as e:
-        print(f"[WARN] deleteWebhook failed: {e}")
+        print(f"[WARN] deleteWebhook failed: {e}", flush=True)
 
 
 # ========= HELPERS =========
@@ -179,45 +189,39 @@ def init_pending():
 
 # ---- PRESET HELPERS (load/save target presets) ----
 def _save_preset(path: str, value):
-    """שומר מחרוזת/מספר לקובץ פריסט."""
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(str(value))
     except Exception as e:
-        print(f"[WARN] Failed to save preset {path}: {e}")
+        print(f"[WARN] Failed to save preset {path}: {e}", flush=True)
 
 def _load_preset(path: str):
-    """טוען ערך מהפריסט; מחזיר None אם לא קיים."""
     try:
         if not os.path.exists(path):
             return None
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception as e:
-        print(f"[WARN] Failed to load preset {path}: {e}")
+        print(f"[WARN] Failed to load preset {path}: {e}", flush=True)
         return None
 
 def resolve_target(value):
-    """מנרמל יעד: @name נשאר מחרוזת; '-100…'/מספר מומר ל-int."""
+    """@name נשאר מחרוזת; '-100…'/מספר מומר ל-int."""
     try:
         if isinstance(value, int):
             return value
         s = str(value).strip()
         if s.startswith("-"):
             return int(s)
-        return s  # @username
+        return s
     except Exception:
         return value
 
-# בדיקת יעד: קבלת צ'אט, בדיקת אדמין, שליחת הודעת טסט ומחיקה
 def check_and_probe_target(target):
-    """
-    מחזיר (ok: bool, details: str).
-    """
+    """בודק קיום יעד, אדמין, ויכולת פרסום קצרה (למחיקה)."""
     try:
         t = resolve_target(target)
-        chat = bot.get_chat(t)  # יאמת קיום יעד
-        # בדיקת אדמין (Channels)
+        chat = bot.get_chat(t)
         try:
             me = bot.get_me()
             member = bot.get_chat_member(chat.id, me.id)
@@ -225,9 +229,7 @@ def check_and_probe_target(target):
             if status not in ("administrator", "creator"):
                 return False, f"⚠️ הבוט אינו אדמין ביעד {chat.id}."
         except Exception as e_mem:
-            print("[WARN] get_chat_member failed:", e_mem)
-
-        # שליחת הודעת בדיקה ומחיקה (אם יש הרשאה לפרסם)
+            print("[WARN] get_chat_member failed:", e_mem, flush=True)
         try:
             m = bot.send_message(chat.id, "🟢 בדיקת הרשאה (תימחק מיד).", disable_notification=True)
             try:
@@ -249,11 +251,11 @@ def should_broadcast(now: datetime | None = None) -> bool:
         now = now.astimezone(IL_TZ)
     wd = now.weekday()  # Mon=0 ... Sun=6 (אצלנו: ראשון=6)
     t = now.time()
-    if wd in (6, 0, 1, 2, 3):  # ראשון–חמישי
+    if wd in (6, 0, 1, 2, 3):
         return dtime(6, 0) <= t <= dtime(23, 59)
-    if wd == 4:  # שישי
+    if wd == 4:
         return dtime(6, 0) <= t <= dtime(17, 59)
-    if wd == 5:  # שבת
+    if wd == 5:
         return dtime(20, 15) <= t <= dtime(23, 59)
     return False
 
@@ -269,7 +271,7 @@ def set_schedule_enforced(enabled: bool) -> None:
             if os.path.exists(SCHEDULE_FLAG_FILE):
                 os.remove(SCHEDULE_FLAG_FILE)
     except Exception as e:
-        print(f"[WARN] Failed to set schedule mode: {e}")
+        print(f"[WARN] Failed to set schedule mode: {e}", flush=True)
 
 def is_quiet_now(now: datetime | None = None) -> bool:
     return not should_broadcast(now) if is_schedule_enforced() else False
@@ -381,7 +383,45 @@ def post_to_channel(product):
             resp.raise_for_status()
             bot.send_photo(target, resp.content, caption=post_text)
     except Exception as e:
-        print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}")
+        print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}", flush=True)
+
+
+# ========= ATOMIC SEND (מניעת כפילות) =========
+def send_next_locked(source: str = "loop") -> bool:
+    """
+    שולח את הפריט הראשון בתור (אם יש), מעדכן את pending.csv ומדפיס לוגים.
+    מחזיר True אם נשלח משהו.
+    """
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        if not pending:
+            print(f"[{datetime.now(tz=IL_TZ)}] {source}: no pending", flush=True)
+            return False
+
+        item = pending[0]
+        item_id = (item.get("ItemId") or "").strip()
+        title = (item.get("Title") or "").strip()[:120]
+        print(f"[{datetime.now(tz=IL_TZ)}] {source}: sending ItemId={item_id} | Title={title}", flush=True)
+
+        try:
+            post_to_channel(item)
+        except Exception as e:
+            print(f"[{datetime.now(tz=IL_TZ)}] {source}: send FAILED: {e}", flush=True)
+            return False
+
+        try:
+            write_products(PENDING_CSV, pending[1:])
+        except Exception as e:
+            print(f"[{datetime.now(tz=IL_TZ)}] {source}: write FAILED, retry once: {e}", flush=True)
+            time.sleep(0.2)
+            try:
+                write_products(PENDING_CSV, pending[1:])
+            except Exception as e2:
+                print(f"[{datetime.now(tz=IL_TZ)}] {source}: write FAILED permanently: {e2}", flush=True)
+                return True
+
+        print(f"[{datetime.now(tz=IL_TZ)}] {source}: sent & advanced queue", flush=True)
+        return True
 
 
 # ========= DELAY (מרווח) =========
@@ -401,7 +441,7 @@ def save_delay_seconds(seconds: int) -> None:
         with open(DELAY_FILE, "w", encoding="utf-8") as f:
             f.write(str(seconds))
     except Exception as e:
-        print(f"[WARN] Failed to save delay: {e}")
+        print(f"[WARN] Failed to save delay: {e}", flush=True)
 
 POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
 
@@ -497,30 +537,26 @@ def on_inline_click(c):
     chat_id = c.message.chat.id
 
     if data == "publish_now":
-        pending = read_products(PENDING_CSV)
-        if not pending:
-            bot.answer_callback_query(c.id, "אין פוסטים ממתינים ✅", show_alert=True)
+        ok = send_next_locked("manual")
+        if not ok:
+            bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
             return
-        item = pending[0]
-        try:
-            post_to_channel(item)
-            write_products(PENDING_CSV, pending[1:])
-            safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                              new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
-        except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בשליחה: {e}", show_alert=True)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "skip_one":
-        pending = read_products(PENDING_CSV)
-        if not pending:
-            bot.answer_callback_query(c.id, "אין מה לדלג – התור ריק.", show_alert=True)
-            return
-        write_products(PENDING_CSV, pending[1:])
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+            if not pending:
+                bot.answer_callback_query(c.id, "אין מה לדלג – התור ריק.", show_alert=True)
+                return
+            write_products(PENDING_CSV, pending[1:])
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text="⏭ דילגתי על הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "list_pending":
-        pending = read_products(PENDING_CSV)
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
         if not pending:
             bot.answer_callback_query(c.id, "אין פוסטים ממתינים ✅", show_alert=True)
             return
@@ -540,7 +576,8 @@ def on_inline_click(c):
                           reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "pending_status":
-        pending = read_products(PENDING_CSV)
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
         count = len(pending)
         now_il = datetime.now(tz=IL_TZ)
         schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
@@ -602,7 +639,8 @@ def on_inline_click(c):
             return
         CURRENT_TARGET = resolve_target(v)
         src_rows = read_products(DATA_CSV)
-        write_products(PENDING_CSV, src_rows)
+        with FILE_LOCK:
+            write_products(PENDING_CSV, src_rows)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🎯 עברתי לשדר ליעד הציבורי: {v}\n🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n{details}",
@@ -615,7 +653,8 @@ def on_inline_click(c):
             return
         CURRENT_TARGET = resolve_target(v)
         src_rows = read_products(DATA_CSV)
-        write_products(PENDING_CSV, src_rows)
+        with FILE_LOCK:
+            write_products(PENDING_CSV, src_rows)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🔒 עברתי לשדר ליעד הפרטי: {v}\n🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n{details}",
@@ -661,7 +700,6 @@ def handle_forward_for_target(msg):
     username = fwd.username or ""
     target_value = f"@{username}" if username else chat_id
 
-    # שמירה
     if mode == "public":
         _save_preset(PUBLIC_PRESET_FILE, target_value)
         label = "ציבורי"
@@ -669,11 +707,11 @@ def handle_forward_for_target(msg):
         _save_preset(PRIVATE_PRESET_FILE, target_value)
         label = "פרטי"
 
-    # העברה + אתחול תור + בדיקת יעד
     global CURRENT_TARGET
     CURRENT_TARGET = resolve_target(target_value)
     src_rows = read_products(DATA_CSV)
-    write_products(PENDING_CSV, src_rows)
+    with FILE_LOCK:
+        write_products(PENDING_CSV, src_rows)
     ok, details = check_and_probe_target(CURRENT_TARGET)
 
     EXPECTING_TARGET.pop(msg.from_user.id, None)
@@ -695,7 +733,8 @@ def cmd_cancel(msg):
 
 @bot.message_handler(commands=['list_pending'])
 def list_pending(msg):
-    pending = read_products(PENDING_CSV)
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
     if not pending:
         bot.reply_to(msg, "אין פוסטים ממתינים ✅")
         return
@@ -717,7 +756,8 @@ def clear_pending(msg):
     if not _is_admin(msg):
         bot.reply_to(msg, "אין הרשאה.")
         return
-    write_products(PENDING_CSV, [])
+    with FILE_LOCK:
+        write_products(PENDING_CSV, [])
     bot.reply_to(msg, "נוקה התור של הפוסטים הממתינים 🧹")
 
 @bot.message_handler(commands=['reset_pending'])
@@ -726,7 +766,8 @@ def reset_pending(msg):
         bot.reply_to(msg, "אין הרשאה.")
         return
     src = read_products(DATA_CSV)
-    write_products(PENDING_CSV, src)
+    with FILE_LOCK:
+        write_products(PENDING_CSV, src)
     bot.reply_to(msg, "התור אופס מהקובץ הראשי והכול נטען מחדש 🔄")
 
 @bot.message_handler(commands=['skip_one'])
@@ -734,16 +775,18 @@ def skip_one(msg):
     if not _is_admin(msg):
         bot.reply_to(msg, "אין הרשאה.")
         return
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין מה לדלג – אין פוסטים ממתינים.")
-        return
-    write_products(PENDING_CSV, pending[1:])
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        if not pending:
+            bot.reply_to(msg, "אין מה לדלג – אין פוסטים ממתינים.")
+            return
+        write_products(PENDING_CSV, pending[1:])
     bot.reply_to(msg, "דילגתי על הפוסט הבא ✅")
 
 @bot.message_handler(commands=['peek_next'])
 def peek_next(msg):
-    pending = read_products(PENDING_CSV)
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
     if not pending:
         bot.reply_to(msg, "אין פוסטים ממתינים ✅")
         return
@@ -759,7 +802,8 @@ def peek_idx(msg):
         bot.reply_to(msg, "שימוש: /peek_idx N  (לדוגמה: /peek_idx 3)")
         return
     idx = int(parts[1])
-    pending = read_products(PENDING_CSV)
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
     if not pending:
         bot.reply_to(msg, "אין פוסטים ממתינים ✅")
         return
@@ -772,7 +816,8 @@ def peek_idx(msg):
 
 @bot.message_handler(commands=['pending_status'])
 def pending_status(msg):
-    pending = read_products(PENDING_CSV)
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
     count = len(pending)
     now_il = datetime.now(tz=IL_TZ)
     schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
@@ -809,7 +854,7 @@ def cmd_start(msg):
             EXPECTING_TARGET.pop(uid, None)
     except Exception:
         pass
-    print(f"Instance={socket.gethostname()} | User={msg.from_user.id if msg.from_user else 'N/A'} sent /start")
+    print(f"Instance={socket.gethostname()} | User={msg.from_user.id if msg.from_user else 'N/A'} sent /start", flush=True)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
 
@@ -821,40 +866,42 @@ def run_sender_loop():
 
     while True:
         if is_quiet_now():
-            now_il = datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
-            print(f"[{now_il}] Quiet (schedule enforced) — not broadcasting.")
+            now_il = datetime.now(tz=IL_TZ)
+            print(f"[{now_il}] quiet hours ON – sleeping 30s", flush=True)
             DELAY_EVENT.wait(timeout=30)
             DELAY_EVENT.clear()
             continue
 
-        pending = read_products(PENDING_CSV)
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
         if not pending:
-            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] No pending posts.")
+            print(f"[{datetime.now(tz=IL_TZ)}] queue empty – sleeping 30s", flush=True)
             DELAY_EVENT.wait(timeout=30)
             DELAY_EVENT.clear()
             continue
 
-        product = pending[0]
-        post_to_channel(product)
-        write_products(PENDING_CSV, pending[1:])
+        # שליחה אטומית
+        send_next_locked("loop")
 
+        # המתנה למרווח (או עד לשינוי מרווח)
+        print(f"[{datetime.now(tz=IL_TZ)}] sleeping for {POST_DELAY_SECONDS}s (or until delay changed)", flush=True)
         DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
         DELAY_EVENT.clear()
 
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    print(f"Instance: {socket.gethostname()}")
+    print(f"Instance: {socket.gethostname()}", flush=True)
     try:
         me = bot.get_me()
-        print(f"Bot: @{me.username} ({me.id})")
+        print(f"Bot: @{me.username} ({me.id})", flush=True)
     except Exception as e:
-        print("getMe failed:", e)
+        print("getMe failed:", e, flush=True)
 
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
         import sys
-        print("Another instance is running (lock failed). Exiting.")
+        print("Another instance is running (lock failed). Exiting.", flush=True)
         sys.exit(1)
 
     print_webhook_info()
@@ -865,7 +912,7 @@ if __name__ == "__main__":
         try:
             bot.remove_webhook()
         except Exception as e2:
-            print(f"[WARN] remove_webhook failed: {e2}")
+            print(f"[WARN] remove_webhook failed: {e2}", flush=True)
     print_webhook_info()
 
     t = threading.Thread(target=run_sender_loop, daemon=True)
@@ -877,5 +924,5 @@ if __name__ == "__main__":
         except Exception as e:
             msg = str(e)
             wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...")
+            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
             time.sleep(wait)
