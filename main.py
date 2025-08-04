@@ -711,7 +711,7 @@ def _handle_set_private_value(msg, v):
     bot.reply_to(msg, f"נשמר פריסט פרטי: {v}")
 
 @bot.message_handler(commands=['use_public'])
-\1re_ok, re_info = reload_pending_from_data()
+re_ok, re_info = reload_pending_from_data()
     ok, details, _ = _check_target_permissions(v)
     if ok:
         bot.reply_to(msg, f"עברתי לשידור ליעד הציבורי: {v} ✅\n{details}")
@@ -719,7 +719,7 @@ def _handle_set_private_value(msg, v):
         bot.reply_to(msg, f"עודכן יעד ציבורי: {v}, אך יש בעיה בהרשאות/זיהוי היעד ⚠️\n{details}")
 
 @bot.message_handler(commands=['use_private'])
-\1re_ok, re_info = reload_pending_from_data()
+re_ok, re_info = reload_pending_from_data()
     ok, details, _ = _check_target_permissions(v)
     if ok:
         bot.reply_to(msg, f"עברתי לשידור ליעד הפרטי: {v} ✅\n{details}")
