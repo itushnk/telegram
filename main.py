@@ -11,9 +11,40 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כאן
-CHANNEL_ID = "@nisayon121"       # ← עדכן כאן (למשל: "@my_channel")
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # ← עדכן כאן
+CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"       # ← עדכן כאן (למשל: "@my_channel")
 ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789}
+
+# תמיכה בהחלפת ערוץ בזמן ריצה (פרטי/ציבורי) בלי לפרוס קוד מחדש
+CHANNEL_FILE = "channel_id.cfg"  # נשמר בו היעד הנוכחי (@name או -100...)
+
+def load_channel_id():
+    """קורא את יעד השידור. קדימות: ENV CHANNEL_ID -> קובץ -> הקבוע בקוד."""
+    try:
+        env_val = os.getenv("CHANNEL_ID", "").strip()
+    except Exception:
+        env_val = ""
+    if env_val:
+        try:
+            return int(env_val) if env_val.startswith("-") else env_val
+        except Exception:
+            return env_val
+    try:
+        if os.path.exists(CHANNEL_FILE):
+            s = open(CHANNEL_FILE, "r", encoding="utf-8").read().strip()
+            return int(s) if s.startswith("-") else s
+    except Exception:
+        pass
+    return CHANNEL_ID
+
+def save_channel_id(val):
+    """שומר יעד שידור חדש (מחרוזת @name או מספר -100...)."""
+    try:
+        with open(CHANNEL_FILE, "w", encoding="utf-8") as f:
+            f.write(str(val))
+    except Exception as e:
+        print(f"[WARN] Failed to persist channel id: {e}")
+
 
 # קבצים
 DATA_CSV = "workfile.csv"           # קובץ המקור שאתה מכין
@@ -84,7 +115,8 @@ def acquire_single_instance_lock(lock_path: str = "bot.lock"):
 
 
 # ========= WEBHOOK DIAGNOSTICS =========
-def print_webhook_info():
+def print_webhook_info()
+    print_current_channel_target():
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
         r = requests.get(url, timeout=10)
@@ -286,15 +318,16 @@ def format_post(product):
 def post_to_channel(product):
     try:
         post_text, image_url = format_post(product)
+        target = load_channel_id()
         video_url = (product.get('Video Url') or "").strip()
         if video_url.endswith('.mp4'):
             resp = SESSION.get(video_url, timeout=20)
             resp.raise_for_status()
-            bot.send_video(CHANNEL_ID, resp.content, caption=post_text)
+            bot.send_video(target, resp.content, caption=post_text)
         else:
             resp = SESSION.get(image_url, timeout=20)
             resp.raise_for_status()
-            bot.send_photo(CHANNEL_ID, resp.content, caption=post_text)
+            bot.send_photo(target, resp.content, caption=post_text)
     except Exception as e:
         print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}")
 
@@ -505,6 +538,34 @@ def cmd_set_delay_30m(msg):
     set_post_delay(30 * 60)
     bot.reply_to(msg, "עודכן מרווח בין פוסטים ל-30 דקות.")
 
+
+
+# ========= Channel target commands =========
+@bot.message_handler(commands=['set_channel_id'])
+def cmd_set_channel_id(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(msg, "שימוש: /set_channel_id <@PublicName | -100XXXXXXXXXXXX>")
+        return
+    new_id = parts[1].strip()
+    try:
+        if new_id.startswith("-"):
+            new_id = int(new_id)
+    except ValueError:
+        bot.reply_to(msg, "chat_id לא חוקי.")
+        return
+    save_channel_id(new_id)
+    bot.reply_to(msg, f"עודכן יעד השידור ל־{new_id}")
+
+@bot.message_handler(commands=['channel_status'])
+def cmd_channel_status(msg):
+    cur = load_channel_id()
+    typ = "פרטי (-100…)" if isinstance(cur, int) else "ציבורי (@name)"
+    bot.reply_to(msg, f"Channel target: {cur} ({typ})")
+
 # ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
@@ -535,6 +596,8 @@ def cmd_start(msg):
 • /clear_pending – ניקוי התור
 • /reset_pending – טעינה מחדש מהקובץ
 • /force_send_next – שליחה כפויה של הפריט הבא (עוקף שקט)
+• /channel_status – יעד השידור הנוכחי
+• /set_channel_id <@name|-100…> – עדכון יעד השידור
 • /set_delay_10m – קבע מרווח ל-10 דקות
 • /set_delay_20m – קבע מרווח ל-20 דקות
 • /set_delay_25m – קבע מרווח ל-25 דקות
@@ -566,10 +629,21 @@ def run_sender_loop():
         time.sleep(get_post_delay())
 
 
+
+
+def print_current_channel_target():
+    try:
+        cur = load_channel_id()
+        kind = "INT" if isinstance(cur, int) else "STR"
+        print(f"[BOOT] Channel target: {cur} (type={kind})")
+    except Exception as e:
+        print(f"[BOOT] Channel target check failed: {e}")
+
 # ========= MAIN =========
 if __name__ == "__main__":
     _lock_handle = acquire_single_instance_lock()
     print_webhook_info()
+    print_current_channel_target()
     try:
         force_delete_webhook()
         bot.delete_webhook(drop_pending_updates=True)
@@ -579,6 +653,7 @@ if __name__ == "__main__":
         except Exception as e2:
             print(f"[WARN] remove_webhook failed: {e2}")
     print_webhook_info()
+    print_current_channel_target()
     t = threading.Thread(target=run_sender_loop, daemon=True)
     t.start()
     while True:
