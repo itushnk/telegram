@@ -328,7 +328,7 @@ def format_post(product):
     rating_percent = rating if rating else "אין דירוג"
     orders_num = safe_int(orders, default=0)
     orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
-    discount_text = f"💸 חיסכון של {discount}!" אם discount and discount != "0%" else ""
+    discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
 
     lines = []
