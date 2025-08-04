@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כאן אם צריך
+BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן אם צריך
 CHANNEL_ID = "@nisayon121"       # יעד ברירת מחדל (ציבורי)
 ADMIN_USER_IDS = set()           # מומלץ להגדיר: {123456789}
 
@@ -28,11 +28,9 @@ SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (שי�
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
-
-# אזור זמן ישראל
 IL_TZ = ZoneInfo("Asia/Jerusalem")
 
-# יעד נוכחי (מתחיל כברירת מחדל = CHANNEL_ID)
+# יעד נוכחי (ברירת מחדל)
 CURRENT_TARGET = CHANNEL_ID
 
 # Event שמעיר את לולאת השליחה כשמשנים מרווח
@@ -238,42 +236,13 @@ def _check_target_permissions(target):
     except Exception as e:
         return False, f"שגיאה בהרשאות/זיהוי היעד: {e}"
 
-# פקודות קצרות להגדרת היעדים פעם אחת:
-@bot.message_handler(commands=['set_public'])
-def cmd_set_public(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(msg, "שימוש: /set_public @name")
-        return
-    v = parts[1].strip()
-    _save_preset(PUBLIC_PRESET_FILE, v)
-    bot.reply_to(msg, f"נשמר יעד ציבורי: {v}")
 
-@bot.message_handler(commands=['set_private'])
-def cmd_set_private(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(msg, "שימוש: /set_private -1001234567890  (או @name)")
-        return
-    v = parts[1].strip()
-    try:
-        if v.startswith("-"):
-            v = int(v)  # chat_id מספרי
-    except ValueError:
-        bot.reply_to(msg, "ערך לא חוקי ליעד פרטי.")
-        return
-    _save_preset(PRIVATE_PRESET_FILE, v)
-    bot.reply_to(msg, f"נשמר יעד פרטי: {v}")
-
-
-# ========= POSTING (שומר על הפורמט הישן) =========
+# ========= POSTING (Opening/Strengths רק מה-CSV) =========
 def format_post(product):
+    """
+    תיאור (Opening) ונקודות חוזק (Strengths) נלקחים *רק* מה-CSV.
+    אין טקסט גנרי על המוצר. שאר המבנה נשאר כבעבר.
+    """
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
     title = product.get('Title', '')
@@ -284,7 +253,10 @@ def format_post(product):
     orders = product.get('Orders', '')
     buy_link = product.get('BuyLink', '')
     coupon = product.get('CouponCode', '')
-    opening = product.get('Opening', '')
+
+    # תיאור ונקודות חוזק מתוך הקובץ בלבד
+    opening = (product.get('Opening') or '').strip()
+    strengths_src = (product.get("Strengths") or "").strip()
 
     rating_percent = rating if rating else "אין דירוג"
     orders_num = safe_int(orders, default=0)
@@ -292,30 +264,41 @@ def format_post(product):
     discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
 
-    post = f"""{opening}
+    # בניית הטקסט: Opening+Title מהCSV, Strengths רק אם מולא בקובץ (ללא שורות גנריות)
+    lines = []
+    if opening:
+        lines.append(opening)
+        lines.append("")
+    if title:
+        lines.append(title)
+        lines.append("")
 
-{title}
+    if strengths_src:
+        for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
+            if part:
+                lines.append(part)
+        lines.append("")
 
-✨ נוח במיוחד לשימוש יומיומי
-🔧 איכות גבוהה ועמידות לאורך זמן
-🎨 מגיע במבחר גרסאות – בדקו בקישור!
+    price_line = f'💰 מחיר מבצע: <a href="{buy_link}">{sale_price} ש"ח</a> (מחיר מקורי: {original_price} ש"ח)'
+    lines += [
+        price_line,
+        discount_text,
+        f"⭐ דירוג: {rating_percent}",
+        f"📦 {orders_text}",
+        "🚚 משלוח חינם מעל 38 ש\"ח או 7.49 ש\"ח",
+        "",
+        coupon_text if coupon_text else "",
+        "",
+        f'להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>',
+        "",
+        f"מספר פריט: {item_id}",
+        'להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>',
+        "",
+        "👇🛍הזמינו עכשיו🛍👇",
+        f'<a href="{buy_link}">לחיצה וזה בדרך </a>',
+    ]
 
-💰 מחיר מבצע: <a href="{buy_link}">{sale_price} ש"ח</a> (מחיר מקורי: {original_price} ש"ח)
-{discount_text}
-⭐ דירוג: {rating_percent}
-📦 {orders_text}
-🚚 משלוח חינם מעל 38 ש"ח או 7.49 ש"ח
-
-{coupon_text}
-
-להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>
-
-מספר פריט: {item_id}
-להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>
-
-👇🛍הזמינו עכשיו🛍👇
-<a href="{buy_link}">לחיצה וזה בדרך </a>
-"""
+    post = "\n".join([l for l in lines if l is not None and str(l).strip() != ""])
     return post, image_url
 
 
@@ -338,7 +321,7 @@ def post_to_channel(product):
 
 # ========= DELAY (מרווח בין פוסטים) =========
 def load_delay_seconds(default_seconds: int = 1500) -> int:
-    """טוען מרווח מהקובץ; אם אין, מחזיר ברירת מחדל (25 דקות = 1500ש')."""
+    """ברירת מחדל 25 דקות; אם יש קובץ delay – נטען ממנו."""
     try:
         if os.path.exists(DELAY_FILE):
             with open(DELAY_FILE, "r", encoding="utf-8") as f:
@@ -356,11 +339,10 @@ def save_delay_seconds(seconds: int) -> None:
     except Exception as e:
         print(f"[WARN] Failed to save delay: {e}")
 
-# ברירת מחדל 25 דקות (1500ש'), נטען מהקובץ אם קיים:
-POST_DELAY_SECONDS = load_delay_seconds(1500)
+POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
 
 
-# ========= ADMIN COMMANDS =========
+# ========= ADMIN/STATUS =========
 def _is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
         return True
@@ -472,12 +454,12 @@ def pending_status(msg):
     bot.reply_to(msg, msg_text, parse_mode='HTML')
 
 
-# ========= INLINE MENU (עברית) =========
+# ========= INLINE MENU =========
 def inline_menu():
-    """תפריט אינליין בעברית, כולל בחירת מרווח ומעבר יעד שידור."""
+    """תפריט אינליין בעברית: פעולות, מרווחים, מעבר יעד."""
     kb = types.InlineKeyboardMarkup(row_width=3)
 
-    # פעולות עיקריות
+    # פעולות
     kb.add(
         types.InlineKeyboardButton("📢 פרסם עכשיו", callback_data="publish_now"),
         types.InlineKeyboardButton("⏭ דלג פריט", callback_data="skip_one"),
@@ -489,7 +471,7 @@ def inline_menu():
         types.InlineKeyboardButton("🕒 מצב שינה (החלפה)", callback_data="toggle_schedule"),
     )
 
-    # בחירת מרווח
+    # מרווחים
     kb.add(
         types.InlineKeyboardButton("⏱️ דקה", callback_data="delay_60"),
         types.InlineKeyboardButton("⏱️ 15ד", callback_data="delay_900"),
@@ -498,21 +480,22 @@ def inline_menu():
         types.InlineKeyboardButton("⏱️ 30ד", callback_data="delay_1800"),
     )
 
-    # מעבר בין יעדים
+    # יעד ציבורי/פרטי
     kb.add(
         types.InlineKeyboardButton("🎯 ציבורי", callback_data="target_public"),
         types.InlineKeyboardButton("🔒 פרטי", callback_data="target_private"),
     )
 
-    # שורת מידע על מרווח ויעד נוכחי (כפתורי 'תצוגה בלבד')
-    current_min = POST_DELAY_SECONDS // 60
-    kb.add(types.InlineKeyboardButton(f"מרווח: ~{current_min} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"))
+    # מידע
+    kb.add(types.InlineKeyboardButton(
+        f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"
+    ))
     return kb
 
 def merge_from_data_into_pending():
     """
-    מוסיף לתור (PENDING_CSV) רק פריטים חדשים שמופיעים ב-DATA_CSV.
-    קריטריון ייחודי: (ItemId, BuyLink). אם אין ItemId – משתמשים ב-(Title, BuyLink).
+    מוסיף לתור רק פריטים חדשים שמופיעים ב-DATA_CSV.
+    ייחוד: (ItemId, BuyLink). אם אין ItemId – (Title, BuyLink).
     """
     data_rows = read_products(DATA_CSV)
     pending_rows = read_products(PENDING_CSV)
@@ -538,6 +521,7 @@ def merge_from_data_into_pending():
 
     write_products(PENDING_CSV, pending_rows)
     return added, already, len(pending_rows)
+
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
@@ -663,10 +647,9 @@ def on_inline_click(c):
         if v is None:
             bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. הגדר: /set_private -100... (או @name)", show_alert=True)
             return
-        # אם שמור כמספר במחרוזת שמתחילה במינוס – הפוך ל-int
         try:
             if isinstance(v, str) and v.strip().startswith("-"):
-                v = int(v)
+                v = int(v)  # chat_id מספרי
         except Exception:
             pass
         _set_current_target(v)
@@ -677,21 +660,18 @@ def on_inline_click(c):
         )
 
     else:
-        # כפתור "תצוגה בלבד"
         bot.answer_callback_query(c.id, f"מרווח: ~{POST_DELAY_SECONDS // 60} דק׳ | יעד: {CURRENT_TARGET}", show_alert=True)
 
 
-# ========= /start: מציג תפריט אינליין =========
+# ========= /start: תפריט אינליין =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
-    text = "בחר פעולה:"
-    bot.send_message(msg.chat.id, text, reply_markup=inline_menu())
+    bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
 
-# ========= SENDER LOOP (BACKGROUND) =========
+# ========= SENDER LOOP =========
 def run_sender_loop():
     if not os.path.exists(SCHEDULE_FLAG_FILE):
-        # ברירת מחדל: שינה פעיל (כיבוד שעות)
         set_schedule_enforced(True)
     init_pending()
 
@@ -714,7 +694,6 @@ def run_sender_loop():
         post_to_channel(product)
         write_products(PENDING_CSV, pending[1:])
 
-        # שינה חכמה: עד המרווח או עד שינוי מרווח
         DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
         DELAY_EVENT.clear()
 
