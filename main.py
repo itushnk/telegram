@@ -11,8 +11,8 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # ← עדכן כאן
-CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"       # ← עדכן כאן (למשל: "@my_channel")
+BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כאן
+CHANNEL_ID = "@nisayon121"       # ← עדכן כאן (למשל: "@my_channel")
 ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789}
 
 # תמיכה בהחלפת ערוץ בזמן ריצה (פרטי/ציבורי) בלי לפרוס קוד מחדש
@@ -21,7 +21,7 @@ CHANNEL_FILE = "channel_id.cfg"  # נשמר בו היעד הנוכחי (@name א
 def load_channel_id():
     """קורא את יעד השידור. קדימות: ENV CHANNEL_ID -> קובץ -> הקבוע בקוד."""
     try:
-        env_val = os.getenv("CHANNEL_ID", "").strip()
+        env_val = os.getenv("-1001371533401", "").strip()
     except Exception:
         env_val = ""
     if env_val:
@@ -45,6 +45,55 @@ def save_channel_id(val):
     except Exception as e:
         print(f"[WARN] Failed to persist channel id: {e}")
 
+
+
+# פריסת פריסטים לערוצים ציבורי/פרטי
+PUBLIC_PRESET_FILE = "public_target.cfg"
+PRIVATE_PRESET_FILE = "private_target.cfg"
+
+def save_public_preset(val):
+    try:
+        with open(PUBLIC_PRESET_FILE, "w", encoding="utf-8") as f:
+            f.write(str(val))
+    except Exception as e:
+        print(f"[WARN] Failed to save public preset: {e}")
+
+def save_private_preset(val):
+    try:
+        with open(PRIVATE_PRESET_FILE, "w", encoding="utf-8") as f:
+            f.write(str(val))
+    except Exception as e:
+        print(f"[WARN] Failed to save private preset: {e}")
+
+def load_public_preset():
+    try:
+        if os.path.exists(PUBLIC_PRESET_FILE):
+            s = open(PUBLIC_PRESET_FILE, "r", encoding="utf-8").read().strip()
+            return int(s) if s.startswith("-") else s
+    except Exception:
+        pass
+    env_val = os.getenv("PUBLIC_CHANNEL_ID", "").strip() if os.getenv("PUBLIC_CHANNEL_ID") else ""
+    if env_val:
+        try:
+            return int(env_val) if env_val.startswith("-") else env_val
+        except Exception:
+            return env_val
+    return None
+
+def load_private_preset():
+    try:
+        if os.path.exists(PRIVATE_PRESET_FILE):
+            s = open(PRIVATE_PRESET_FILE, "r", encoding="utf-8").read().strip()
+            return int(s) if s.startswith("-") else s
+    except Exception:
+        pass
+    env_val = os.getenv("PRIVATE_CHANNEL_ID", "").strip() if os.getenv("PRIVATE_CHANNEL_ID") else ""
+    if env_val:
+        try:
+            return int(env_val) if env_val.startswith("-") else env_val
+        except Exception:
+            return env_val
+    return None
 
 # קבצים
 DATA_CSV = "workfile.csv"           # קובץ המקור שאתה מכין
@@ -566,6 +615,71 @@ def cmd_channel_status(msg):
     typ = "פרטי (-100…)" if isinstance(cur, int) else "ציבורי (@name)"
     bot.reply_to(msg, f"Channel target: {cur} ({typ})")
 
+
+
+# ========= Public/Private preset commands =========
+@bot.message_handler(commands=['set_public'])
+def cmd_set_public(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(msg, "שימוש: /set_public <@PublicName | -100XXXXXXXXXXXX>")
+        return
+    v = parts[1].strip()
+    try:
+        if v.startswith("-"):
+            v = int(v)
+    except ValueError:
+        bot.reply_to(msg, "ערך לא חוקי לפריסט ציבורי.")
+        return
+    save_public_preset(v)
+    bot.reply_to(msg, f"נשמר פריסט ציבורי: {v}")
+
+@bot.message_handler(commands=['set_private'])
+def cmd_set_private(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(msg, "שימוש: /set_private <-100XXXXXXXXXXXX> או @name (לא מומלץ לפרטי)")
+        return
+    v = parts[1].strip()
+    try:
+        if v.startswith("-"):
+            v = int(v)
+    except ValueError:
+        bot.reply_to(msg, "ערך לא חוקי לפריסט פרטי.")
+        return
+    save_private_preset(v)
+    bot.reply_to(msg, f"נשמר פריסט פרטי: {v}")
+
+@bot.message_handler(commands=['use_public'])
+def cmd_use_public(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    v = load_public_preset()
+    if v is None:
+        bot.reply_to(msg, "לא הוגדר פריסט ציבורי. השתמש ב-/set_public קודם.")
+        return
+    save_channel_id(v)
+    bot.reply_to(msg, f"עברתי לשידור ליעד הציבורי: {v}")
+
+@bot.message_handler(commands=['use_private'])
+def cmd_use_private(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    v = load_private_preset()
+    if v is None:
+        bot.reply_to(msg, "לא הוגדר פריסט פרטי. השתמש ב-/set_private קודם.")
+        return
+    save_channel_id(v)
+    bot.reply_to(msg, f"עברתי לשידור ליעד הפרטי: {v}")
+
 # ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
@@ -598,6 +712,10 @@ def cmd_start(msg):
 • /force_send_next – שליחה כפויה של הפריט הבא (עוקף שקט)
 • /channel_status – יעד השידור הנוכחי
 • /set_channel_id <@name|-100…> – עדכון יעד השידור
+• /use_public – מעבר מהיר לפריסט הציבורי
+• /use_private – מעבר מהיר לפריסט הפרטי
+• /set_public <@name|-100…> – שמירת פריסט ציבורי
+• /set_private <@name|-100…> – שמירת פריסט פרטי
 • /set_delay_10m – קבע מרווח ל-10 דקות
 • /set_delay_20m – קבע מרווח ל-20 דקות
 • /set_delay_25m – קבע מרווח ל-25 דקות
