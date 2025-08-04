@@ -8,11 +8,12 @@ import threading
 import os
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
+import socket
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן אם צריך
-CHANNEL_ID = "@nisayon121"       # יעד ברירת מחדל (ציבורי)
-ADMIN_USER_IDS = set()           # מומלץ להגדיר: {123456789}
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4")  # רצוי לשים ב-ENV
+CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ברירת מחדל (ציבורי)
+ADMIN_USER_IDS = set()  # מומלץ להגדיר: {123456789}
 
 # קבצים
 DATA_CSV = "workfile.csv"        # קובץ המקור
@@ -23,6 +24,7 @@ PRIVATE_PRESET_FILE = "private_target.preset"
 
 # מצב עבודה (חלונות שידור): 'מתוזמן' או 'תמיד-פעיל' באמצעות דגל קובץ
 SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (שינה פעיל), לא קיים => תמיד-פעיל
+LOCK_PATH = os.environ.get("BOT_LOCK_PATH", "/tmp/bot.lock")  # למניעת ריבוי מופעים באותו קונטיינר
 
 # ========= INIT =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -236,6 +238,49 @@ def _check_target_permissions(target):
         return False, f"שגיאה בהרשאות/זיהוי היעד: {e}"
 
 
+# ========= SAFE EDIT (מניעת 400 message is not modified) =========
+def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
+    """
+    עורכת הודעה רק אם צריך. אם אין שינוי – מנסה לעדכן רק reply_markup.
+    אם גם זה לא השתנה – סוגרת את ה-callback בשקט.
+    """
+    try:
+        curr_text = (message.text or message.caption or "")
+        if curr_text == (new_text or ""):
+            # נסה לשנות רק מקלדת
+            try:
+                if reply_markup is not None:
+                    bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
+                    if cb_id:
+                        bot.answer_callback_query(cb_id)
+                    return
+                if cb_id:
+                    bot.answer_callback_query(cb_id)
+                return
+            except Exception as e_rm:
+                if "message is not modified" in str(e_rm):
+                    if cb_id:
+                        bot.answer_callback_query(cb_id)
+                    return
+                # ננסה עריכת טקסט מלאה בכל זאת
+        bot.edit_message_text(
+            new_text, chat_id, message.message_id,
+            reply_markup=reply_markup, parse_mode=parse_mode
+        )
+        if cb_id:
+            bot.answer_callback_query(cb_id)
+    except Exception as e:
+        s = str(e)
+        if "message is not modified" in s:
+            if cb_id:
+                bot.answer_callback_query(cb_id)
+            return
+        if cb_id and cb_info:
+            bot.answer_callback_query(cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
+        else:
+            raise
+
+
 # ========= POSTING =========
 def format_post(product):
     """
@@ -443,7 +488,10 @@ def on_inline_click(c):
         try:
             post_to_channel(item)
             write_products(PENDING_CSV, pending[1:])
-            bot.edit_message_text("✅ נשלח הפריט הבא בתור.", chat_id, c.message.message_id, reply_markup=inline_menu())
+            safe_edit_message(
+                bot, chat_id=chat_id, message=c.message,
+                new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id
+            )
         except Exception as e:
             bot.answer_callback_query(c.id, f"שגיאה בשליחה: {e}", show_alert=True)
 
@@ -453,7 +501,10 @@ def on_inline_click(c):
             bot.answer_callback_query(c.id, "אין מה לדלג – התור ריק.", show_alert=True)
             return
         write_products(PENDING_CSV, pending[1:])
-        bot.edit_message_text("⏭ דילגתי על הפריט הבא בתור.", chat_id, c.message.message_id, reply_markup=inline_menu())
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text="⏭ דילגתי על הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id
+        )
 
     elif data == "list_pending":
         pending = read_products(PENDING_CSV)
@@ -471,7 +522,11 @@ def on_inline_click(c):
         more = len(pending) - len(preview)
         if more > 0:
             lines.append(f"...ועוד {more} בהמתנה")
-        bot.edit_message_text("📝 פוסטים ממתינים:\n\n" + "\n".join(lines), chat_id, c.message.message_id, reply_markup=inline_menu())
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text="📝 פוסטים ממתינים:\n\n" + "\n".join(lines),
+            reply_markup=inline_menu(), cb_id=c.id
+        )
 
     elif data == "pending_status":
         pending = read_products(PENDING_CSV)
@@ -498,22 +553,27 @@ def on_inline_click(c):
                 f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
                 f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
             )
-        bot.edit_message_text(text, chat_id, c.message.message_id, parse_mode='HTML', reply_markup=inline_menu())
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=text, reply_markup=inline_menu(), parse_mode='HTML', cb_id=c.id
+        )
 
     elif data == "reload_merge":
         added, already, total_after = merge_from_data_into_pending()
-        bot.edit_message_text(
-            f"🔄 מיזוג הושלם.\n"
-            f"נוספו: {added}\n"
-            f"בעבר בתור: {already}\n"
-            f"סה\"כ בתור כעת: {total_after}",
-            chat_id, c.message.message_id, reply_markup=inline_menu()
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=f"🔄 מיזוג הושלם.\nנוספו: {added}\nבעבר בתור: {already}\nסה\"כ בתור כעת: {total_after}",
+            reply_markup=inline_menu(), cb_id=c.id
         )
 
     elif data == "toggle_schedule":
         set_schedule_enforced(not is_schedule_enforced())
         state = "🕰️ מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 תמיד-פעיל"
-        bot.edit_message_text(f"החלפתי מצב לשידור: {state}", chat_id, c.message.message_id, reply_markup=inline_menu())
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=f"החלפתי מצב לשידור: {state}",
+            reply_markup=inline_menu(), cb_id=c.id
+        )
 
     elif data.startswith("delay_"):
         try:
@@ -524,9 +584,10 @@ def on_inline_click(c):
             save_delay_seconds(seconds)
             DELAY_EVENT.set()  # מעיר את הלולאה מיד
             mins = seconds // 60
-            bot.edit_message_text(
-                f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות).",
-                chat_id, c.message.message_id, reply_markup=inline_menu()
+            safe_edit_message(
+                bot, chat_id=chat_id, message=c.message,
+                new_text=f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות).",
+                reply_markup=inline_menu(), cb_id=c.id
             )
         except Exception as e:
             bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
@@ -541,11 +602,10 @@ def on_inline_click(c):
         src_rows = read_products(DATA_CSV)     # אתחול התור
         write_products(PENDING_CSV, src_rows)
         ok, details = _check_target_permissions(v)
-        bot.edit_message_text(
-            f"🎯 עברתי לשדר ליעד הציבורי: {v}\n"
-            f"🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n"
-            f"{details}",
-            chat_id, c.message.message_id, reply_markup=inline_menu()
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=f"🎯 עברתי לשדר ליעד הציבורי: {v}\n🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n{details}",
+            reply_markup=inline_menu(), cb_id=c.id
         )
 
     elif data == "target_private":
@@ -562,32 +622,33 @@ def on_inline_click(c):
         src_rows = read_products(DATA_CSV)     # אתחול התור
         write_products(PENDING_CSV, src_rows)
         ok, details = _check_target_permissions(v)
-        bot.edit_message_text(
-            f"🔒 עברתי לשדר ליעד הפרטי: {v}\n"
-            f"🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n"
-            f"{details}",
-            chat_id, c.message.message_id, reply_markup=inline_menu()
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=f"🔒 עברתי לשדר ליעד הפרטי: {v}\n🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n{details}",
+            reply_markup=inline_menu(), cb_id=c.id
         )
 
     # ---- בחירת יעד ע"י Forward ----
     elif data == "choose_public":
         EXPECTING_TARGET[c.from_user.id] = "public"
-        bot.edit_message_text(
-            "שלח/י לי *הודעה מועברת* (Forward) מאותו ערוץ **ציבורי** כדי לשמור אותו כיעד.\n\n"
-            "טיפ: פתח/י פוסט בערוץ, ••• → Forward → בחר/י את הבוט.",
-            chat_id, c.message.message_id, parse_mode='Markdown', reply_markup=inline_menu()
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=("שלח/י לי *הודעה מועברת* (Forward) מאותו ערוץ **ציבורי** כדי לשמור אותו כיעד.\n\n"
+                      "טיפ: פתח/י פוסט בערוץ, ••• → Forward → בחר/י את הבוט."),
+            reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id
         )
 
     elif data == "choose_private":
         EXPECTING_TARGET[c.from_user.id] = "private"
-        bot.edit_message_text(
-            "שלח/י לי *הודעה מועברת* (Forward) מאותו ערוץ **פרטי** כדי לשמור אותו כיעד.\n\n"
-            "חשוב: הוסף/י קודם את הבוט כמנהל בערוץ הפרטי.",
-            chat_id, c.message.message_id, parse_mode='Markdown', reply_markup=inline_menu()
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=("שלח/י לי *הודעה מועברת* (Forward) מאותו ערוץ **פרטי** כדי לשמור אותו כיעד.\n\n"
+                      "חשוב: הוסף/י קודם את הבוט כמנהל בערוץ הפרטי."),
+            reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id
         )
 
     else:
-        bot.answer_callback_query(c.id, f"מרווח: ~{POST_DELAY_SECONDS // 60} דק׳ | יעד: {CURRENT_TARGET}", show_alert=True)
+        bot.answer_callback_query(c.id)  # סגירה נקייה
 
 
 # ========= FORWARD HANDLER: שמירת יעד מתוך הודעה מועברת =========
@@ -742,6 +803,8 @@ def pending_status(msg):
 # ========= /start: תפריט אינליין =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
+    # אינדיקציה בלוג
+    print(f"Instance={socket.gethostname()} | User={msg.from_user.id if msg.from_user else 'N/A'} sent /start")
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
 
@@ -776,7 +839,19 @@ def run_sender_loop():
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    _lock_handle = acquire_single_instance_lock()
+    print(f"Instance: {socket.gethostname()}")
+    try:
+        me = bot.get_me()
+        print(f"Bot: @{me.username} ({me.id})")
+    except Exception as e:
+        print("getMe failed:", e)
+
+    _lock_handle = acquire_single_instance_lock(LOCK_PATH)
+    if _lock_handle is None:
+        import sys
+        print("Another instance is running (lock failed). Exiting.")
+        sys.exit(1)
+
     print_webhook_info()
     try:
         force_delete_webhook()
@@ -795,5 +870,11 @@ if __name__ == "__main__":
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
         except Exception as e:
-            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in 5s...")
-            time.sleep(5)
+            msg = str(e)
+            # ב-Railway בזמן blue/green ייתכן 409 כמה פעמים — תן מרווח
+            if "Conflict: terminated by other getUpdates request" in msg:
+                wait = 30
+            else:
+                wait = 5
+            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...")
+            time.sleep(wait)
