@@ -22,15 +22,16 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
-# נתיבי קבצים (ניתנים להגדרה ב-ENV כדי לעבוד עם Volume כמו /data)
-DATA_CSV = os.environ.get("DATA_CSV", "workfile.csv")             # קובץ המקור
-PENDING_CSV = os.environ.get("PENDING_CSV", "pending.csv")        # תור הפוסטים
-DELAY_FILE = os.environ.get("DELAY_FILE", "post_delay.txt")       # מרווח נבחר
-PUBLIC_PRESET_FILE  = os.environ.get("PUBLIC_PRESET_FILE",  "public_target.preset")
-PRIVATE_PRESET_FILE = os.environ.get("PRIVATE_PRESET_FILE", "private_target.preset")
-SCHEDULE_FLAG_FILE  = os.environ.get("SCHEDULE_FLAG_FILE", "schedule_enforced.flag")
-CONSUME_MODE_FILE   = os.environ.get("CONSUME_MODE_FILE", "consume_mode.flag")  # קיים => מוחקים גם מ-workfile.csv
-LOCK_PATH = os.environ.get("BOT_LOCK_PATH", "/tmp/bot.lock")  # נעילה למופע יחיד (עדיף לשים על Volume)
+# קבצים
+DATA_CSV = "workfile.csv"         # קובץ המקור
+PENDING_CSV = "pending.csv"       # תור הפוסטים
+DELAY_FILE = "post_delay.txt"     # מרווח נבחר
+PUBLIC_PRESET_FILE = "public_target.preset"
+PRIVATE_PRESET_FILE = "private_target.preset"
+
+# מצב עבודה (חלונות שידור)
+SCHEDULE_FLAG_FILE = "schedule_enforced.flag"
+LOCK_PATH = os.environ.get("BOT_LOCK_PATH", "/tmp/bot.lock")  # נעילה למופע יחיד בקונטיינר
 
 # ========= INIT =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -279,41 +280,6 @@ def is_quiet_now(now: datetime | None = None) -> bool:
     return not should_broadcast(now) if is_schedule_enforced() else False
 
 
-# ========= CONSUME MODE (מוחק גם מה-workfile.csv אחרי שליחה) =========
-def is_consume_mode() -> bool:
-    return os.path.exists(CONSUME_MODE_FILE)
-
-def set_consume_mode(enabled: bool) -> None:
-    try:
-        if enabled:
-            with open(CONSUME_MODE_FILE, "w", encoding="utf-8") as f:
-                f.write("on")
-        else:
-            if os.path.exists(CONSUME_MODE_FILE):
-                os.remove(CONSUME_MODE_FILE)
-    except Exception as e:
-        print(f"[WARN] Failed to set consume mode: {e}", flush=True)
-
-def _key_of_row(r):
-    item_id = (r.get("ItemId") or "").strip()
-    title   = (r.get("Title") or "").strip()
-    buy     = (r.get("BuyLink") or "").strip()
-    # כמו בלוגיקת המיזוג: אם יש ItemId משתמשים בו; אחרת Title+BuyLink
-    return (item_id if item_id else None, title if not item_id else None, buy)
-
-def remove_item_from_csv(path: str, key_tuple) -> bool:
-    """מסיר פריט תואם מ-CSV (אם נמצא), ושומר חזרה. מחזיר True אם הוסר משהו."""
-    if not os.path.exists(path):
-        return False
-    rows = read_products(path)
-    before = len(rows)
-    rows = [r for r in rows if _key_of_row(r) != key_tuple]
-    if len(rows) != before:
-        write_products(path, rows)
-        return True
-    return False
-
-
 # ========= SAFE EDIT (מניעת 400) =========
 def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
     try:
@@ -438,7 +404,6 @@ def send_next_locked(source: str = "loop") -> bool:
         item = pending[0]
         item_id = (item.get("ItemId") or "").strip()
         title = (item.get("Title") or "").strip()[:120]
-        key_t = _key_of_row(item)
         print(f"[{datetime.now(tz=IL_TZ)}] {source}: sending ItemId={item_id} | Title={title}", flush=True)
 
         try:
@@ -447,7 +412,6 @@ def send_next_locked(source: str = "loop") -> bool:
             print(f"[{datetime.now(tz=IL_TZ)}] {source}: send FAILED: {e}", flush=True)
             return False
 
-        # קדימת התור
         try:
             write_products(PENDING_CSV, pending[1:])
         except Exception as e:
@@ -458,11 +422,6 @@ def send_next_locked(source: str = "loop") -> bool:
             except Exception as e2:
                 print(f"[{datetime.now(tz=IL_TZ)}] {source}: write FAILED permanently: {e2}", flush=True)
                 return True
-
-        # מחיקה מה-workfile.csv אם מצב צריכה פעיל
-        if is_consume_mode():
-            removed = remove_item_from_csv(DATA_CSV, key_t)
-            print(f"[{datetime.now(tz=IL_TZ)}] {source}: consume_mode=True, removed_from_workfile={removed}", flush=True)
 
         print(f"[{datetime.now(tz=IL_TZ)}] {source}: sent & advanced queue", flush=True)
         return True
@@ -537,10 +496,6 @@ def inline_menu():
     )
     # ביטול בחירה
     kb.add(types.InlineKeyboardButton("❌ בטל בחירת יעד", callback_data="choose_cancel"))
-
-    # מצב צריכה
-    consume_label = "🗑️ מצב צריכה: פעיל" if is_consume_mode() else "🗑️ מצב צריכה: כבוי"
-    kb.add(types.InlineKeyboardButton(consume_label + " (החלפה)", callback_data="toggle_consume"))
 
     kb.add(types.InlineKeyboardButton(
         f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"
@@ -727,13 +682,6 @@ def on_inline_click(c):
                           new_text=f"החלפתי מצב לשידור: {state}",
                           reply_markup=inline_menu(), cb_id=c.id)
 
-    elif data == "toggle_consume":
-        set_consume_mode(not is_consume_mode())
-        state = "🗑️ צריכה פעילה (מוחק גם מה-workfile.csv)" if is_consume_mode() else "✅ צריכה כבויה (לא נוגע ב-workfile.csv)"
-        safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"החלפתי מצב: {state}",
-                          reply_markup=inline_menu(), cb_id=c.id)
-
     elif data.startswith("delay_"):
         try:
             seconds = int(data.split("_", 1)[1])
@@ -863,4 +811,269 @@ def on_document(msg):
         # לא במצב העלאה מבוקש — מתעלמים
         return
 
-   
+    try:
+        doc = msg.document
+        filename = (doc.file_name or "").lower()
+        if not filename.endswith(".csv"):
+            bot.reply_to(msg, "זה לא נראה כמו CSV. נסה/י שוב עם קובץ .csv")
+            return
+
+        # הורדת הקובץ מטלגרם
+        file_info = bot.get_file(doc.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+
+        csv_text = _decode_csv_bytes(file_bytes)
+        rows = _read_source_csv_text(csv_text)
+
+        if not rows:
+            bot.reply_to(msg, "לא הצלחתי לקרוא נתונים מה-CSV. ודא/י שיש כותרות ושורות.")
+            return
+
+        # כתיבה ל-workfile.csv + מיזוג ל-pending.csv — נעילה כדי למנוע מירוץ
+        with FILE_LOCK:
+            _save_workfile(rows)
+            added, already, total_after = _merge_to_pending_from_rows(rows)
+
+        bot.reply_to(msg,
+            "✅ הקובץ נקלט בהצלחה.\n"
+            f"נוספו לתור: {added}\nכבר היו בתור: {already}\nסה\"כ בתור כעת: {total_after}\n\n"
+            "השידור ממשיך בקצב שנקבע. אפשר לבדוק '📊 סטטוס שידור' בתפריט."
+        )
+
+    except Exception as e:
+        bot.reply_to(msg, f"שגיאה בעיבוד הקובץ: {e}")
+    finally:
+        if uid in EXPECTING_UPLOAD:
+            EXPECTING_UPLOAD.remove(uid)
+
+
+# ========= TEXT COMMANDS =========
+@bot.message_handler(commands=['cancel'])
+def cmd_cancel(msg):
+    uid = getattr(msg.from_user, "id", None)
+    if uid is not None:
+        EXPECTING_TARGET.pop(uid, None)
+        EXPECTING_UPLOAD.discard(uid)
+    bot.reply_to(msg, "בוטל מצב בחירת יעד/העלאה. שלח /start לתפריט.")
+
+@bot.message_handler(commands=['list_pending'])
+def list_pending(msg):
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    preview = pending[:10]
+    lines = []
+    for i, p in enumerate(preview, start=1):
+        title = str(p.get('Title',''))[:80]
+        sale = p.get('SalePrice','')
+        disc = p.get('Discount','')
+        rating = p.get('Rating','')
+        lines.append(f"{i}. {title}\n   מחיר מבצע: {sale} | הנחה: {disc} | דירוג: {rating}")
+    more = len(pending) - len(preview)
+    if more > 0:
+        lines.append(f"...ועוד {more} בהמתנה")
+    bot.reply_to(msg, "פוסטים ממתינים:\n\n" + "\n".join(lines))
+
+@bot.message_handler(commands=['clear_pending'])
+def clear_pending(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    with FILE_LOCK:
+        write_products(PENDING_CSV, [])
+    bot.reply_to(msg, "נוקה התור של הפוסטים הממתינים 🧹")
+
+@bot.message_handler(commands=['reset_pending'])
+def reset_pending(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    src = read_products(DATA_CSV)
+    with FILE_LOCK:
+        write_products(PENDING_CSV, src)
+    bot.reply_to(msg, "התור אופס מהקובץ הראשי והכול נטען מחדש 🔄")
+
+@bot.message_handler(commands=['skip_one'])
+def skip_one(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        if not pending:
+            bot.reply_to(msg, "אין מה לדלג – אין פוסטים ממתינים.")
+            return
+        write_products(PENDING_CSV, pending[1:])
+    bot.reply_to(msg, "דילגתי על הפוסט הבא ✅")
+
+@bot.message_handler(commands=['peek_next'])
+def peek_next(msg):
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    nxt = pending[0]
+    txt = "<b>הפריט הבא בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in nxt.items()])
+    bot.reply_to(msg, txt, parse_mode='HTML')
+
+@bot.message_handler(commands=['peek_idx'])
+def peek_idx(msg):
+    text = (msg.text or "").strip()
+    parts = text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.reply_to(msg, "שימוש: /peek_idx N  (לדוגמה: /peek_idx 3)")
+        return
+    idx = int(parts[1])
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    if idx < 1 or idx > len(pending):
+        bot.reply_to(msg, f"אינדקס מחוץ לטווח. יש כרגע {len(pending)} פוסטים בתור.")
+        return
+    item = pending[idx-1]
+    txt = f"<b>פריט #{idx} בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in item.items()])
+    bot.reply_to(msg, txt, parse_mode='HTML')
+
+@bot.message_handler(commands=['pending_status'])
+def pending_status(msg):
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    count = len(pending)
+    now_il = datetime.now(tz=IL_TZ)
+    schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
+    delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
+    target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
+    if count == 0:
+        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅")
+        return
+    total_seconds = (count - 1) * POST_DELAY_SECONDS
+    eta = now_il + timedelta(seconds=total_seconds)
+    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
+    next_eta = now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
+    status_line = "🎙️ שידור אפשרי עכשיו" if not is_quiet_now(now_il) else "⏸️ כרגע מחוץ לחלון השידור"
+    msg_text = (
+        f"{schedule_line}\n"
+        f"{status_line}\n"
+        f"{delay_line}\n"
+        f"{target_line}\n"
+        f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
+        f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
+        f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
+        f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
+    )
+    bot.reply_to(msg, msg_text, parse_mode='HTML')
+
+
+# ========= HEALTH & START FALLBACK =========
+@bot.message_handler(commands=['ping'])
+def cmd_ping(msg):
+    bot.reply_to(msg, "pong ✅")
+
+@bot.message_handler(commands=['start', 'help', 'menu'])
+def cmd_start(msg):
+    # נקה מצב בחירה/העלאה, כדי ש-/start לא "ייבלע"
+    try:
+        uid = getattr(msg.from_user, "id", None)
+        if uid is not None:
+            EXPECTING_TARGET.pop(uid, None)
+            EXPECTING_UPLOAD.discard(uid)
+    except Exception:
+        pass
+    print(f"Instance={socket.gethostname()} | User={msg.from_user.id if msg.from_user else 'N/A'} sent /start", flush=True)
+    bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
+
+# fallback אם משום מה /start לא נתפס כפקודה
+@bot.message_handler(func=lambda m: isinstance(m.text, str) and m.text.strip().lower() in ('/start', 'start'))
+def start_fallback(msg):
+    cmd_start(msg)
+
+
+# ========= SENDER LOOP =========
+def run_sender_loop():
+    if not os.path.exists(SCHEDULE_FLAG_FILE):
+        set_schedule_enforced(True)
+    init_pending()
+
+    while True:
+        if is_quiet_now():
+            now_il = datetime.now(tz=IL_TZ)
+            print(f"[{now_il}] quiet hours ON – sleeping 30s", flush=True)
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
+
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+        if not pending:
+            print(f"[{datetime.now(tz=IL_TZ)}] queue empty – sleeping 30s", flush=True)
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
+
+        # שליחה אטומית
+        send_next_locked("loop")
+
+        # המתנה למרווח (או עד לשינוי מרווח)
+        print(f"[{datetime.now(tz=IL_TZ)}] sleeping for {POST_DELAY_SECONDS}s (or until delay changed)", flush=True)
+        DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
+        DELAY_EVENT.clear()
+
+
+# ========= DEBUG LOG EVERY MESSAGE (אבחון) =========
+# שים לב: זה MUST לבוא בסוף, כדי שלא "יגנוב" handlers אחרים.
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice', 'sticker'])
+def _debug_log_everything(msg):
+    try:
+        uid = getattr(msg.from_user, "id", None)
+        uname = f"@{msg.from_user.username}" if getattr(msg.from_user, "username", None) else uid
+        kind = (msg.content_type or "unknown")
+        txt = (msg.text or msg.caption or "")
+        txt = txt[:80].replace("\n", " ")
+        print(f"[DBG] inbound {kind} from {uname}: {txt}", flush=True)
+    except Exception:
+        pass
+    # לא עונים כאן כדי לא להפריע ל-handlers אחרים
+
+
+# ========= MAIN =========
+if __name__ == "__main__":
+    print(f"Instance: {socket.gethostname()}", flush=True)
+    try:
+        me = bot.get_me()
+        print(f"Bot: @{me.username} ({me.id})", flush=True)
+    except Exception as e:
+        print("getMe failed:", e, flush=True)
+
+    _lock_handle = acquire_single_instance_lock(LOCK_PATH)
+    if _lock_handle is None:
+        import sys
+        print("Another instance is running (lock failed). Exiting.", flush=True)
+        sys.exit(1)
+
+    print_webhook_info()
+    try:
+        force_delete_webhook()
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        try:
+            bot.remove_webhook()
+        except Exception as e2:
+            print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+    print_webhook_info()
+
+    t = threading.Thread(target=run_sender_loop, daemon=True)
+    t.start()
+
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            msg = str(e)
+            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
+            time.sleep(wait)
