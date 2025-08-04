@@ -16,13 +16,13 @@ ADMIN_USER_IDS = set()           # מומלץ להגדיר: {123456789}
 
 # קבצים
 DATA_CSV = "workfile.csv"        # קובץ המקור
-PENDING_CSV = "pending.csv"      # תור הפוסטים
-DELAY_FILE = "post_delay.txt"    # שמירת מרווח
+PENDING_CSV = "pending.csv"      # תור הפוסטים (נבנה/מתעדכן)
+DELAY_FILE = "post_delay.txt"    # שמירת מרווח שנבחר
 PUBLIC_PRESET_FILE = "public_target.preset"
 PRIVATE_PRESET_FILE = "private_target.preset"
 
-# מצב עבודה: 'מתוזמן' או 'תמיד-פעיל' באמצעות דגל קובץ
-SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (שינה פעיל), לא קיים => תמיד משדר
+# מצב עבודה (חלונות שידור): 'מתוזמן' או 'תמיד-פעיל' באמצעות דגל קובץ
+SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (שינה פעיל), לא קיים => תמיד-פעיל
 
 # ========= INIT =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -33,8 +33,11 @@ IL_TZ = ZoneInfo("Asia/Jerusalem")
 # יעד נוכחי (ברירת מחדל)
 CURRENT_TARGET = CHANNEL_ID
 
-# Event שמעיר את לולאת השליחה כשמשנים מרווח
+# “התעוררות חמה” ללולאת השידור בשינוי מרווח
 DELAY_EVENT = threading.Event()
+
+# מצב שיחה להגדרת יעד ע"י Forward
+EXPECTING_TARGET = {}  # dict[user_id] = "public" or "private"
 
 
 # ========= SINGLE INSTANCE LOCK =========
@@ -142,7 +145,6 @@ def normalize_row_keys(row):
     out["Strengths"] = out.get("Strengths", "")
     return out
 
-
 def read_products(path):
     if not os.path.exists(path):
         return []
@@ -168,7 +170,6 @@ def write_products(path, rows):
         for r in rows:
             w.writerow(r)
 
-
 def init_pending():
     if not os.path.exists(PENDING_CSV):
         src = read_products(DATA_CSV)
@@ -191,8 +192,6 @@ def should_broadcast(now: datetime | None = None) -> bool:
         return dtime(20, 15) <= t <= dtime(23, 59)
     return False
 
-
-# ========= MODE: SCHEDULE vs ALWAYS =========
 def is_schedule_enforced() -> bool:
     return os.path.exists(SCHEDULE_FLAG_FILE)
 
@@ -213,7 +212,7 @@ def is_quiet_now(now: datetime | None = None) -> bool:
     return False  # מצב תמיד-פעיל
 
 
-# ========= TARGET HELPERS (ציבורי/פרטי) =========
+# ========= TARGET HELPERS =========
 def _set_current_target(v):
     global CURRENT_TARGET
     CURRENT_TARGET = v
@@ -229,7 +228,7 @@ def _load_preset(path):
         return f.read().strip()
 
 def _check_target_permissions(target):
-    """בדיקת הרשאות/זיהוי יעד ללא פרסום (שליחת action)."""
+    """בדיקת הרשאה/זיהוי יעד ללא פרסום."""
     try:
         bot.send_chat_action(target, 'typing')
         return True, "הרשאה נראית תקינה."
@@ -237,11 +236,11 @@ def _check_target_permissions(target):
         return False, f"שגיאה בהרשאות/זיהוי היעד: {e}"
 
 
-# ========= POSTING (Opening/Strengths רק מה-CSV) =========
+# ========= POSTING =========
 def format_post(product):
     """
     תיאור (Opening) ונקודות חוזק (Strengths) נלקחים *רק* מה-CSV.
-    אין טקסט גנרי על המוצר. שאר המבנה נשאר כבעבר.
+    אין טקסט גנרי על המוצר. שאר המבנה נשמר כבעבר.
     """
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
@@ -254,7 +253,7 @@ def format_post(product):
     buy_link = product.get('BuyLink', '')
     coupon = product.get('CouponCode', '')
 
-    # תיאור ונקודות חוזק מתוך הקובץ בלבד
+    # Opening/Strengths אך ורק מהקובץ
     opening = (product.get('Opening') or '').strip()
     strengths_src = (product.get("Strengths") or "").strip()
 
@@ -264,7 +263,6 @@ def format_post(product):
     discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
 
-    # בניית הטקסט: Opening+Title מהCSV, Strengths רק אם מולא בקובץ (ללא שורות גנריות)
     lines = []
     if opening:
         lines.append(opening)
@@ -273,6 +271,7 @@ def format_post(product):
         lines.append(title)
         lines.append("")
 
+    # Strengths רק אם מולא בקובץ (מופרד ב־| או ; או שורות)
     if strengths_src:
         for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
             if part:
@@ -301,7 +300,6 @@ def format_post(product):
     post = "\n".join([l for l in lines if l is not None and str(l).strip() != ""])
     return post, image_url
 
-
 def post_to_channel(product):
     try:
         post_text, image_url = format_post(product)
@@ -319,9 +317,9 @@ def post_to_channel(product):
         print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}")
 
 
-# ========= DELAY (מרווח בין פוסטים) =========
+# ========= DELAY (מרווח) =========
 def load_delay_seconds(default_seconds: int = 1500) -> int:
-    """ברירת מחדל 25 דקות; אם יש קובץ delay – נטען ממנו."""
+    """ברירת מחדל 25 דק'; אם יש קובץ delay – נטען ממנו."""
     try:
         if os.path.exists(DELAY_FILE):
             with open(DELAY_FILE, "r", encoding="utf-8") as f:
@@ -339,124 +337,19 @@ def save_delay_seconds(seconds: int) -> None:
     except Exception as e:
         print(f"[WARN] Failed to save delay: {e}")
 
-POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
+POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות ברירת מחדל
 
 
-# ========= ADMIN/STATUS =========
+# ========= ADMIN HELPERS =========
 def _is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
         return True
     return msg.from_user and (msg.from_user.id in ADMIN_USER_IDS)
 
-@bot.message_handler(commands=['list_pending'])
-def list_pending(msg):
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
-        return
-    preview = pending[:10]
-    lines = []
-    for i, p in enumerate(preview, start=1):
-        title = str(p.get('Title',''))[:80]
-        sale = p.get('SalePrice','')
-        disc = p.get('Discount','')
-        rating = p.get('Rating','')
-        lines.append(f"{i}. {title}\n   מחיר מבצע: {sale} | הנחה: {disc} | דירוג: {rating}")
-    more = len(pending) - len(preview)
-    if more > 0:
-        lines.append(f"...ועוד {more} בהמתנה")
-    bot.reply_to(msg, "פוסטים ממתינים:\n\n" + "\n".join(lines))
-
-@bot.message_handler(commands=['clear_pending'])
-def clear_pending(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    write_products(PENDING_CSV, [])
-    bot.reply_to(msg, "נוקה התור של הפוסטים הממתינים 🧹")
-
-@bot.message_handler(commands=['reset_pending'])
-def reset_pending(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    src = read_products(DATA_CSV)
-    write_products(PENDING_CSV, src)
-    bot.reply_to(msg, "התור אופס מהקובץ הראשי והכול נטען מחדש 🔄")
-
-@bot.message_handler(commands=['skip_one'])
-def skip_one(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין מה לדלג – אין פוסטים ממתינים.")
-        return
-    write_products(PENDING_CSV, pending[1:])
-    bot.reply_to(msg, "דילגתי על הפוסט הבא ✅")
-
-@bot.message_handler(commands=['peek_next'])
-def peek_next(msg):
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
-        return
-    nxt = pending[0]
-    txt = "<b>הפריט הבא בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in nxt.items()])
-    bot.reply_to(msg, txt, parse_mode='HTML')
-
-@bot.message_handler(commands=['peek_idx'])
-def peek_idx(msg):
-    text = (msg.text or "").strip()
-    parts = text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        bot.reply_to(msg, "שימוש: /peek_idx N  (לדוגמה: /peek_idx 3)")
-        return
-    idx = int(parts[1])
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
-        return
-    if idx < 1 or idx > len(pending):
-        bot.reply_to(msg, f"אינדקס מחוץ לטווח. יש כרגע {len(pending)} פוסטים בתור.")
-        return
-    item = pending[idx-1]
-    txt = f"<b>פריט #{idx} בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in item.items()])
-    bot.reply_to(msg, txt, parse_mode='HTML')
-
-@bot.message_handler(commands=['pending_status'])
-def pending_status(msg):
-    pending = read_products(PENDING_CSV)
-    count = len(pending)
-    now_il = datetime.now(tz=IL_TZ)
-    schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל (שינה כבוי)"
-    delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
-    target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
-    if count == 0:
-        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅")
-        return
-    total_seconds = (count - 1) * POST_DELAY_SECONDS
-    eta = now_il + timedelta(seconds=total_seconds)
-    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
-    next_eta = now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
-    status_line = "🎙️ שידור אפשרי עכשיו" if not is_quiet_now(now_il) else "⏸️ כרגע מחוץ לחלון השידור"
-    msg_text = (
-        f"{schedule_line}\n"
-        f"{status_line}\n"
-        f"{delay_line}\n"
-        f"{target_line}\n"
-        f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
-        f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
-        f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
-        f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
-    )
-    bot.reply_to(msg, msg_text, parse_mode='HTML')
-
 
 # ========= INLINE MENU =========
 def inline_menu():
-    """תפריט אינליין בעברית: פעולות, מרווחים, מעבר יעד."""
+    """תפריט אינליין: פעולות, מרווחים, יעדים, בחירת ערוץ ע"י Forward."""
     kb = types.InlineKeyboardMarkup(row_width=3)
 
     # פעולות
@@ -480,10 +373,15 @@ def inline_menu():
         types.InlineKeyboardButton("⏱️ 30ד", callback_data="delay_1800"),
     )
 
-    # יעד ציבורי/פרטי
+    # יעדים: שימוש ביעדים שמורים
     kb.add(
-        types.InlineKeyboardButton("🎯 ציבורי", callback_data="target_public"),
-        types.InlineKeyboardButton("🔒 פרטי", callback_data="target_private"),
+        types.InlineKeyboardButton("🎯 ציבורי (השתמש)", callback_data="target_public"),
+        types.InlineKeyboardButton("🔒 פרטי (השתמש)", callback_data="target_private"),
+    )
+    # בחירת יעד באמצעות Forward
+    kb.add(
+        types.InlineKeyboardButton("🆕 בחר ערוץ ציבורי", callback_data="choose_public"),
+        types.InlineKeyboardButton("🆕 בחר ערוץ פרטי", callback_data="choose_private"),
     )
 
     # מידע
@@ -492,10 +390,12 @@ def inline_menu():
     ))
     return kb
 
+
+# ========= MERGE FROM DATA =========
 def merge_from_data_into_pending():
     """
-    מוסיף לתור רק פריטים חדשים שמופיעים ב-DATA_CSV.
-    ייחוד: (ItemId, BuyLink). אם אין ItemId – (Title, BuyLink).
+    מוסיף לתור רק פריטים חדשים מ-DATA_CSV.
+    מזהה ייחודי: (ItemId, BuyLink). אם אין ItemId – (Title, BuyLink).
     """
     data_rows = read_products(DATA_CSV)
     pending_rows = read_products(PENDING_CSV)
@@ -523,6 +423,7 @@ def merge_from_data_into_pending():
     return added, already, len(pending_rows)
 
 
+# ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET
@@ -630,37 +531,212 @@ def on_inline_click(c):
         except Exception as e:
             bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
 
+    # ---- שימוש ביעדים שמורים + אתחול התור מהתחלה ----
     elif data == "target_public":
         v = _load_preset(PUBLIC_PRESET_FILE)
         if v is None:
-            bot.answer_callback_query(c.id, "לא הוגדר יעד ציבורי. הגדר: /set_public @name", show_alert=True)
+            bot.answer_callback_query(c.id, "לא הוגדר יעד ציבורי. הגדר דרך '🆕 בחר ערוץ ציבורי' או /set_public", show_alert=True)
             return
         _set_current_target(v)
+        src_rows = read_products(DATA_CSV)     # אתחול התור
+        write_products(PENDING_CSV, src_rows)
         ok, details = _check_target_permissions(v)
         bot.edit_message_text(
-            f"🎯 עברתי לשדר ליעד הציבורי: {v}\n{details}",
+            f"🎯 עברתי לשדר ליעד הציבורי: {v}\n"
+            f"🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n"
+            f"{details}",
             chat_id, c.message.message_id, reply_markup=inline_menu()
         )
 
     elif data == "target_private":
         v = _load_preset(PRIVATE_PRESET_FILE)
         if v is None:
-            bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. הגדר: /set_private -100... (או @name)", show_alert=True)
+            bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. הגדר דרך '🆕 בחר ערוץ פרטי' או /set_private", show_alert=True)
             return
         try:
             if isinstance(v, str) and v.strip().startswith("-"):
-                v = int(v)  # chat_id מספרי
+                v = int(v)
         except Exception:
             pass
         _set_current_target(v)
+        src_rows = read_products(DATA_CSV)     # אתחול התור
+        write_products(PENDING_CSV, src_rows)
         ok, details = _check_target_permissions(v)
         bot.edit_message_text(
-            f"🔒 עברתי לשדר ליעד הפרטי: {v}\n{details}",
+            f"🔒 עברתי לשדר ליעד הפרטי: {v}\n"
+            f"🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n"
+            f"{details}",
             chat_id, c.message.message_id, reply_markup=inline_menu()
+        )
+
+    # ---- בחירת יעד ע"י Forward ----
+    elif data == "choose_public":
+        EXPECTING_TARGET[c.from_user.id] = "public"
+        bot.edit_message_text(
+            "שלח/י לי *הודעה מועברת* (Forward) מאותו ערוץ **ציבורי** כדי לשמור אותו כיעד.\n\n"
+            "טיפ: פתח/י פוסט בערוץ, ••• → Forward → בחר/י את הבוט.",
+            chat_id, c.message.message_id, parse_mode='Markdown', reply_markup=inline_menu()
+        )
+
+    elif data == "choose_private":
+        EXPECTING_TARGET[c.from_user.id] = "private"
+        bot.edit_message_text(
+            "שלח/י לי *הודעה מועברת* (Forward) מאותו ערוץ **פרטי** כדי לשמור אותו כיעד.\n\n"
+            "חשוב: הוסף/י קודם את הבוט כמנהל בערוץ הפרטי.",
+            chat_id, c.message.message_id, parse_mode='Markdown', reply_markup=inline_menu()
         )
 
     else:
         bot.answer_callback_query(c.id, f"מרווח: ~{POST_DELAY_SECONDS // 60} דק׳ | יעד: {CURRENT_TARGET}", show_alert=True)
+
+
+# ========= FORWARD HANDLER: שמירת יעד מתוך הודעה מועברת =========
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice'])
+def handle_forward_for_target(msg):
+    mode = EXPECTING_TARGET.get(getattr(msg.from_user, "id", None))
+    if not mode:
+        return  # לא בתהליך בחירת יעד
+
+    fwd = getattr(msg, "forward_from_chat", None)
+    if not fwd:
+        bot.reply_to(msg, "לא זיהיתי *הודעה מועברת מערוץ*. נסה/י שוב: העבר/י פוסט מהערוץ הרצוי.", parse_mode='Markdown')
+        return
+
+    chat_id = fwd.id                     # למשל -1001234567890
+    username = fwd.username or ""        # למשל my_channel
+    target_value = f"@{username}" if username else chat_id
+
+    # שמירה לפי מצב
+    if mode == "public":
+        _save_preset(PUBLIC_PRESET_FILE, target_value)
+        label = "ציבורי"
+    else:
+        _save_preset(PRIVATE_PRESET_FILE, target_value)
+        label = "פרטי"
+
+    # העברה מיידית ליעד + אתחול תור
+    _set_current_target(target_value)
+    src_rows = read_products(DATA_CSV)
+    write_products(PENDING_CSV, src_rows)
+
+    ok, details = _check_target_permissions(target_value)
+
+    # יציאה מהמצב
+    EXPECTING_TARGET.pop(msg.from_user.id, None)
+
+    bot.reply_to(
+        msg,
+        f"✅ נשמר יעד {label}: {target_value}\n"
+        f"🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n"
+        f"{details}\n\nאפשר לעבור בין יעדים מהתפריט: 🎯/🔒",
+    )
+
+
+# ========= TEXT COMMANDS (אופציונלי/תואם קיים) =========
+@bot.message_handler(commands=['list_pending'])
+def list_pending(msg):
+    pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    preview = pending[:10]
+    lines = []
+    for i, p in enumerate(preview, start=1):
+        title = str(p.get('Title',''))[:80]
+        sale = p.get('SalePrice','')
+        disc = p.get('Discount','')
+        rating = p.get('Rating','')
+        lines.append(f"{i}. {title}\n   מחיר מבצע: {sale} | הנחה: {disc} | דירוג: {rating}")
+    more = len(pending) - len(preview)
+    if more > 0:
+        lines.append(f"...ועוד {more} בהמתנה")
+    bot.reply_to(msg, "פוסטים ממתינים:\n\n" + "\n".join(lines))
+
+@bot.message_handler(commands=['clear_pending'])
+def clear_pending(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    write_products(PENDING_CSV, [])
+    bot.reply_to(msg, "נוקה התור של הפוסטים הממתינים 🧹")
+
+@bot.message_handler(commands=['reset_pending'])
+def reset_pending(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    src = read_products(DATA_CSV)
+    write_products(PENDING_CSV, src)
+    bot.reply_to(msg, "התור אופס מהקובץ הראשי והכול נטען מחדש 🔄")
+
+@bot.message_handler(commands=['skip_one'])
+def skip_one(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין מה לדלג – אין פוסטים ממתינים.")
+        return
+    write_products(PENDING_CSV, pending[1:])
+    bot.reply_to(msg, "דילגתי על הפוסט הבא ✅")
+
+@bot.message_handler(commands=['peek_next'])
+def peek_next(msg):
+    pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    nxt = pending[0]
+    txt = "<b>הפריט הבא בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in nxt.items()])
+    bot.reply_to(msg, txt, parse_mode='HTML')
+
+@bot.message_handler(commands=['peek_idx'])
+def peek_idx(msg):
+    text = (msg.text or "").strip()
+    parts = text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.reply_to(msg, "שימוש: /peek_idx N  (לדוגמה: /peek_idx 3)")
+        return
+    idx = int(parts[1])
+    pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    if idx < 1 or idx > len(pending):
+        bot.reply_to(msg, f"אינדקס מחוץ לטווח. יש כרגע {len(pending)} פוסטים בתור.")
+        return
+    item = pending[idx-1]
+    txt = f"<b>פריט #{idx} בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in item.items()])
+    bot.reply_to(msg, txt, parse_mode='HTML')
+
+@bot.message_handler(commands=['pending_status'])
+def pending_status(msg):
+    pending = read_products(PENDING_CSV)
+    count = len(pending)
+    now_il = datetime.now(tz=IL_TZ)
+    schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל (שינה כבוי)"
+    delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
+    target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
+    if count == 0:
+        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅")
+        return
+    total_seconds = (count - 1) * POST_DELAY_SECONDS
+    eta = now_il + timedelta(seconds=total_seconds)
+    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
+    next_eta = now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
+    status_line = "🎙️ שידור אפשרי עכשיו" if not is_quiet_now(now_il) else "⏸️ כרגע מחוץ לחלון השידור"
+    msg_text = (
+        f"{schedule_line}\n"
+        f"{status_line}\n"
+        f"{delay_line}\n"
+        f"{target_line}\n"
+        f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
+        f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
+        f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
+        f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
+    )
+    bot.reply_to(msg, msg_text, parse_mode='HTML')
 
 
 # ========= /start: תפריט אינליין =========
