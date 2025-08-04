@@ -591,12 +591,12 @@ def on_inline_click(c):
 
 
 # ========= FORWARD HANDLER: שמירת יעד מתוך הודעה מועברת =========
-@bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice'])
+@bot.message_handler(
+    func=lambda m: EXPECTING_TARGET.get(getattr(m.from_user, "id", None)) is not None,
+    content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice']
+)
 def handle_forward_for_target(msg):
     mode = EXPECTING_TARGET.get(getattr(msg.from_user, "id", None))
-    if not mode:
-        return  # לא בתהליך בחירת יעד
-
     fwd = getattr(msg, "forward_from_chat", None)
     if not fwd:
         bot.reply_to(msg, "לא זיהיתי *הודעה מועברת מערוץ*. נסה/י שוב: העבר/י פוסט מהערוץ הרצוי.", parse_mode='Markdown')
@@ -632,7 +632,7 @@ def handle_forward_for_target(msg):
     )
 
 
-# ========= TEXT COMMANDS (אופציונלי/תואם קיים) =========
+# ========= TEXT COMMANDS =========
 @bot.message_handler(commands=['list_pending'])
 def list_pending(msg):
     pending = read_products(PENDING_CSV)
