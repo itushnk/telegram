@@ -11,8 +11,8 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כאן
-CHANNEL_ID = "@nisayon121"       # ← עדכן כאן (למשל: "@my_channel")
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # ← עדכן כאן
+CHANNEL_ID = "@YOUR_CHANNEL_USERNAME"       # ← עדכן כאן (למשל: "@my_channel")
 ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789}
 
 # קבצים
@@ -23,7 +23,29 @@ PENDING_CSV = "pending.csv"         # תור הפוסטים הממתינים
 SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (מצב שינה פעיל), לא קיים => תמיד משדר
 
 # מרווח בין פוסטים בשניות
+DELAY_FILE = "post_delay_seconds.cfg"  # נשמר בו מרווח ברירת המחדל בביטים (שניות)
 POST_DELAY_SECONDS = 60
+
+# ========= DELAY PERSISTENCE =========
+def get_post_delay() -> int:
+    # קורא מרווח משמירת קובץ, אם קיים. אחרת משתמש ב-POST_DELAY_SECONDS.
+    try:
+        if os.path.exists(DELAY_FILE):
+            with open(DELAY_FILE, "r", encoding="utf-8") as f:
+                v = int(f.read().strip())
+                return max(5, v)  # סף מינימום סביר
+    except Exception:
+        pass
+    return POST_DELAY_SECONDS
+
+def set_post_delay(seconds: int) -> None:
+    seconds = max(5, int(seconds))
+    try:
+        with open(DELAY_FILE, "w", encoding="utf-8") as f:
+            f.write(str(seconds))
+    except Exception as e:
+        print(f"[WARN] Failed to persist delay: {e}")
+
 
 # ========= INIT =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -369,7 +391,7 @@ def pending_status(msg):
     if count == 0:
         bot.reply_to(msg, f"{schedule_line}\nאין פוסטים ממתינים ✅")
         return
-    total_seconds = (count - 1) * POST_DELAY_SECONDS
+    total_seconds = (count - 1) * get_post_delay()
     eta = now_il + timedelta(seconds=total_seconds)
     eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
     next_eta = now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -380,7 +402,7 @@ def pending_status(msg):
         f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
         f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
         f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
-        f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
+        f"(מרווח בין פוסטים: {get_post_delay()//60} דקות)"
     )
     bot.reply_to(msg, msg_text, parse_mode='HTML')
 
@@ -428,6 +450,61 @@ def cmd_force_send_next(msg):
         bot.reply_to(msg, f"שגיאה בשליחה כפויה: {e}")
 
 
+
+
+# ========= Delay commands =========
+@bot.message_handler(commands=['set_delay'])
+def cmd_set_delay(msg):
+    # שימוש: /set_delay N  (N בדקות)
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        bot.reply_to(msg, "שימוש: /set_delay N  (בדקות). לדוגמה: /set_delay 20")
+        return
+    try:
+        minutes = int(parts[1])
+        if minutes < 1 or minutes > 180:
+            bot.reply_to(msg, "מרווח צריך להיות בין 1 ל-180 דקות.")
+            return
+        set_post_delay(minutes * 60)
+        bot.reply_to(msg, f"עודכן מרווח בין פוסטים ל-{minutes} דקות.")
+    except ValueError:
+        bot.reply_to(msg, "ערך לא חוקי. השתמש במספר שלם בדקות.")
+
+@bot.message_handler(commands=['set_delay_10m'])
+def cmd_set_delay_10m(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    set_post_delay(10 * 60)
+    bot.reply_to(msg, "עודכן מרווח בין פוסטים ל-10 דקות.")
+
+@bot.message_handler(commands=['set_delay_20m'])
+def cmd_set_delay_20m(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    set_post_delay(20 * 60)
+    bot.reply_to(msg, "עודכן מרווח בין פוסטים ל-20 דקות.")
+
+@bot.message_handler(commands=['set_delay_25m'])
+def cmd_set_delay_25m(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    set_post_delay(25 * 60)
+    bot.reply_to(msg, "עודכן מרווח בין פוסטים ל-25 דקות.")
+
+@bot.message_handler(commands=['set_delay_30m'])
+def cmd_set_delay_30m(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    set_post_delay(30 * 60)
+    bot.reply_to(msg, "עודכן מרווח בין פוסטים ל-30 דקות.")
+
 # ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
@@ -436,6 +513,8 @@ def cmd_start(msg):
     kb.row('/peek_next', '/peek_idx')
     kb.row('/skip_one', '/clear_pending')
     kb.row('/reset_pending', '/force_send_next')
+    kb.row('/set_delay_10m', '/set_delay_20m')
+    kb.row('/set_delay_25m', '/set_delay_30m')
     kb.row('/schedule_status')
     kb.row('/schedule_on', '/schedule_off')
 
@@ -444,6 +523,7 @@ def cmd_start(msg):
 • מצב שינה כבוי (תמיד-פעיל): הבוט משדר כל הזמן.
 
 פקודות:
+• /set_delay N – להגדיר מרווח בדקות (לדוגמה: /set_delay 20)
 • /schedule_on – הפעלת מצב שינה פעיל (כיבוד שעות)
 • /schedule_off – ביטול מצב שינה (שידור תמיד)
 • /schedule_status – מצב נוכחי
@@ -455,6 +535,10 @@ def cmd_start(msg):
 • /clear_pending – ניקוי התור
 • /reset_pending – טעינה מחדש מהקובץ
 • /force_send_next – שליחה כפויה של הפריט הבא (עוקף שקט)
+• /set_delay_10m – קבע מרווח ל-10 דקות
+• /set_delay_20m – קבע מרווח ל-20 דקות
+• /set_delay_25m – קבע מרווח ל-25 דקות
+• /set_delay_30m – קבע מרווח ל-30 דקות
 
 טיפ: פתח את תפריט הפקודות דרך כפתור התפריט או בהקלדת '/'."""
     bot.send_message(msg.chat.id, text, reply_markup=kb)
@@ -479,7 +563,7 @@ def run_sender_loop():
         product = pending[0]
         post_to_channel(product)
         write_products(PENDING_CSV, pending[1:])
-        time.sleep(POST_DELAY_SECONDS)
+        time.sleep(get_post_delay())
 
 
 # ========= MAIN =========
