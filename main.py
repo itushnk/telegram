@@ -292,6 +292,16 @@ def should_broadcast(now: datetime | None = None) -> bool:
     return False
 
 
+
+# ========= Reload pending queue helper =========
+def reload_pending_from_data():
+    try:
+        src = read_products(DATA_CSV)
+        write_products(PENDING_CSV, src)
+        return True, len(src)
+    except Exception as e:
+        return False, str(e)
+
 # ========= MODE: SCHEDULE vs ALWAYS =========
 def is_schedule_enforced() -> bool:
     return os.path.exists(SCHEDULE_FLAG_FILE)
@@ -701,15 +711,7 @@ def _handle_set_private_value(msg, v):
     bot.reply_to(msg, f"נשמר פריסט פרטי: {v}")
 
 @bot.message_handler(commands=['use_public'])
-def cmd_use_public(msg):
-    if not user_is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    v = load_public_preset()
-    if v is None:
-        bot.reply_to(msg, "לא הוגדר פריסט ציבורי. השתמש ב-/set_public קודם.")
-        return
-    save_channel_id(v)
+\1re_ok, re_info = reload_pending_from_data()
     ok, details, _ = _check_target_permissions(v)
     if ok:
         bot.reply_to(msg, f"עברתי לשידור ליעד הציבורי: {v} ✅\n{details}")
@@ -717,15 +719,7 @@ def cmd_use_public(msg):
         bot.reply_to(msg, f"עודכן יעד ציבורי: {v}, אך יש בעיה בהרשאות/זיהוי היעד ⚠️\n{details}")
 
 @bot.message_handler(commands=['use_private'])
-def cmd_use_private(msg):
-    if not user_is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    v = load_private_preset()
-    if v is None:
-        bot.reply_to(msg, "לא הוגדר פריסט פרטי. השתמש ב-/set_private קודם.")
-        return
-    save_channel_id(v)
+\1re_ok, re_info = reload_pending_from_data()
     ok, details, _ = _check_target_permissions(v)
     if ok:
         bot.reply_to(msg, f"עברתי לשידור ליעד הפרטי: {v} ✅\n{details}")
@@ -789,11 +783,12 @@ def cmd_switch_target(msg):
         bot.reply_to(msg, "חסר פריסט אחד לפחות. קבע שניהם פעם אחת:\n/set_public @PublicName\n/set_private -100XXXXXXXXXXXX")
         return
     save_channel_id(nxt)
+    re_ok, re_info = reload_pending_from_data()
     ok, details, _ = _check_target_permissions(nxt)
     if ok:
-        bot.reply_to(msg, f"החלפתי יעד ➜ {nxt_name}: {nxt} ✅\n{details}")
+        bot.reply_to(msg, f"החלפתי יעד ➜ {nxt_name}: {nxt} ✅\n{details}\nטעינת תור: " + ("הצליחה" if re_ok else f"נכשלה ({re_info})"))
     else:
-        bot.reply_to(msg, f"החלפתי יעד ➜ {nxt_name}: {nxt}, אך יש בעיה בהרשאות/זיהוי ⚠️\n{details}")
+        bot.reply_to(msg, f"החלפתי יעד ➜ {nxt_name}: {nxt}, אך יש בעיה בהרשאות/זיהוי ⚠️\n{details}\nטעינת תור בוצעה: " + ("הצליחה" if re_ok else f"נכשלה ({re_info})"))
 
 # ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
@@ -808,11 +803,10 @@ def cmd_start(msg):
     kb.row('/schedule_status')
     kb.row('/schedule_on', '/schedule_off')
     kb.row('/channel_status', '/set_channel_id')
-    kb.row('/use_public', '/use_private')
-    kb.row('/set_public', '/set_private')
+    kb.row('/use_private', '/use_public')
+    kb.row('/channel_status')
     kb.row('/switch_target')
-    kb.row('/debug_check_target', '/debug_send')
-
+    
     text = f"""ברוך הבא! פקודות שימושיות:
 
 מצב עבודה:
@@ -825,11 +819,9 @@ def cmd_start(msg):
 • /set_delay_10m / _20m / _25m / _30m – קיצורי דרך
 
 יעד שידור:
-• /channel_status – יעד השידור הנוכחי
-• /set_channel_id @name או -100xxxxxxxxxxxx – עדכון יעד השידור
-• /use_public / /use_private – מעבר מהיר לפריסטים
-• /set_public @name או -100xxxxxxxxxxxx – שמירת פריסט ציבורי
-• /set_private @name או -100xxxxxxxxxxxx – שמירת פריסט פרטי
+• /channel_status – סטטוס: איפה השידור כעת
+• /use_private – שידור לערוץ הפרטי
+• /use_public – שידור לערוץ הציבורי
 
 ניהול תור:
 • /list_pending – פוסטים ממתינים
