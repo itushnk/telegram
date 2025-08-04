@@ -569,7 +569,7 @@ def cmd_set_channel_id(msg):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(msg, "שימוש: /set_channel_id <@PublicName | -100XXXXXXXXXXXX>")
+        bot.reply_to(msg, "שימוש: /set_channel_id @name או -100xxxxxxxxxxxx")
         return
     new_id = parts[1].strip()
     try:
@@ -594,7 +594,7 @@ def cmd_set_public(msg):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(msg, "שימוש: /set_public <@PublicName | -100XXXXXXXXXXXX>")
+        bot.reply_to(msg, "שימוש: /set_public @name או -100xxxxxxxxxxxx")
         return
     v = parts[1].strip()
     try:
@@ -613,7 +613,7 @@ def cmd_set_private(msg):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(msg, "שימוש: /set_private <-100XXXXXXXXXXXX> או @name (לא מומלץ לפרטי)")
+        bot.reply_to(msg, "שימוש: /set_private @name או -100xxxxxxxxxxxx")
         return
     v = parts[1].strip()
     try:
@@ -700,10 +700,10 @@ def cmd_start(msg):
 
 יעד שידור:
 • /channel_status – יעד השידור הנוכחי
-• /set_channel_id <@name|-100…> – עדכון יעד השידור
+• /set_channel_id @name או -100xxxxxxxxxxxx – עדכון יעד השידור
 • /use_public / /use_private – מעבר מהיר לפריסטים
-• /set_public <@name|-100…> – שמירת פריסט ציבורי
-• /set_private <@name|-100…> – שמירת פריסט פרטי
+• /set_public @name או -100xxxxxxxxxxxx – שמירת פריסט ציבורי
+• /set_private @name או -100xxxxxxxxxxxx – שמירת פריסט פרטי
 
 ניהול תור:
 • /list_pending – פוסטים ממתינים
@@ -715,7 +715,7 @@ def cmd_start(msg):
 • /reset_pending – טעינה מחדש מהקובץ
 • /force_send_next – שליחה כפויה (עוקף שקט)
 """
-    bot.send_message(msg.chat.id, text, reply_markup=kb)
+    bot.send_message(msg.chat.id, text, reply_markup=kb, disable_web_page_preview=True)
 
 
 # ========= SENDER LOOP (BACKGROUND) =========
