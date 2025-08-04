@@ -16,7 +16,6 @@ import threading
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 import socket
-import re  # <<< הוספה: לשימוש בביטויים רגולריים
 
 # ========= CONFIG =========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4")  # מומלץ ב-ENV
@@ -33,10 +32,6 @@ PRIVATE_PRESET_FILE = "private_target.preset"
 # מצב עבודה (חלונות שידור)
 SCHEDULE_FLAG_FILE = "schedule_enforced.flag"
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", "/tmp/bot.lock")  # נעילה למופע יחיד בקונטיינר
-
-# דגל המרת $→₪ לקובץ הבא בלבד
-CONVERT_NEXT_FLAG_FILE = "convert_next_usd_to_ils.flag"
-USD_TO_ILS_RATE_DEFAULT = 3.55
 
 # ========= INIT =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -489,9 +484,6 @@ def inline_menu():
     # העלאת CSV
     kb.add(types.InlineKeyboardButton("📥 העלה CSV", callback_data="upload_source"))
 
-    # המרת $→₪ לקובץ הבא בלבד
-    kb.add(types.InlineKeyboardButton("₪ המרת $→₪ (3.55) לקובץ הבא", callback_data="convert_next"))
-
     # יעדים (שמורים)
     kb.add(
         types.InlineKeyboardButton("🎯 ציבורי (השתמש)", callback_data="target_public"),
@@ -557,50 +549,37 @@ def _read_source_csv_text(csv_text: str):
     rows = [normalize_row_keys(r) for r in reader]
     return rows
 
-# ---- המרת $→₪ לשורות הקובץ הבא בלבד ----
-def _is_usd_price(raw_value: str) -> bool:
-    s = (raw_value or "")
-    if not isinstance(s, str):
-        s = str(s)
-    s_low = s.lower()
-    return ("$" in s) or ("usd" in s_low)
+def _save_workfile(rows):
+    """כותב את הנתונים ל-workfile.csv בפורמט שהבוט מצפה לו."""
+    write_products(DATA_CSV, rows)
 
-def _extract_number(s: str) -> float | None:
-    if s is None:
-        return None
-    s = str(s)
-    m = re.search(r"([-+]?\d+(?:[.,]\d+)?)", s)
-    if not m:
-        return None
-    return float(m.group(1).replace(",", "."))
-
-def _convert_price_text(raw_value: str, rate: float) -> str:
-    """מקבל טקסט מחיר גלמי בדולר ומחזיר מחרוזת ₪ מעוגלת לשלם."""
-    num = _extract_number(raw_value)
-    if num is None:
-        return ""
-    ils = round(num * rate)
-    return str(int(ils))
-
-def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
+def _merge_to_pending_from_rows(rows):
     """
-    אם rate קיים ונדרש להמיר: נעבור שורה-שורה,
-    ואם המחיר בדולרים (זוהה לפי $/USD בשדות), נהפוך את OriginalPrice/SalePrice לשקלים.
-    לבסוף נחזיר שורות מנורמלות עם normalize_row_keys.
+    ממזג rows (כבר מנורמלים) אל pending.csv בלי כפילויות.
     """
-    out = []
-    for r in rows_raw:
-        rr = dict(r)  # עותק
-        if rate:
-            orig_src = rr.get("OriginalPrice", rr.get("Origin Price", ""))
-            sale_src = rr.get("SalePrice", rr.get("Discount Price", ""))
+    pending_rows = read_products(PENDING_CSV)
 
-            if _is_usd_price(str(orig_src)):
-                rr["OriginalPrice"] = _convert_price_text(orig_src, rate)
-            if _is_usd_price(str(sale_src)):
-                rr["SalePrice"] = _convert_price_text(sale_src, rate)
-        out.append(normalize_row_keys(rr))
-    return out
+    def key_of(r):
+        item_id = (r.get("ItemId") or "").strip()
+        title   = (r.get("Title") or "").strip()
+        buy     = (r.get("BuyLink") or "").strip()
+        return (item_id if item_id else None, title if not item_id else None, buy)
+
+    existing_keys = {key_of(r) for r in pending_rows}
+    added = 0
+    already = 0
+
+    for r in rows:
+        k = key_of(r)
+        if k in existing_keys:
+            already += 1
+            continue
+        pending_rows.append(r)
+        existing_keys.add(k)
+        added += 1
+
+    write_products(PENDING_CSV, pending_rows)
+    return added, already, len(pending_rows)
 
 
 # ========= INLINE CALLBACKS =========
@@ -766,18 +745,6 @@ def on_inline_click(c):
                           new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
                           reply_markup=inline_menu(), cb_id=c.id)
 
-    elif data == "convert_next":
-        try:
-            with open(CONVERT_NEXT_FLAG_FILE, "w", encoding="utf-8") as f:
-                f.write(str(USD_TO_ILS_RATE_DEFAULT))
-            safe_edit_message(
-                bot, chat_id=chat_id, message=c.message,
-                new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
-                reply_markup=inline_menu(), cb_id=c.id
-            )
-        except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
-
     else:
         bot.answer_callback_query(c.id)
 
@@ -856,43 +823,21 @@ def on_document(msg):
         file_bytes = bot.download_file(file_info.file_path)
 
         csv_text = _decode_csv_bytes(file_bytes)
+        rows = _read_source_csv_text(csv_text)
 
-        # קוראים כ-RAW כדי לזהות $/USD לפני נורמליזציה
-        from io import StringIO
-        raw_reader = csv.DictReader(StringIO(csv_text))
-        rows_raw = [dict(r) for r in raw_reader]
-
-        # בדיקת דגל המרה לקובץ הבא
-        convert_rate = None
-        if os.path.exists(CONVERT_NEXT_FLAG_FILE):
-            try:
-                with open(CONVERT_NEXT_FLAG_FILE, "r", encoding="utf-8") as f:
-                    convert_rate = float((f.read() or "").strip() or USD_TO_ILS_RATE_DEFAULT)
-            except Exception:
-                convert_rate = USD_TO_ILS_RATE_DEFAULT
-            # מאפסים את הדגל - יחול רק על הקובץ הזה
-            try:
-                os.remove(CONVERT_NEXT_FLAG_FILE)
-            except Exception:
-                pass
-
-        # המרה (רק אם convert_rate הוגדר) + נורמליזציה
-        rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
+        if not rows:
+            bot.reply_to(msg, "לא הצלחתי לקרוא נתונים מה-CSV. ודא/י שיש כותרות ושורות.")
+            return
 
         # כתיבה ל-workfile.csv + מיזוג ל-pending.csv — נעילה כדי למנוע מירוץ
         with FILE_LOCK:
-            write_products(DATA_CSV, rows)
+            _save_workfile(rows)
             added, already, total_after = _merge_to_pending_from_rows(rows)
-
-        extra_line = ""
-        if convert_rate:
-            extra_line = f"\n💱 בוצעה המרה לש\"ח בשער {convert_rate} לכל מחירי הדולר בקובץ זה."
 
         bot.reply_to(msg,
             "✅ הקובץ נקלט בהצלחה.\n"
-            f"נוספו לתור: {added}\nכבר היו בתור/כפולים: {already}\nסה\"כ בתור כעת: {total_after}"
-            + extra_line +
-            "\n\nהשידור ממשיך בקצב שנקבע. אפשר לבדוק '📊 סטטוס שידור' בתפריט."
+            f"נוספו לתור: {added}\nכבר היו בתור: {already}\nסה\"כ בתור כעת: {total_after}\n\n"
+            "השידור ממשיך בקצב שנקבע. אפשר לבדוק '📊 סטטוס שידור' בתפריט."
         )
 
     except Exception as e:
