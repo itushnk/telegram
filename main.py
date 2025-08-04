@@ -17,12 +17,10 @@ ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789
 # קבצים
 DATA_CSV = "workfile.csv"           # קובץ המקור שאתה מכין
 PENDING_CSV = "pending.csv"         # תור הפוסטים הממתינים
+DELAY_FILE = "post_delay.txt"       # שמירת מרווח שנבחר
 
 # מצב עבודה: 'מתוזמן' או 'תמיד-פעיל' באמצעות דגל קובץ
 SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (מצב שינה פעיל), לא קיים => תמיד משדר
-
-# מרווח בין פוסטים בשניות
-POST_DELAY_SECONDS = 60
 
 # ========= INIT =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -272,6 +270,32 @@ def post_to_channel(product):
         print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}")
 
 
+# ========= DELAY (מרווח בין פוסטים) =========
+def load_delay_seconds(default_seconds: int = 1500) -> int:
+    """
+    טוען מרווח מהקובץ; אם אין, מחזיר ברירת מחדל (25 דקות = 1500ש').
+    """
+    try:
+        if os.path.exists(DELAY_FILE):
+            with open(DELAY_FILE, "r", encoding="utf-8") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val
+    except Exception:
+        pass
+    return default_seconds
+
+def save_delay_seconds(seconds: int) -> None:
+    try:
+        with open(DELAY_FILE, "w", encoding="utf-8") as f:
+            f.write(str(seconds))
+    except Exception as e:
+        print(f"[WARN] Failed to save delay: {e}")
+
+# ברירת מחדל 25 דקות (1500ש'), נטען מהקובץ אם קיים:
+POST_DELAY_SECONDS = load_delay_seconds(1500)
+
+
 # ========= ADMIN COMMANDS =========
 def user_is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
@@ -382,15 +406,33 @@ def pending_status(msg):
 
 # ========= INLINE MENU (עברית) =========
 def inline_menu():
-    kb = types.InlineKeyboardMarkup(row_width=2)
+    """תפריט אינליין בעברית, כולל בחירת מרווח."""
+    kb = types.InlineKeyboardMarkup(row_width=3)
+
+    # שורת פעולות עיקריות
     kb.add(
         types.InlineKeyboardButton("📢 פרסם עכשיו", callback_data="publish_now"),
         types.InlineKeyboardButton("⏭ דלג פריט", callback_data="skip_one"),
         types.InlineKeyboardButton("📝 רשימת ממתינים", callback_data="list_pending"),
+    )
+    kb.add(
         types.InlineKeyboardButton("📊 סטטוס שידור", callback_data="pending_status"),
         types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
         types.InlineKeyboardButton("🕒 מצב שינה (החלפה)", callback_data="toggle_schedule"),
     )
+
+    # שורת בחירת מרווח
+    kb.add(
+        types.InlineKeyboardButton("⏱️ דקה", callback_data="delay_60"),
+        types.InlineKeyboardButton("⏱️ 15ד", callback_data="delay_900"),
+        types.InlineKeyboardButton("⏱️ 20ד", callback_data="delay_1200"),
+        types.InlineKeyboardButton("⏱️ 25ד", callback_data="delay_1500"),
+        types.InlineKeyboardButton("⏱️ 30ד", callback_data="delay_1800"),
+    )
+
+    # תצוגת מרווח נוכחי (כיתוב בלבד)
+    current_min = POST_DELAY_SECONDS // 60
+    kb.add(types.InlineKeyboardButton(f"מרווח נוכחי: ~{current_min} דק׳", callback_data="noop_current_delay"))
     return kb
 
 def merge_from_data_into_pending():
@@ -426,6 +468,7 @@ def merge_from_data_into_pending():
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
+    global POST_DELAY_SECONDS
     if not user_is_admin(c.message):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
         return
@@ -476,7 +519,7 @@ def on_inline_click(c):
         pending = read_products(PENDING_CSV)
         count = len(pending)
         now_il = datetime.now(tz=IL_TZ)
-        schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל (שינה כבוי)"
+        schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
         if count == 0:
             text = f"{schedule_line}\nאין פוסטים ממתינים ✅"
         else:
@@ -510,8 +553,20 @@ def on_inline_click(c):
         state = "🕰️ מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 תמיד-פעיל"
         bot.edit_message_text(f"החלפתי מצב לשידור: {state}", chat_id, c.message.message_id, reply_markup=inline_menu())
 
+    elif data.startswith("delay_"):
+        # delay_60 / delay_900 / delay_1200 / delay_1500 / delay_1800
+        try:
+            seconds = int(data.split("_", 1)[1])
+            POST_DELAY_SECONDS = seconds
+            save_delay_seconds(seconds)
+            mins = seconds // 60
+            bot.edit_message_text(f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות).", chat_id, c.message.message_id, reply_markup=inline_menu())
+        except Exception as e:
+            bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
+
     else:
-        bot.answer_callback_query(c.id, "לא זוהתה פעולה.", show_alert=True)
+        # כפתור "תצוגה בלבד"
+        bot.answer_callback_query(c.id, f"מרווח נוכחי: ~{POST_DELAY_SECONDS // 60} דק׳", show_alert=True)
 
 
 # ========= /start: מציג תפריט אינליין =========
@@ -526,6 +581,8 @@ def run_sender_loop():
     if not os.path.exists(SCHEDULE_FLAG_FILE):
         # ברירת מחדל: שינה פעיל (כיבוד שעות)
         set_schedule_enforced(True)
+    init_pending()
+
     while True:
         if is_quiet_now():
             now_il = datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
