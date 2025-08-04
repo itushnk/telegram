@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 import csv
 import requests
@@ -15,13 +14,80 @@ BOT_TOKEN = "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4"  # ← עדכן כ�
 CHANNEL_ID = "@nisayon121"       # ← עדכן כאן (למשל: "@my_channel")
 ADMIN_USER_IDS = set()  # ← מומלץ להגדיר user id שלך: {123456789}
 
+# קבצים
+DATA_CSV = "workfile.csv"            # קובץ המקור שאתה מכין
+PENDING_CSV = "pending.csv"          # תור הפוסטים הממתינים
+
+# מצב עבודה: 'מתוזמן' או 'תמיד-פעיל' באמצעות דגל קובץ
+SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (שינה פעיל), לא קיים => תמיד משדר
+
+# מרווח בין פוסטים: ברירת מחדל + קובץ הגדרה שנשמר בין הפעלות
+POST_DELAY_SECONDS = 60
+DELAY_FILE = "post_delay_seconds.cfg"  # נשמר בו המרווח בפועל (שניות)
+
+# ========= INIT =========
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
+
+# אזור זמן ישראל
+IL_TZ = ZoneInfo("Asia/Jerusalem")
+
+
+# ========= SINGLE INSTANCE LOCK =========
+def acquire_single_instance_lock(lock_path: str = "bot.lock"):
+    """מונע הרצה כפולה על אותה מכונה"""
+    try:
+        import sys
+        if os.name == "nt":
+            import msvcrt
+            f = open(lock_path, "w")
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("Another instance is running. Exiting.")
+                sys.exit(1)
+            return f
+        else:
+            import fcntl
+            f = open(lock_path, "w")
+            try:
+                fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("Another instance is running. Exiting.")
+                sys.exit(1)
+            return f
+    except Exception as e:
+        print(f"[WARN] Could not acquire single-instance lock: {e}")
+        return None
+
+
+# ========= WEBHOOK DIAGNOSTICS =========
+def print_webhook_info():
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
+        r = requests.get(url, timeout=10)
+        print("getWebhookInfo:", r.json())
+    except Exception as e:
+        print(f"[WARN] getWebhookInfo failed: {e}")
+
+def force_delete_webhook():
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        r = requests.get(url, params={"drop_pending_updates": True}, timeout=10)
+        print("deleteWebhook:", r.json())
+    except Exception as e:
+        print(f"[WARN] deleteWebhook failed: {e}")
+
+
+# ========= DYNAMIC CHANNEL TARGET =========
 # תמיכה בהחלפת ערוץ בזמן ריצה (פרטי/ציבורי) בלי לפרוס קוד מחדש
 CHANNEL_FILE = "channel_id.cfg"  # נשמר בו היעד הנוכחי (@name או -100...)
 
 def load_channel_id():
     """קורא את יעד השידור. קדימות: ENV CHANNEL_ID -> קובץ -> הקבוע בקוד."""
     try:
-        env_val = os.getenv("-1001371533401", "").strip()
+        env_val = os.getenv("CHANNEL_ID", "").strip()
     except Exception:
         env_val = ""
     if env_val:
@@ -45,9 +111,7 @@ def save_channel_id(val):
     except Exception as e:
         print(f"[WARN] Failed to persist channel id: {e}")
 
-
-
-# פריסת פריסטים לערוצים ציבורי/פרטי
+# פריסטים ציבורי/פרטי
 PUBLIC_PRESET_FILE = "public_target.cfg"
 PRIVATE_PRESET_FILE = "private_target.cfg"
 
@@ -95,20 +159,10 @@ def load_private_preset():
             return env_val
     return None
 
-# קבצים
-DATA_CSV = "workfile.csv"           # קובץ המקור שאתה מכין
-PENDING_CSV = "pending.csv"         # תור הפוסטים הממתינים
-
-# מצב עבודה: 'מתוזמן' או 'תמיד-פעיל' באמצעות דגל קובץ
-SCHEDULE_FLAG_FILE = "schedule_enforced.flag"  # קיים => מתוזמן (מצב שינה פעיל), לא קיים => תמיד משדר
-
-# מרווח בין פוסטים בשניות
-DELAY_FILE = "post_delay_seconds.cfg"  # נשמר בו מרווח ברירת המחדל בביטים (שניות)
-POST_DELAY_SECONDS = 60
 
 # ========= DELAY PERSISTENCE =========
 def get_post_delay() -> int:
-    # קורא מרווח משמירת קובץ, אם קיים. אחרת משתמש ב-POST_DELAY_SECONDS.
+    """קורא מרווח משמירת קובץ, אם קיים. אחרת משתמש ב-POST_DELAY_SECONDS."""
     try:
         if os.path.exists(DELAY_FILE):
             with open(DELAY_FILE, "r", encoding="utf-8") as f:
@@ -125,61 +179,6 @@ def set_post_delay(seconds: int) -> None:
             f.write(str(seconds))
     except Exception as e:
         print(f"[WARN] Failed to persist delay: {e}")
-
-
-# ========= INIT =========
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
-
-# אזור זמן ישראל
-IL_TZ = ZoneInfo("Asia/Jerusalem")
-
-
-# ========= SINGLE INSTANCE LOCK =========
-def acquire_single_instance_lock(lock_path: str = "bot.lock"):
-    try:
-        import sys
-        if os.name == "nt":
-            import msvcrt
-            f = open(lock_path, "w")
-            try:
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                print("Another instance is running. Exiting.")
-                sys.exit(1)
-            return f
-        else:
-            import fcntl
-            f = open(lock_path, "w")
-            try:
-                fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                print("Another instance is running. Exiting.")
-                sys.exit(1)
-            return f
-    except Exception as e:
-        print(f"[WARN] Could not acquire single-instance lock: {e}")
-        return None
-
-
-# ========= WEBHOOK DIAGNOSTICS =========
-def print_webhook_info()
-    print_current_channel_target():
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
-        r = requests.get(url, timeout=10)
-        print("getWebhookInfo:", r.json())
-    except Exception as e:
-        print(f"[WARN] getWebhookInfo failed: {e}")
-
-def force_delete_webhook():
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        r = requests.get(url, params={"drop_pending_updates": True}, timeout=10)
-        print("deleteWebhook:", r.json())
-    except Exception as e:
-        print(f"[WARN] deleteWebhook failed: {e}")
 
 
 # ========= UTILITIES =========
@@ -308,13 +307,10 @@ def set_schedule_enforced(enabled: bool) -> None:
         print(f"[WARN] Failed to set schedule mode: {e}")
 
 def is_quiet_now(now: datetime | None = None) -> bool:
-    """
-    אם מצב "שינה פעיל" (schedule enforced) — נכבד חלונות זמן.
-    אם "שינה לא פעיל" — תמיד נשלח (לא שקט לעולם).
-    """
+    """אם שינה פעיל — נכבד חלונות זמן; אם שינה כבוי — תמיד משדרים."""
     if is_schedule_enforced():
         return not should_broadcast(now)
-    return False  # מצב תמיד-פעיל
+    return False
 
 
 # ========= POSTING =========
@@ -367,8 +363,9 @@ def format_post(product):
 def post_to_channel(product):
     try:
         post_text, image_url = format_post(product)
-        target = load_channel_id()
         video_url = (product.get('Video Url') or "").strip()
+        target = load_channel_id()
+
         if video_url.endswith('.mp4'):
             resp = SESSION.get(video_url, timeout=20)
             resp.raise_for_status()
@@ -511,33 +508,9 @@ def cmd_schedule_status(msg):
     bot.reply_to(msg, "מצב שינה פעיל" if is_schedule_enforced() else "מצב שינה כבוי")
 
 
-# ========= Force send next =========
-@bot.message_handler(commands=['force_send_next'])
-def cmd_force_send_next(msg):
-    if not user_is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    pending = read_products(PENDING_CSV)
-    if not pending:
-        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
-        return
-    item = pending[0]
-    try:
-        post_to_channel(item)
-        write_products(PENDING_CSV, pending[1:])
-        item_id = item.get("ItemId", "ללא מספר")
-        title = (item.get("Title","") or "")[:80]
-        bot.reply_to(msg, f"נשלח בכפייה ✅\nמספר פריט: {item_id}\nכותרת: {title}")
-    except Exception as e:
-        bot.reply_to(msg, f"שגיאה בשליחה כפויה: {e}")
-
-
-
-
 # ========= Delay commands =========
 @bot.message_handler(commands=['set_delay'])
 def cmd_set_delay(msg):
-    # שימוש: /set_delay N  (N בדקות)
     if not user_is_admin(msg):
         bot.reply_to(msg, "אין הרשאה.")
         return
@@ -588,7 +561,6 @@ def cmd_set_delay_30m(msg):
     bot.reply_to(msg, "עודכן מרווח בין פוסטים ל-30 דקות.")
 
 
-
 # ========= Channel target commands =========
 @bot.message_handler(commands=['set_channel_id'])
 def cmd_set_channel_id(msg):
@@ -615,9 +587,6 @@ def cmd_channel_status(msg):
     typ = "פרטי (-100…)" if isinstance(cur, int) else "ציבורי (@name)"
     bot.reply_to(msg, f"Channel target: {cur} ({typ})")
 
-
-
-# ========= Public/Private preset commands =========
 @bot.message_handler(commands=['set_public'])
 def cmd_set_public(msg):
     if not user_is_admin(msg):
@@ -680,6 +649,28 @@ def cmd_use_private(msg):
     save_channel_id(v)
     bot.reply_to(msg, f"עברתי לשידור ליעד הפרטי: {v}")
 
+
+# ========= Force send next =========
+@bot.message_handler(commands=['force_send_next'])
+def cmd_force_send_next(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    item = pending[0]
+    try:
+        post_to_channel(item)
+        write_products(PENDING_CSV, pending[1:])
+        item_id = item.get("ItemId", "ללא מספר")
+        title = (item.get("Title","") or "")[:80]
+        bot.reply_to(msg, f"נשלח בכפייה ✅\nמספר פריט: {item_id}\nכותרת: {title}")
+    except Exception as e:
+        bot.reply_to(msg, f"שגיאה בשליחה כפויה: {e}")
+
+
 # ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
@@ -692,43 +683,46 @@ def cmd_start(msg):
     kb.row('/set_delay_25m', '/set_delay_30m')
     kb.row('/schedule_status')
     kb.row('/schedule_on', '/schedule_off')
+    kb.row('/channel_status', '/set_channel_id')
+    kb.row('/use_public', '/use_private')
+    kb.row('/set_public', '/set_private')
 
-    text = """ברוך הבא! מצב עבודה בשתי אפשרויות:
-• מצב שינה פעיל (מתוזמן): שידור רק בשעות שהוגדרו.
-• מצב שינה כבוי (תמיד-פעיל): הבוט משדר כל הזמן.
+    text = f"""ברוך הבא! פקודות שימושיות:
 
-פקודות:
-• /set_delay N – להגדיר מרווח בדקות (לדוגמה: /set_delay 20)
+מצב עבודה:
 • /schedule_on – הפעלת מצב שינה פעיל (כיבוד שעות)
 • /schedule_off – ביטול מצב שינה (שידור תמיד)
 • /schedule_status – מצב נוכחי
+
+זמני המתנה:
+• /set_delay N – להגדיר מרווח בדקות (למשל: /set_delay 20)
+• /set_delay_10m / _20m / _25m / _30m – קיצורי דרך
+
+יעד שידור:
+• /channel_status – יעד השידור הנוכחי
+• /set_channel_id <@name|-100…> – עדכון יעד השידור
+• /use_public / /use_private – מעבר מהיר לפריסטים
+• /set_public <@name|-100…> – שמירת פריסט ציבורי
+• /set_private <@name|-100…> – שמירת פריסט פרטי
+
+ניהול תור:
 • /list_pending – פוסטים ממתינים
-• /pending_status – סטטוס שידור ו-ETA
+• /pending_status – סטטוס ו-ETA (מרווח: {get_post_delay()//60} דקות)
 • /peek_next – הפריט הבא
 • /peek_idx N – פריט לפי אינדקס
 • /skip_one – דילוג על הבא
 • /clear_pending – ניקוי התור
 • /reset_pending – טעינה מחדש מהקובץ
-• /force_send_next – שליחה כפויה של הפריט הבא (עוקף שקט)
-• /channel_status – יעד השידור הנוכחי
-• /set_channel_id <@name|-100…> – עדכון יעד השידור
-• /use_public – מעבר מהיר לפריסט הציבורי
-• /use_private – מעבר מהיר לפריסט הפרטי
-• /set_public <@name|-100…> – שמירת פריסט ציבורי
-• /set_private <@name|-100…> – שמירת פריסט פרטי
-• /set_delay_10m – קבע מרווח ל-10 דקות
-• /set_delay_20m – קבע מרווח ל-20 דקות
-• /set_delay_25m – קבע מרווח ל-25 דקות
-• /set_delay_30m – קבע מרווח ל-30 דקות
-
-טיפ: פתח את תפריט הפקודות דרך כפתור התפריט או בהקלדת '/'."""
+• /force_send_next – שליחה כפויה (עוקף שקט)
+"""
     bot.send_message(msg.chat.id, text, reply_markup=kb)
 
 
 # ========= SENDER LOOP (BACKGROUND) =========
 def run_sender_loop():
+    init_pending()
+    # ברירת מחדל: אם אין דגל, הפעל מתוזמן
     if not os.path.exists(SCHEDULE_FLAG_FILE):
-        # ברירת מחדל: שינה פעיל (כיבוד שעות)
         set_schedule_enforced(True)
     while True:
         if is_quiet_now():
@@ -747,8 +741,7 @@ def run_sender_loop():
         time.sleep(get_post_delay())
 
 
-
-
+# ========= MAIN =========
 def print_current_channel_target():
     try:
         cur = load_channel_id()
@@ -757,9 +750,10 @@ def print_current_channel_target():
     except Exception as e:
         print(f"[BOOT] Channel target check failed: {e}")
 
-# ========= MAIN =========
 if __name__ == "__main__":
     _lock_handle = acquire_single_instance_lock()
+
+    # אבחון webhook לפני ואחרי מחיקה
     print_webhook_info()
     print_current_channel_target()
     try:
@@ -771,9 +765,12 @@ if __name__ == "__main__":
         except Exception as e2:
             print(f"[WARN] remove_webhook failed: {e2}")
     print_webhook_info()
-    print_current_channel_target()
+
+    # חוט רקע לשידור
     t = threading.Thread(target=run_sender_loop, daemon=True)
     t.start()
+
+    # polling עם retry
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
