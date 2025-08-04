@@ -409,6 +409,27 @@ def _check_target_permissions(target):
     except Exception as e:
         return False, f"check failed: {e}", None
 
+
+
+# ========= Quick toggle between presets =========
+def _resolve_preset_name(value):
+    return "פרטי" if isinstance(value, int) else "ציבורי"
+
+def _pick_other_preset(cur):
+    pub = load_public_preset()
+    prv = load_private_preset()
+    # אם אחד מהם לא מוגדר – אי אפשר לעשות toggle
+    if pub is None or prv is None:
+        return None, None, pub, prv
+    # אם היעד הנוכחי זהה לפריסט פרטי – נעבור לציבורי
+    if (isinstance(cur, int) and isinstance(prv, int) and cur == prv):
+        return pub, "ציבורי", pub, prv
+    # אם היעד הנוכחי זהה לפריסט ציבורי – נעבור לפרטי
+    if (not isinstance(cur, int) and not isinstance(pub, int) and cur == pub):
+        return prv, "פרטי", pub, prv
+    # אם הנוכחי לא תואם לאף פריסט – כברירת מחדל נעבור לפרטי
+    return prv, "פרטי", pub, prv
+
 # ========= ADMIN COMMANDS =========
 def user_is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
@@ -755,6 +776,25 @@ def cmd_debug_send(msg):
     except Exception as e:
         bot.reply_to(msg, f"debug_send error: {e}")
 
+
+
+@bot.message_handler(commands=['switch_target'])
+def cmd_switch_target(msg):
+    if not user_is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    cur = load_channel_id()
+    nxt, nxt_name, pub, prv = _pick_other_preset(cur)
+    if pub is None or prv is None:
+        bot.reply_to(msg, "חסר פריסט אחד לפחות. קבע שניהם פעם אחת:\n/set_public @PublicName\n/set_private -100XXXXXXXXXXXX")
+        return
+    save_channel_id(nxt)
+    ok, details, _ = _check_target_permissions(nxt)
+    if ok:
+        bot.reply_to(msg, f"החלפתי יעד ➜ {nxt_name}: {nxt} ✅\n{details}")
+    else:
+        bot.reply_to(msg, f"החלפתי יעד ➜ {nxt_name}: {nxt}, אך יש בעיה בהרשאות/זיהוי ⚠️\n{details}")
+
 # ========= /start menu =========
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
@@ -770,6 +810,7 @@ def cmd_start(msg):
     kb.row('/channel_status', '/set_channel_id')
     kb.row('/use_public', '/use_private')
     kb.row('/set_public', '/set_private')
+    kb.row('/switch_target')
     kb.row('/debug_check_target', '/debug_send')
 
     text = f"""ברוך הבא! פקודות שימושיות:
@@ -799,6 +840,7 @@ def cmd_start(msg):
 • /clear_pending – ניקוי התור
 • /reset_pending – טעינה מחדש מהקובץ
 • /force_send_next – שליחה כפויה (עוקף שקט)
+• /switch_target – החלפה מהירה בין פרטי ↔ ציבורי
 • /debug_check_target – בדיקת יעד והרשאות
 • /debug_send – שליחת טקסט בדיקה לערוץ היעד
 """
