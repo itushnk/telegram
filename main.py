@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import socket
 
 # ========= CONFIG =========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4")  # כדאי ב-ENV
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4")  # מומלץ ב-ENV
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
@@ -177,6 +177,26 @@ def init_pending():
         src = read_products(DATA_CSV)
         write_products(PENDING_CSV, src)
 
+# ---- PRESET HELPERS (load/save target presets) ----
+def _save_preset(path: str, value):
+    """שומר מחרוזת/מספר לקובץ פריסט."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(value))
+    except Exception as e:
+        print(f"[WARN] Failed to save preset {path}: {e}")
+
+def _load_preset(path: str):
+    """טוען ערך מהפריסט; מחזיר None אם לא קיים."""
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"[WARN] Failed to load preset {path}: {e}")
+        return None
+
 def resolve_target(value):
     """מנרמל יעד: @name נשאר מחרוזת; '-100…'/מספר מומר ל-int."""
     try:
@@ -197,7 +217,7 @@ def check_and_probe_target(target):
     try:
         t = resolve_target(target)
         chat = bot.get_chat(t)  # יאמת קיום יעד
-        # בדיקת אדמין (ב-Channels זה עובד)
+        # בדיקת אדמין (Channels)
         try:
             me = bot.get_me()
             member = bot.get_chat_member(chat.id, me.id)
@@ -205,14 +225,12 @@ def check_and_probe_target(target):
             if status not in ("administrator", "creator"):
                 return False, f"⚠️ הבוט אינו אדמין ביעד {chat.id}."
         except Exception as e_mem:
-            # לא חוסם — נעבור לבדיקת שליחה
             print("[WARN] get_chat_member failed:", e_mem)
 
         # שליחת הודעת בדיקה ומחיקה (אם יש הרשאה לפרסם)
         try:
             m = bot.send_message(chat.id, "🟢 בדיקת הרשאה (תימחק מיד).", disable_notification=True)
             try:
-                # מותר למחוק רק אם יש הרשאה למחיקה; לא חובה להצליח
                 bot.delete_message(chat.id, m.message_id)
             except Exception:
                 pass
@@ -310,7 +328,7 @@ def format_post(product):
     rating_percent = rating if rating else "אין דירוג"
     orders_num = safe_int(orders, default=0)
     orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
-    discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
+    discount_text = f"💸 חיסכון של {discount}!" אם discount and discount != "0%" else ""
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
 
     lines = []
@@ -645,12 +663,10 @@ def handle_forward_for_target(msg):
 
     # שמירה
     if mode == "public":
-        with open(PUBLIC_PRESET_FILE, "w", encoding="utf-8") as f:
-            f.write(str(target_value))
+        _save_preset(PUBLIC_PRESET_FILE, target_value)
         label = "ציבורי"
     else:
-        with open(PRIVATE_PRESET_FILE, "w", encoding="utf-8") as f:
-            f.write(str(target_value))
+        _save_preset(PRIVATE_PRESET_FILE, target_value)
         label = "פרטי"
 
     # העברה + אתחול תור + בדיקת יעד
