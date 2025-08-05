@@ -38,6 +38,7 @@ SCHEDULE_FLAG_FILE = os.path.join(BASE_DIR, "schedule_enforced.flag")
 CONVERT_NEXT_FLAG_FILE = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 RATE_FILE = os.path.join(BASE_DIR, "usd_ils_rate.txt")
 USD_TO_ILS_RATE_DEFAULT = 3.55
+CONVERT_DEFAULT_FLAG_FILE = os.path.join(BASE_DIR, "convert_default_usd_to_ils.flag")
 
 LOCK_PATH = os.path.join(BASE_DIR, "bot.lock")
 
@@ -69,7 +70,10 @@ def _write_rate(v: float):
         f.write(str(v))
 
 def _convert_enabled() -> bool:
-    return os.path.exists(CONVERT_NEXT_FLAG_FILE)
+    # Next-file flag overrides; otherwise use persistent default
+    if os.path.exists(CONVERT_NEXT_FLAG_FILE):
+        return True
+    return os.path.exists(CONVERT_DEFAULT_FLAG_FILE)
 
 def _set_convert_enabled(enabled: bool, rate: float | None = None):
     if enabled:
@@ -81,6 +85,20 @@ def _set_convert_enabled(enabled: bool, rate: float | None = None):
                 os.remove(CONVERT_NEXT_FLAG_FILE)
         except Exception:
             pass
+def _convert_default_enabled() -> bool:
+    return os.path.exists(CONVERT_DEFAULT_FLAG_FILE)
+
+def _set_convert_default_enabled(enabled: bool):
+    if enabled:
+        with open(CONVERT_DEFAULT_FLAG_FILE, "w", encoding="utf-8") as f:
+            f.write("1")
+    else:
+        try:
+            if os.path.exists(CONVERT_DEFAULT_FLAG_FILE):
+                os.remove(CONVERT_DEFAULT_FLAG_FILE)
+        except Exception:
+            pass
+
 
 def safe_int(value, default=0):
     try:
@@ -251,6 +269,9 @@ def inline_menu():
     rate = _read_rate()
     status = "✅" if _convert_enabled() else "❌"
     kb.add(types.InlineKeyboardButton(f"₪ המרת $→₪ ({rate}) לקובץ הבא: {status}", callback_data="convert_toggle"))
+    # המרה אוטומטית קבועה
+    default_status = "✅" if _convert_default_enabled() else "❌"
+    kb.add(types.InlineKeyboardButton(f"₪ המרה אוטומטית כברירת מחדל: {default_status}", callback_data="convert_toggle_default"))
 
     # שינוי שער המרה
     kb.add(
@@ -586,7 +607,6 @@ def on_inline_click(c):
             seconds = int(data.split("_", 1)[1])
             if seconds <= 0:
                 raise ValueError("מרווח חייב להיות חיובי")
-            global POST_DELAY_SECONDS
             POST_DELAY_SECONDS = seconds
             save_delay_seconds(seconds)
             DELAY_EVENT.set()
@@ -604,6 +624,14 @@ def on_inline_click(c):
             rate = _read_rate()
             _set_convert_enabled(True, rate)
             bot.edit_message_text(f"✅ הופעל: המרת $→₪ לקובץ הבא (שער {rate}).", chat_id, c.message.message_id, reply_markup=inline_menu())
+
+    elif data == "convert_toggle_default":
+        if _convert_default_enabled():
+            _set_convert_default_enabled(False)
+            bot.edit_message_text("❌ המרה אוטומטית $→₪ כבויה כברירת מחדל.", chat_id, c.message.message_id, reply_markup=inline_menu())
+        else:
+            _set_convert_default_enabled(True)
+            bot.edit_message_text("✅ הופעלה המרה אוטומטית $→₪ כברירת מחדל.", chat_id, c.message.message_id, reply_markup=inline_menu())
 
     elif data == "show_set_rate":
         rate = _read_rate()
