@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import os, sys
-# לוגים ללא באפר
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -16,24 +15,38 @@ import threading
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 import socket
+import re
+
+# ========= PERSISTENT DATA DIR =========
+BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
+os.makedirs(BASE_DIR, exist_ok=True)
 
 # ========= CONFIG =========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4")  # מומלץ ב-ENV
-CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
+CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
-# קבצים
-DATA_CSV = "workfile.csv"         # קובץ המקור
-PENDING_CSV = "pending.csv"       # תור הפוסטים
-DELAY_FILE = "post_delay.txt"     # מרווח נבחר
-PUBLIC_PRESET_FILE = "public_target.preset"
-PRIVATE_PRESET_FILE = "private_target.preset"
+# קבצים (בתיקיית DATA המתמשכת או לוקאלית)
+DATA_CSV = os.path.join(BASE_DIR, "workfile.csv")        # קובץ המקור האחרון שהועלה
+PENDING_CSV = os.path.join(BASE_DIR, "pending.csv")      # תור הפוסטים
+DELAY_FILE = os.path.join(BASE_DIR, "post_delay.txt")    # מרווח שידור
+PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
+PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 
-# מצב עבודה (חלונות שידור)
-SCHEDULE_FLAG_FILE = "schedule_enforced.flag"
-LOCK_PATH = os.environ.get("BOT_LOCK_PATH", "/tmp/bot.lock")  # נעילה למופע יחיד בקונטיינר
+# דגלים
+SCHEDULE_FLAG_FILE = os.path.join(BASE_DIR, "schedule_enforced.flag")
+CONVERT_NEXT_FLAG_FILE = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
+
+# שער ברירת מחדל
+USD_TO_ILS_RATE_DEFAULT = 3.55
+
+# נעילה למופע יחיד
+LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= INIT =========
+if not BOT_TOKEN:
+    print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יוכל להתחבר לטלגרם עד שתקבע ENV.", flush=True)
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
@@ -56,9 +69,8 @@ FILE_LOCK = threading.Lock()
 
 
 # ========= SINGLE INSTANCE LOCK =========
-def acquire_single_instance_lock(lock_path: str = "bot.lock"):
+def acquire_single_instance_lock(lock_path: str):
     try:
-        import sys
         if os.name == "nt":
             import msvcrt
             f = open(lock_path, "w")
@@ -190,7 +202,7 @@ def init_pending():
         src = read_products(DATA_CSV)
         write_products(PENDING_CSV, src)
 
-# ---- PRESET HELPERS (load/save target presets) ----
+# ---- PRESET HELPERS ----
 def _save_preset(path: str, value):
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -209,7 +221,6 @@ def _load_preset(path: str):
         return None
 
 def resolve_target(value):
-    """@name נשאר מחרוזת; '-100…'/מספר מומר ל-int."""
     try:
         if isinstance(value, int):
             return value
@@ -221,7 +232,6 @@ def resolve_target(value):
         return value
 
 def check_and_probe_target(target):
-    """בודק קיום יעד, אדמין, ויכולת פרסום קצרה (למחיקה)."""
     try:
         t = resolve_target(target)
         chat = bot.get_chat(t)
@@ -280,7 +290,7 @@ def is_quiet_now(now: datetime | None = None) -> bool:
     return not should_broadcast(now) if is_schedule_enforced() else False
 
 
-# ========= SAFE EDIT (מניעת 400) =========
+# ========= SAFE EDIT =========
 def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
     try:
         curr_text = (message.text or message.caption or "")
@@ -315,7 +325,6 @@ def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup
 
 # ========= POSTING =========
 def format_post(product):
-    # תוכן הפרסום נמשך רק מהקובץ (Opening/Strengths/Title/מחירים וכו')
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
     title = product.get('Title', '')
@@ -389,12 +398,8 @@ def post_to_channel(product):
         print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}", flush=True)
 
 
-# ========= ATOMIC SEND (מניעת כפילות) =========
+# ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
-    """
-    שולח את הפריט הראשון בתור (אם יש), מעדכן את pending.csv ומדפיס לוגים.
-    מחזיר True אם נשלח משהו.
-    """
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
@@ -427,7 +432,7 @@ def send_next_locked(source: str = "loop") -> bool:
         return True
 
 
-# ========= DELAY (מרווח) =========
+# ========= DELAY =========
 def load_delay_seconds(default_seconds: int = 1500) -> int:
     try:
         if os.path.exists(DELAY_FILE):
@@ -449,11 +454,125 @@ def save_delay_seconds(seconds: int) -> None:
 POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
 
 
-# ========= ADMIN HELPERS =========
+# ========= ADMIN =========
 def _is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
         return True
     return msg.from_user and (msg.from_user.id in ADMIN_USER_IDS)
+
+
+# ========= MERGE =========
+def merge_from_data_into_pending():
+    data_rows = read_products(DATA_CSV)
+    pending_rows = read_products(PENDING_CSV)
+
+    def key_of(r):
+        item_id = (r.get("ItemId") or "").strip()
+        title = (r.get("Title") or "").strip()
+        buy = (r.get("BuyLink") or "").strip()
+        return (item_id if item_id else None, title if not item_id else None, buy)
+
+    existing_keys = {key_of(r) for r in pending_rows}
+    added = 0
+    already = 0
+
+    for r in data_rows:
+        k = key_of(r)
+        if k in existing_keys:
+            already += 1
+            continue
+        pending_rows.append(r)
+        existing_keys.add(k)
+        added += 1
+
+    write_products(PENDING_CSV, pending_rows)
+    return added, already, len(pending_rows)
+
+
+# ========= DELETE HELPERS =========
+def _key_of_row(r: dict):
+    item_id = (r.get("ItemId") or "").strip()
+    title   = (r.get("Title") or "").strip()
+    buy     = (r.get("BuyLink") or "").strip()
+    return (item_id if item_id else None, title if not item_id else None, buy)
+
+def delete_source_csv_file():
+    """
+    מוחק את workfile.csv (משאיר קובץ ריק עם כותרות) — לא נוגע בתור.
+    """
+    with FILE_LOCK:
+        write_products(DATA_CSV, [])
+    return True
+
+def delete_source_rows_from_pending():
+    """
+    קורא את workfile.csv ומסיר מהתור (pending.csv) את כל הרשומות שנוספו ממנו,
+    לפי אותו מפתח מניעת-כפילויות (ItemId/Title/BuyLink).
+    """
+    with FILE_LOCK:
+        src_rows = read_products(DATA_CSV)
+        if not src_rows:
+            return 0, 0
+
+        src_keys = {_key_of_row(r) for r in src_rows}
+        pending_rows = read_products(PENDING_CSV)
+        if not pending_rows:
+            write_products(PENDING_CSV, [])
+            return 0, 0
+
+        before = len(pending_rows)
+        filtered = [r for r in pending_rows if _key_of_row(r) not in src_keys]
+        removed = before - len(filtered)
+        write_products(PENDING_CSV, filtered)
+        return removed, len(filtered)
+
+
+# ========= USD→ILS HELPERS =========
+def _decode_csv_bytes(b: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp1255", "iso-8859-8"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="ignore")
+
+def _is_usd_price(raw_value: str) -> bool:
+    s = (raw_value or "")
+    if not isinstance(s, str):
+        s = str(s)
+    s_low = s.lower()
+    return ("$" in s) or ("usd" in s_low)
+
+def _extract_number(s: str) -> float | None:
+    if s is None:
+        return None
+    s = str(s)
+    m = re.search(r"([-+]?\d+(?:[.,]\d+)?)", s)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", "."))
+
+def _convert_price_text(raw_value: str, rate: float) -> str:
+    num = _extract_number(raw_value)
+    if num is None:
+        return ""
+    ils = round(num * rate)
+    return str(int(ils))
+
+def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
+    out = []
+    for r in rows_raw:
+        rr = dict(r)
+        if rate:
+            orig_src = rr.get("OriginalPrice", rr.get("Origin Price", ""))
+            sale_src = rr.get("SalePrice", rr.get("Discount Price", ""))
+
+            if _is_usd_price(str(orig_src)):
+                rr["OriginalPrice"] = _convert_price_text(orig_src, rate)
+            if _is_usd_price(str(sale_src)):
+                rr["SalePrice"] = _convert_price_text(sale_src, rate)
+        out.append(normalize_row_keys(rr))
+    return out
 
 
 # ========= INLINE MENU =========
@@ -484,6 +603,18 @@ def inline_menu():
     # העלאת CSV
     kb.add(types.InlineKeyboardButton("📥 העלה CSV", callback_data="upload_source"))
 
+    # המרת $→₪ לקובץ הבא בלבד
+    kb.add(types.InlineKeyboardButton("₪ המרת $→₪ (3.55) לקובץ הבא", callback_data="convert_next"))
+
+    # איפוס יזום מהקובץ הראשי
+    kb.add(types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"))
+
+    # מחיקות
+    kb.add(
+        types.InlineKeyboardButton("🗑️ מחק פריטי התור מהקובץ", callback_data="delete_source_from_pending"),
+        types.InlineKeyboardButton("🧹 מחק את workfile.csv", callback_data="delete_source_file"),
+    )
+
     # יעדים (שמורים)
     kb.add(
         types.InlineKeyboardButton("🎯 ציבורי (השתמש)", callback_data="target_public"),
@@ -501,85 +632,6 @@ def inline_menu():
         f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"
     ))
     return kb
-
-
-# ========= MERGE FROM DATA =========
-def merge_from_data_into_pending():
-    data_rows = read_products(DATA_CSV)
-    pending_rows = read_products(PENDING_CSV)
-
-    def key_of(r):
-        item_id = (r.get("ItemId") or "").strip()
-        title = (r.get("Title") or "").strip()
-        buy = (r.get("BuyLink") or "").strip()
-        return (item_id if item_id else None, title if not item_id else None, buy)
-
-    existing_keys = {key_of(r) for r in pending_rows}
-    added = 0
-    already = 0
-
-    for r in data_rows:
-        k = key_of(r)
-        if k in existing_keys:
-            already += 1
-            continue
-        pending_rows.append(r)
-        existing_keys.add(k)
-        added += 1
-
-    write_products(PENDING_CSV, pending_rows)
-    return added, already, len(pending_rows)
-
-
-# ========= UPLOAD CSV HELPERS =========
-def _decode_csv_bytes(b: bytes) -> str:
-    # ניסיון פענוח ידידותי ל-CSV בעברית
-    for enc in ("utf-8-sig", "utf-8", "cp1255", "iso-8859-8"):
-        try:
-            return b.decode(enc)
-        except Exception:
-            continue
-    return b.decode("utf-8", errors="ignore")
-
-def _read_source_csv_text(csv_text: str):
-    """קורא טקסט CSV ומחזיר רשימת dicts כשהעמודות מנורמלות."""
-    from io import StringIO
-    f = StringIO(csv_text)
-    reader = csv.DictReader(f)
-    rows = [normalize_row_keys(r) for r in reader]
-    return rows
-
-def _save_workfile(rows):
-    """כותב את הנתונים ל-workfile.csv בפורמט שהבוט מצפה לו."""
-    write_products(DATA_CSV, rows)
-
-def _merge_to_pending_from_rows(rows):
-    """
-    ממזג rows (כבר מנורמלים) אל pending.csv בלי כפילויות.
-    """
-    pending_rows = read_products(PENDING_CSV)
-
-    def key_of(r):
-        item_id = (r.get("ItemId") or "").strip()
-        title   = (r.get("Title") or "").strip()
-        buy     = (r.get("BuyLink") or "").strip()
-        return (item_id if item_id else None, title if not item_id else None, buy)
-
-    existing_keys = {key_of(r) for r in pending_rows}
-    added = 0
-    already = 0
-
-    for r in rows:
-        k = key_of(r)
-        if k in existing_keys:
-            already += 1
-            continue
-        pending_rows.append(r)
-        existing_keys.add(k)
-        added += 1
-
-    write_products(PENDING_CSV, pending_rows)
-    return added, already, len(pending_rows)
 
 
 # ========= INLINE CALLBACKS =========
@@ -703,12 +755,9 @@ def on_inline_click(c):
             bot.answer_callback_query(c.id, "לא הוגדר יעד ציבורי. בחר דרך '🆕 בחר ערוץ ציבורי'.", show_alert=True)
             return
         CURRENT_TARGET = resolve_target(v)
-        src_rows = read_products(DATA_CSV)
-        with FILE_LOCK:
-            write_products(PENDING_CSV, src_rows)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"🎯 עברתי לשדר ליעד הציבורי: {v}\n🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n{details}",
+                          new_text=f"🎯 עברתי לשדר ליעד הציבורי: {v}\n{details}",
                           reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "target_private":
@@ -717,12 +766,9 @@ def on_inline_click(c):
             bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. בחר דרך '🆕 בחר ערוץ פרטי'.", show_alert=True)
             return
         CURRENT_TARGET = resolve_target(v)
-        src_rows = read_products(DATA_CSV)
-        with FILE_LOCK:
-            write_products(PENDING_CSV, src_rows)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"🔒 עברתי לשדר ליעד הפרטי: {v}\n🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n{details}",
+                          new_text=f"🔒 עברתי לשדר ליעד הפרטי: {v}\n{details}",
                           reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "choose_public":
@@ -744,6 +790,42 @@ def on_inline_click(c):
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
                           reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "convert_next":
+        try:
+            with open(CONVERT_NEXT_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write(str(USD_TO_ILS_RATE_DEFAULT))
+            safe_edit_message(
+                bot, chat_id=chat_id, message=c.message,
+                new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
+                reply_markup=inline_menu(), cb_id=c.id
+            )
+        except Exception as e:
+            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
+
+    elif data == "reset_from_data":
+        src = read_products(DATA_CSV)
+        with FILE_LOCK:
+            write_products(PENDING_CSV, src)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"🔁 התור אופס ומתחיל מחדש ({len(src)} פריטים) מהקובץ הראשי.",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delete_source_from_pending":
+        removed, left = delete_source_rows_from_pending()
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=f"🗑️ הוסר מהתור: {removed} פריטים שנמצאו ב-workfile.csv\nנשארו בתור: {left}",
+            reply_markup=inline_menu(), cb_id=c.id
+        )
+
+    elif data == "delete_source_file":
+        ok = delete_source_csv_file()
+        msg_txt = "🧹 workfile.csv אופס לריק (נשמרו רק כותרות). התור לא שונה." if ok else "שגיאה במחיקת workfile.csv"
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id
+        )
 
     else:
         bot.answer_callback_query(c.id)
@@ -774,21 +856,17 @@ def handle_forward_for_target(msg):
 
     global CURRENT_TARGET
     CURRENT_TARGET = resolve_target(target_value)
-    src_rows = read_products(DATA_CSV)
-    with FILE_LOCK:
-        write_products(PENDING_CSV, src_rows)
     ok, details = check_and_probe_target(CURRENT_TARGET)
 
     EXPECTING_TARGET.pop(msg.from_user.id, None)
 
     bot.reply_to(msg,
         f"✅ נשמר יעד {label}: {target_value}\n"
-        f"🔄 התור אופס ומתחיל מחדש ({len(src_rows)} פריטים).\n"
         f"{details}\n\nאפשר לעבור בין יעדים מהתפריט: 🎯/🔒"
     )
 
 
-# ========= UPLOAD CSV COMMANDS =========
+# ========= UPLOAD CSV =========
 @bot.message_handler(commands=['upload_source'])
 def cmd_upload_source(msg):
     if not _is_admin(msg):
@@ -808,7 +886,6 @@ def cmd_upload_source(msg):
 def on_document(msg):
     uid = getattr(msg.from_user, "id", None)
     if uid not in EXPECTING_UPLOAD:
-        # לא במצב העלאה מבוקש — מתעלמים
         return
 
     try:
@@ -818,26 +895,68 @@ def on_document(msg):
             bot.reply_to(msg, "זה לא נראה כמו CSV. נסה/י שוב עם קובץ .csv")
             return
 
-        # הורדת הקובץ מטלגרם
+        # הורדה
         file_info = bot.get_file(doc.file_id)
         file_bytes = bot.download_file(file_info.file_path)
 
         csv_text = _decode_csv_bytes(file_bytes)
-        rows = _read_source_csv_text(csv_text)
 
-        if not rows:
-            bot.reply_to(msg, "לא הצלחתי לקרוא נתונים מה-CSV. ודא/י שיש כותרות ושורות.")
-            return
+        # קריאה RAW כדי לזהות $/USD לפני נורמליזציה
+        from io import StringIO
+        raw_reader = csv.DictReader(StringIO(csv_text))
+        rows_raw = [dict(r) for r in raw_reader]
 
-        # כתיבה ל-workfile.csv + מיזוג ל-pending.csv — נעילה כדי למנוע מירוץ
+        # בדיקת דגל המרה לקובץ הבא
+        convert_rate = None
+        if os.path.exists(CONVERT_NEXT_FLAG_FILE):
+            try:
+                with open(CONVERT_NEXT_FLAG_FILE, "r", encoding="utf-8") as f:
+                    convert_rate = float((f.read() or "").strip() or USD_TO_ILS_RATE_DEFAULT)
+            except Exception:
+                convert_rate = USD_TO_ILS_RATE_DEFAULT
+            try:
+                os.remove(CONVERT_NEXT_FLAG_FILE)
+            except Exception:
+                pass
+
+        # המרה (אם נדרש) + נורמליזציה
+        rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
+
+        # כתיבה + מיזוג
         with FILE_LOCK:
-            _save_workfile(rows)
-            added, already, total_after = _merge_to_pending_from_rows(rows)
+            write_products(DATA_CSV, rows)
+            # מיזוג ללא כפילויות
+            pending_rows = read_products(PENDING_CSV)
+
+            def key_of(r):
+                item_id = (r.get("ItemId") or "").strip()
+                title = (r.get("Title") or "").strip()
+                buy = (r.get("BuyLink") or "").strip()
+                return (item_id if item_id else None, title if not item_id else None, buy)
+
+            existing_keys = {key_of(r) for r in pending_rows}
+            added = 0
+            already = 0
+            for r in rows:
+                k = key_of(r)
+                if k in existing_keys:
+                    already += 1
+                    continue
+                pending_rows.append(r)
+                existing_keys.add(k)
+                added += 1
+            write_products(PENDING_CSV, pending_rows)
+            total_after = len(pending_rows)
+
+        extra_line = ""
+        if convert_rate:
+            extra_line = f"\n💱 בוצעה המרה לש\"ח בשער {convert_rate} לכל מחירי הדולר בקובץ זה."
 
         bot.reply_to(msg,
             "✅ הקובץ נקלט בהצלחה.\n"
-            f"נוספו לתור: {added}\nכבר היו בתור: {already}\nסה\"כ בתור כעת: {total_after}\n\n"
-            "השידור ממשיך בקצב שנקבע. אפשר לבדוק '📊 סטטוס שידור' בתפריט."
+            f"נוספו לתור: {added}\nכבר היו בתור/כפולים: {already}\nסה\"כ בתור כעת: {total_after}"
+            + extra_line +
+            "\n\nהשידור ממשיך בקצב שנקבע. אפשר לבדוק '📊 סטטוס שידור' בתפריט."
         )
 
     except Exception as e:
@@ -969,14 +1088,13 @@ def pending_status(msg):
     bot.reply_to(msg, msg_text, parse_mode='HTML')
 
 
-# ========= HEALTH & START FALLBACK =========
+# ========= HEALTH & START =========
 @bot.message_handler(commands=['ping'])
 def cmd_ping(msg):
     bot.reply_to(msg, "pong ✅")
 
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
-    # נקה מצב בחירה/העלאה, כדי ש-/start לא "ייבלע"
     try:
         uid = getattr(msg.from_user, "id", None)
         if uid is not None:
@@ -987,7 +1105,6 @@ def cmd_start(msg):
     print(f"Instance={socket.gethostname()} | User={msg.from_user.id if msg.from_user else 'N/A'} sent /start", flush=True)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
-# fallback אם משום מה /start לא נתפס כפקודה
 @bot.message_handler(func=lambda m: isinstance(m.text, str) and m.text.strip().lower() in ('/start', 'start'))
 def start_fallback(msg):
     cmd_start(msg)
@@ -1015,17 +1132,14 @@ def run_sender_loop():
             DELAY_EVENT.clear()
             continue
 
-        # שליחה אטומית
         send_next_locked("loop")
 
-        # המתנה למרווח (או עד לשינוי מרווח)
         print(f"[{datetime.now(tz=IL_TZ)}] sleeping for {POST_DELAY_SECONDS}s (or until delay changed)", flush=True)
         DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
         DELAY_EVENT.clear()
 
 
-# ========= DEBUG LOG EVERY MESSAGE (אבחון) =========
-# שים לב: זה MUST לבוא בסוף, כדי שלא "יגנוב" handlers אחרים.
+# ========= DEBUG LOG =========
 @bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice', 'sticker'])
 def _debug_log_everything(msg):
     try:
@@ -1037,7 +1151,6 @@ def _debug_log_everything(msg):
         print(f"[DBG] inbound {kind} from {uname}: {txt}", flush=True)
     except Exception:
         pass
-    # לא עונים כאן כדי לא להפריע ל-handlers אחרים
 
 
 # ========= MAIN =========
@@ -1051,7 +1164,6 @@ if __name__ == "__main__":
 
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
-        import sys
         print("Another instance is running (lock failed). Exiting.", flush=True)
         sys.exit(1)
 
