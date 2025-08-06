@@ -1148,7 +1148,7 @@ def pending_status(msg):
     auto_mode = read_auto_flag()
     auto_line = "🟢 מצב שידור: אוטומטי לפי שעות" if auto_mode == "on" else "🔴 מצב שידור: ידני לפי הגדרה"
     
-    schedule_line = auto_line + "\n" + schedule_line "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
+schedule_line = auto_line + "\n" + schedule_line + ("🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל")
     delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
     target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
     if count == 0:
