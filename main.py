@@ -439,10 +439,10 @@ AUTO_FLAG_FILE = os.path.join(BASE_DIR, "auto_delay.flag")
 
 
 AUTO_SCHEDULE = [
-    (dtime(6, 0),  dtime(9, 0),   1200),
-    (dtime(9, 0),  dtime(15, 0),  1800),
-    (dtime(15, 0), dtime(21, 0),  1200),
-    (dtime(21, 0), dtime(23, 59), 1500),
+    (dtime(6, 0), dtime(9, 0), 1200),
+    (dtime(9, 0), dtime(15, 0), 1500),
+    (dtime(15, 0), dtime(22, 0), 1200),
+    (dtime(22, 0), dtime(23, 59), 1500),
 ]
 
 
@@ -1308,82 +1308,3 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
-
-
-# ========= PENDING NAVIGATION =========
-
-PENDING_INDEX = {}  # user_id -> index
-
-@bot.message_handler(commands=['navigate_pending'])
-def cmd_navigate_pending(msg):
-    if not _is_admin(msg):
-        return
-    uid = getattr(msg.from_user, "id", None)
-    if uid is None:
-        return
-    with FILE_LOCK:
-        queue = read_products(PENDING_CSV)
-    if not queue:
-        bot.reply_to(msg, "התור ריק – אין מה להציג.")
-        return
-    PENDING_INDEX[uid] = 0
-    send_navigation_preview(msg.chat.id, uid)
-
-def send_navigation_preview(chat_id, uid):
-    with FILE_LOCK:
-        queue = read_products(PENDING_CSV)
-    idx = PENDING_INDEX.get(uid, 0)
-    if not queue:
-        bot.send_message(chat_id, "התור ריק – אין מה להציג.")
-        return
-    if idx >= len(queue):
-        idx = len(queue) - 1
-    if idx < 0:
-        idx = 0
-    PENDING_INDEX[uid] = idx
-    item = queue[idx]
-    preview = f"<b>#{idx+1} מתוך {len(queue)}</b>\n\n"
-
-"
-    preview += "\n".join([f"<b>{k}:</b> {v}" for k, v in item.items() if v])
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    buttons = []
-    if idx > 0:
-        buttons.append(types.InlineKeyboardButton("⏮ קודם", callback_data="nav_prev"))
-    if idx < len(queue) - 1:
-        buttons.append(types.InlineKeyboardButton("⏭ הבא", callback_data="nav_next"))
-    kb.add(*buttons)
-    kb.add(types.InlineKeyboardButton("❌ מחק פריט זה", callback_data="nav_delete"))
-    bot.send_message(chat_id, preview, parse_mode="HTML", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data in ("nav_prev", "nav_next", "nav_delete"))
-def on_nav_click(c):
-    uid = c.from_user.id
-    if not _is_admin(c.message):
-        bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
-        return
-    with FILE_LOCK:
-        queue = read_products(PENDING_CSV)
-    idx = PENDING_INDEX.get(uid, 0)
-    if c.data == "nav_prev":
-        if idx > 0:
-            PENDING_INDEX[uid] = idx - 1
-    elif c.data == "nav_next":
-        if idx < len(queue) - 1:
-            PENDING_INDEX[uid] = idx + 1
-    elif c.data == "nav_delete":
-        if 0 <= idx < len(queue):
-            del queue[idx]
-            write_products(PENDING_CSV, queue)
-            bot.answer_callback_query(c.id, "❌ נמחק מהתור.")
-            if idx >= len(queue):
-                idx = max(0, len(queue) - 1)
-            PENDING_INDEX[uid] = idx
-            if not queue:
-                bot.edit_message_text("✅ כל הפוסטים נמחקו מהתור.", c.message.chat.id, c.message.message_id)
-                return
-    try:
-        bot.delete_message(c.message.chat.id, c.message.message_id)
-    except Exception:
-        pass
-    send_navigation_preview(c.message.chat.id, uid)
