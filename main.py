@@ -333,7 +333,7 @@ def format_post(product):
     discount = product.get('Discount', '')
     rating = product.get('Rating', '')
     orders = product.get('Orders', '')
-    buy_link = product.get('BuyLink', '')
+    buy_link = product.get('Promotion Url', '')
     coupon = product.get('CouponCode', '')
 
     opening = (product.get('Opening') or '').strip()
