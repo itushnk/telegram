@@ -1140,7 +1140,7 @@ def pending_status(msg):
 
     auto_mode = read_auto_flag()
     auto_line = "🟢 מצב שידור: אוטומטי לפי שעות" if auto_mode == "on" else "🔴 מצב שידור: ידני לפי הגדרה"
-        with FILE_LOCK:
+    with FILE_LOCK:
         pending = read_products(PENDING_CSV)
     count = len(pending)
     now_il = datetime.now(tz=IL_TZ)
