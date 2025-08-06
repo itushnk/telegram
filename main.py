@@ -1404,3 +1404,52 @@ def on_nav_click(c):
         pass
     send_navigation_preview(c.message.chat.id, uid)
 
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+def show_queue_item(bot, chat_id, queue, index):
+    if not queue:
+        bot.send_message(chat_id, "📭 אין פוסטים ממתינים בתור.")
+        return
+
+    if index < 0 or index >= len(queue):
+        bot.send_message(chat_id, "⛔ אינדקס מחוץ לטווח.")
+        return
+
+    item = queue[index]
+    preview = f"<b>#{index + 1} מתוך {len(queue)}</b>\n"
+    preview += f"⏰ זמן משוער לפרסום: בעוד {index * POST_DELAY_SECONDS // 60} דקות\n\n"
+    preview += f"{item['Text']}\n\n"
+
+    keyboard = InlineKeyboardMarkup()
+    if index > 0:
+        keyboard.add(InlineKeyboardButton("⏮ קודם", callback_data=f"queue_prev_{index}"))
+    if index < len(queue) - 1:
+        keyboard.add(InlineKeyboardButton("⏭ הבא", callback_data=f"queue_next_{index}"))
+    keyboard.add(InlineKeyboardButton("❌ הסר פוסט זה", callback_data=f"queue_del_{index}"))
+
+    bot.send_message(chat_id, preview, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+
+@bot.message_handler(commands=["queue"])
+def handle_queue_command(message):
+    queue = load_queue()
+    show_queue_item(bot, message.chat.id, queue, 0)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("queue_"))
+def handle_queue_callback(call):
+    action, _, idx_str = call.data.partition("_")
+    sub_action, _, idx_str = idx_str.partition("_")
+    index = int(idx_str)
+
+    queue = load_queue()
+
+    if sub_action == "prev":
+        show_queue_item(bot, call.message.chat.id, queue, index - 1)
+    elif sub_action == "next":
+        show_queue_item(bot, call.message.chat.id, queue, index + 1)
+    elif sub_action == "del":
+        if 0 <= index < len(queue):
+            removed = queue.pop(index)
+            save_queue(queue)
+            bot.edit_message_text("🗑️ הפוסט הוסר מהתור.", call.message.chat.id, call.message.message_id)
+        else:
+            bot.answer_callback_query(call.id, "⛔ לא ניתן להסיר – אינדקס לא תקין.")
