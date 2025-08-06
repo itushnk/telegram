@@ -433,6 +433,37 @@ def send_next_locked(source: str = "loop") -> bool:
 
 
 # ========= DELAY =========
+
+# ========= AUTO DELAY MODE =========
+AUTO_FLAG_FILE = os.path.join(BASE_DIR, "auto_delay.flag")
+
+
+AUTO_SCHEDULE = [
+    (dtime(6, 0),  dtime(9, 0),   1200),
+    (dtime(9, 0),  dtime(15, 0),  1800),
+    (dtime(15, 0), dtime(21, 0),  1200),
+    (dtime(21, 0), dtime(23, 59), 1500),
+]
+
+
+def read_auto_flag():
+    try:
+        with open(AUTO_FLAG_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except:
+        return "on"
+
+def write_auto_flag(value):
+    with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
+        f.write(value)
+
+def get_auto_delay():
+    now = datetime.now(IL_TZ).time()
+    for start, end, delay in AUTO_SCHEDULE:
+        if start <= now <= end:
+            return delay
+    return None
+
 def load_delay_seconds(default_seconds: int = 1500) -> int:
     try:
         if os.path.exists(DELAY_FILE):
@@ -580,11 +611,14 @@ def inline_menu():
     kb = types.InlineKeyboardMarkup(row_width=3)
 
     # פעולות
+    
     kb.add(
         types.InlineKeyboardButton("📢 פרסם עכשיו", callback_data="publish_now"),
-        types.InlineKeyboardButton("⏭ דלג פריט", callback_data="skip_one"),
-        types.InlineKeyboardButton("📝 רשימת ממתינים", callback_data="list_pending"),
+        types.InlineKeyboardButton("⏱️ כל 20ד", callback_data="delay_1200"),
+        types.InlineKeyboardButton("⏱️ כל 25ד", callback_data="delay_1500"),
+        types.InlineKeyboardButton("⏱️ כל 30ד", callback_data="delay_1800"),
     )
+    kb.add(types.InlineKeyboardButton("⚙️ מצב אוטומטי (החלפה)", callback_data="toggle_auto_mode"))
     kb.add(
         types.InlineKeyboardButton("📊 סטטוס שידור", callback_data="pending_status"),
         types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
@@ -608,6 +642,9 @@ def inline_menu():
 
     # איפוס יזום מהקובץ הראשי
     kb.add(types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"))
+
+    
+    kb.add(types.InlineKeyboardButton("⚙️ מצב אוטומטי (החלפה)", callback_data="toggle_auto_mode"))
 
     # מחיקות
     kb.add(
@@ -818,6 +855,46 @@ def on_inline_click(c):
             new_text=f"🗑️ הוסר מהתור: {removed} פריטים שנמצאו ב-workfile.csv\nנשארו בתור: {left}",
             reply_markup=inline_menu(), cb_id=c.id
         )
+
+
+    
+    elif data == "delay_1200":
+        POST_DELAY_SECONDS = 1200
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 20 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delay_1500":
+        POST_DELAY_SECONDS = 1500
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 25 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delay_1800":
+        POST_DELAY_SECONDS = 1800
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 30 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+
+    elif data == "toggle_auto_mode":
+        current = read_auto_flag()
+        new_mode = "off" if current == "on" else "on"
+        write_auto_flag(new_mode)
+        new_label = "🟢 מצב אוטומטי פעיל" if new_mode == "on" else "🔴 מצב ידני בלבד"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"החלפתי מצב שידור: {new_label}",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
 
     elif data == "delete_source_file":
         ok = delete_source_csv_file()
@@ -1111,7 +1188,39 @@ def start_fallback(msg):
 
 
 # ========= SENDER LOOP =========
-def run_sender_loop():
+
+def auto_post_loop():
+    if not os.path.exists(SCHEDULE_FLAG_FILE):
+        set_schedule_enforced(True)
+    init_pending()
+
+    while True:
+        if read_auto_flag() != "on":
+            print(f"[{datetime.now(tz=IL_TZ)}] מצב ידני – שינה 5 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=5)
+            DELAY_EVENT.clear()
+            continue
+
+        delay = get_auto_delay()
+        if delay is None:
+            print(f"[{datetime.now(tz=IL_TZ)}] מחוץ לשעות שידור – שינה 60 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=60)
+            DELAY_EVENT.clear()
+            continue
+
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+        if not pending:
+            print(f"[{datetime.now(tz=IL_TZ)}] התור ריק – שינה 30 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
+
+        send_next_locked("auto")
+        print(f"[{datetime.now(tz=IL_TZ)}] פורסם. המתנה {delay} שניות", flush=True)
+        DELAY_EVENT.wait(timeout=delay)
+        DELAY_EVENT.clear()
+
     if not os.path.exists(SCHEDULE_FLAG_FILE):
         set_schedule_enforced(True)
     init_pending()
@@ -1178,7 +1287,7 @@ if __name__ == "__main__":
             print(f"[WARN] remove_webhook failed: {e2}", flush=True)
     print_webhook_info()
 
-    t = threading.Thread(target=run_sender_loop, daemon=True)
+    t = threading.Thread(target=auto_post_loop, daemon=True)
     t.start()
 
     while True:
@@ -1189,3 +1298,92 @@ if __name__ == "__main__":
             wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
             print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
             time.sleep(wait)
+
+
+@bot.message_handler(commands=['toggle_mode'])
+def toggle_mode(msg):
+    if not _is_admin(msg):
+        return
+    mode = read_auto_flag()
+    new_mode = "off" if mode == "on" else "on"
+    write_auto_flag(new_mode)
+    bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
+
+
+# ========= PENDING NAVIGATION =========
+
+PENDING_INDEX = {}  # user_id -> index
+
+@bot.message_handler(commands=['navigate_pending'])
+def cmd_navigate_pending(msg):
+    if not _is_admin(msg):
+        return
+    uid = getattr(msg.from_user, "id", None)
+    if uid is None:
+        return
+    with FILE_LOCK:
+        queue = read_products(PENDING_CSV)
+    if not queue:
+        bot.reply_to(msg, "התור ריק – אין מה להציג.")
+        return
+    PENDING_INDEX[uid] = 0
+    send_navigation_preview(msg.chat.id, uid)
+
+def send_navigation_preview(chat_id, uid):
+    with FILE_LOCK:
+        queue = read_products(PENDING_CSV)
+    idx = PENDING_INDEX.get(uid, 0)
+    if not queue:
+        bot.send_message(chat_id, "התור ריק – אין מה להציג.")
+        return
+    if idx >= len(queue):
+        idx = len(queue) - 1
+    if idx < 0:
+        idx = 0
+    PENDING_INDEX[uid] = idx
+    item = queue[idx]
+    preview = f"<b>#{idx+1} מתוך {len(queue)}</b>
+
+"
+    preview += "\n".join([f"<b>{k}:</b> {v}" for k, v in item.items() if v])
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    buttons = []
+    if idx > 0:
+        buttons.append(types.InlineKeyboardButton("⏮ קודם", callback_data="nav_prev"))
+    if idx < len(queue) - 1:
+        buttons.append(types.InlineKeyboardButton("⏭ הבא", callback_data="nav_next"))
+    kb.add(*buttons)
+    kb.add(types.InlineKeyboardButton("❌ מחק פריט זה", callback_data="nav_delete"))
+    bot.send_message(chat_id, preview, parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data in ("nav_prev", "nav_next", "nav_delete"))
+def on_nav_click(c):
+    uid = c.from_user.id
+    if not _is_admin(c.message):
+        bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
+        return
+    with FILE_LOCK:
+        queue = read_products(PENDING_CSV)
+    idx = PENDING_INDEX.get(uid, 0)
+    if c.data == "nav_prev":
+        if idx > 0:
+            PENDING_INDEX[uid] = idx - 1
+    elif c.data == "nav_next":
+        if idx < len(queue) - 1:
+            PENDING_INDEX[uid] = idx + 1
+    elif c.data == "nav_delete":
+        if 0 <= idx < len(queue):
+            del queue[idx]
+            write_products(PENDING_CSV, queue)
+            bot.answer_callback_query(c.id, "❌ נמחק מהתור.")
+            if idx >= len(queue):
+                idx = max(0, len(queue) - 1)
+            PENDING_INDEX[uid] = idx
+            if not queue:
+                bot.edit_message_text("✅ כל הפוסטים נמחקו מהתור.", c.message.chat.id, c.message.message_id)
+                return
+    try:
+        bot.delete_message(c.message.chat.id, c.message.message_id)
+    except Exception:
+        pass
+    send_navigation_preview(c.message.chat.id, uid)
