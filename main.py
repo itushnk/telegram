@@ -1221,3 +1221,34 @@ def get_buy_link(row):
 # במקום להשתמש ב-buy_link ישיר בכל מקום, השתמש ב-get_buy_link(row)
 
 # ==========================================================
+
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackQueryHandler
+
+# פונקציה ליצירת כפתורים עם חיווי מצב
+def get_mode_keyboard():
+    status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
+    toggle_text = "העבר למצב ידני" if USE_AUTO_MODE else "העבר למצב אוטומטי"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(toggle_text, callback_data='toggle_mode')
+    ], [
+        InlineKeyboardButton(f"מצב נוכחי: {status}", callback_data='status_info')
+    ]])
+
+# מטפל בלחיצה על כפתור
+def handle_mode_toggle(update, context):
+    global USE_AUTO_MODE
+    query = update.callback_query
+    if query.data == 'toggle_mode':
+        USE_AUTO_MODE = not USE_AUTO_MODE
+        new_status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
+        query.answer()
+        query.edit_message_text(text=f"✅ המצב עודכן: {new_status}", reply_markup=get_mode_keyboard())
+    elif query.data == 'status_info':
+        current_status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
+        query.answer(text=f"המצב הנוכחי: {current_status}")
+
+# הוספת המטפל לרשימת handlers בבוט
+# לדוגמה:
+# updater.dispatcher.add_handler(CallbackQueryHandler(handle_mode_toggle))
