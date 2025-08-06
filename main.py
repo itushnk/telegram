@@ -1342,7 +1342,7 @@ def send_navigation_preview(chat_id, uid):
         idx = 0
     PENDING_INDEX[uid] = idx
     item = queue[idx]
-    preview = f"<b>#{idx+1} מתוך {len(queue)}</b>
+    preview = f"<b>#{idx+1} מתוך {len(queue)}</b>\n\n"
 
 "
     preview += "\n".join([f"<b>{k}:</b> {v}" for k, v in item.items() if v])
