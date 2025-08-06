@@ -357,7 +357,7 @@ def format_post(product):
         for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
 ").replace(";", "
 ").split("
-")]:
+        for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
             if part:
                 lines.append(f"• {part}")
         lines.append("")
