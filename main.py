@@ -1191,64 +1191,51 @@ if __name__ == "__main__":
             time.sleep(wait)
 
 
-# ===================== שדרוגים שהוטמעו =====================
-
+# ===================== שדרוגי מצב שידור אוטומטי =====================
 import datetime
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, CallbackContext
 
-# משתנה מצב שידור אוטומטי/ידני
-USE_AUTO_MODE = True
+USE_AUTO_MODE = True  # ברירת מחדל: אוטומטי
 
 def get_post_delay():
     if not USE_AUTO_MODE:
-        return POST_DELAY_SECONDS  # שימוש בקצב הידני שהוגדר
+        return POST_DELAY_SECONDS  # מצב ידני
 
-    now = datetime.datetime.now()
-    hour = now.hour
+    hour = datetime.datetime.now().hour
     if 6 <= hour < 9:
-        return 20 * 60  # 20 דקות
+        return 20 * 60
     elif 9 <= hour < 15:
-        return 25 * 60  # 25 דקות
+        return 25 * 60
     elif 15 <= hour < 22:
-        return 20 * 60  # 20 דקות
+        return 20 * 60
     else:
-        return 60 * 60  # שעה בלילה
+        return 60 * 60  # מצב לילה
 
-# שימוש בעמודת Promotion Url בלבד
-def get_buy_link(row):
-    return row.get("Promotion Url", "").strip()
-
-# דוגמה לשימוש נכון בעת יצירת פוסט
-# במקום להשתמש ב-buy_link ישיר בכל מקום, השתמש ב-get_buy_link(row)
-
-# ==========================================================
-
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler
-
-# פונקציה ליצירת כפתורים עם חיווי מצב
 def get_mode_keyboard():
     status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
     toggle_text = "העבר למצב ידני" if USE_AUTO_MODE else "העבר למצב אוטומטי"
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(toggle_text, callback_data='toggle_mode')
-    ], [
-        InlineKeyboardButton(f"מצב נוכחי: {status}", callback_data='status_info')
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_text, callback_data="toggle_mode")],
+        [InlineKeyboardButton(f"מצב נוכחי: {status}", callback_data="status_info")]
+    ])
 
-# מטפל בלחיצה על כפתור
-def handle_mode_toggle(update, context):
+def handle_mode_toggle(update: Update, context: CallbackContext):
     global USE_AUTO_MODE
     query = update.callback_query
-    if query.data == 'toggle_mode':
+    if query.data == "toggle_mode":
         USE_AUTO_MODE = not USE_AUTO_MODE
-        new_status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
+        status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
+        query.edit_message_text(f"המצב שונה: {status}", reply_markup=get_mode_keyboard())
         query.answer()
-        query.edit_message_text(text=f"✅ המצב עודכן: {new_status}", reply_markup=get_mode_keyboard())
-    elif query.data == 'status_info':
-        current_status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
-        query.answer(text=f"המצב הנוכחי: {current_status}")
+    elif query.data == "status_info":
+        status = "🟢 אוטומטי" if USE_AUTO_MODE else "⚪ ידני"
+        query.answer(text=f"המצב הנוכחי: {status}")
 
-# הוספת המטפל לרשימת handlers בבוט
-# לדוגמה:
+# יש להוסיף את השורה הבאה בעת אתחול הבוט:
 # updater.dispatcher.add_handler(CallbackQueryHandler(handle_mode_toggle))
+
+# ===================== קישור רכישה נכון =====================
+
+def get_buy_link(row):
+    return row.get("Promotion Url", "").strip()
