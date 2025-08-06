@@ -333,7 +333,7 @@ def format_post(product):
     discount = product.get('Discount', '')
     rating = product.get('Rating', '')
     orders = product.get('Orders', '')
-    buy_link = product.get('Promotion Url', '')
+    buy_link = product.get('BuyLink', '')
     coupon = product.get('CouponCode', '')
 
     opening = (product.get('Opening') or '').strip()
@@ -1189,3 +1189,35 @@ if __name__ == "__main__":
             wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
             print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
             time.sleep(wait)
+
+
+# ===================== שדרוגים שהוטמעו =====================
+
+import datetime
+
+# משתנה מצב שידור אוטומטי/ידני
+USE_AUTO_MODE = True
+
+def get_post_delay():
+    if not USE_AUTO_MODE:
+        return POST_DELAY_SECONDS  # שימוש בקצב הידני שהוגדר
+
+    now = datetime.datetime.now()
+    hour = now.hour
+    if 6 <= hour < 9:
+        return 20 * 60  # 20 דקות
+    elif 9 <= hour < 15:
+        return 25 * 60  # 25 דקות
+    elif 15 <= hour < 22:
+        return 20 * 60  # 20 דקות
+    else:
+        return 60 * 60  # שעה בלילה
+
+# שימוש בעמודת Promotion Url בלבד
+def get_buy_link(row):
+    return row.get("Promotion Url", "").strip()
+
+# דוגמה לשימוש נכון בעת יצירת פוסט
+# במקום להשתמש ב-buy_link ישיר בכל מקום, השתמש ב-get_buy_link(row)
+
+# ==========================================================
