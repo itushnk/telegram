@@ -433,6 +433,37 @@ def send_next_locked(source: str = "loop") -> bool:
 
 
 # ========= DELAY =========
+
+# ========= AUTO DELAY MODE =========
+AUTO_FLAG_FILE = os.path.join(BASE_DIR, "auto_delay.flag")
+
+
+AUTO_SCHEDULE = [
+    (dtime(6, 0), dtime(9, 0), 1200),
+    (dtime(9, 0), dtime(15, 0), 1500),
+    (dtime(15, 0), dtime(22, 0), 1200),
+    (dtime(22, 0), dtime(23, 59), 1500),
+]
+
+
+def read_auto_flag():
+    try:
+        with open(AUTO_FLAG_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except:
+        return "on"
+
+def write_auto_flag(value):
+    with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
+        f.write(value)
+
+def get_auto_delay():
+    now = datetime.now(IL_TZ).time()
+    for start, end, delay in AUTO_SCHEDULE:
+        if start <= now <= end:
+            return delay
+    return None
+
 def load_delay_seconds(default_seconds: int = 1500) -> int:
     try:
         if os.path.exists(DELAY_FILE):
@@ -580,11 +611,14 @@ def inline_menu():
     kb = types.InlineKeyboardMarkup(row_width=3)
 
     # פעולות
+    
     kb.add(
         types.InlineKeyboardButton("📢 פרסם עכשיו", callback_data="publish_now"),
-        types.InlineKeyboardButton("⏭ דלג פריט", callback_data="skip_one"),
-        types.InlineKeyboardButton("📝 רשימת ממתינים", callback_data="list_pending"),
+        types.InlineKeyboardButton("⏱️ כל 20ד", callback_data="delay_1200"),
+        types.InlineKeyboardButton("⏱️ כל 25ד", callback_data="delay_1500"),
+        types.InlineKeyboardButton("⏱️ כל 30ד", callback_data="delay_1800"),
     )
+    kb.add(types.InlineKeyboardButton("⚙️ מצב אוטומטי (החלפה)", callback_data="toggle_auto_mode"))
     kb.add(
         types.InlineKeyboardButton("📊 סטטוס שידור", callback_data="pending_status"),
         types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
@@ -608,6 +642,9 @@ def inline_menu():
 
     # איפוס יזום מהקובץ הראשי
     kb.add(types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"))
+
+    
+    kb.add(types.InlineKeyboardButton("⚙️ מצב אוטומטי (החלפה)", callback_data="toggle_auto_mode"))
 
     # מחיקות
     kb.add(
@@ -818,6 +855,46 @@ def on_inline_click(c):
             new_text=f"🗑️ הוסר מהתור: {removed} פריטים שנמצאו ב-workfile.csv\nנשארו בתור: {left}",
             reply_markup=inline_menu(), cb_id=c.id
         )
+
+
+    
+    elif data == "delay_1200":
+        POST_DELAY_SECONDS = 1200
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 20 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delay_1500":
+        POST_DELAY_SECONDS = 1500
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 25 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delay_1800":
+        POST_DELAY_SECONDS = 1800
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 30 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+
+    elif data == "toggle_auto_mode":
+        current = read_auto_flag()
+        new_mode = "off" if current == "on" else "on"
+        write_auto_flag(new_mode)
+        new_label = "🟢 מצב אוטומטי פעיל" if new_mode == "on" else "🔴 מצב ידני בלבד"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"החלפתי מצב שידור: {new_label}",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
 
     elif data == "delete_source_file":
         ok = delete_source_csv_file()
@@ -1060,11 +1137,18 @@ def peek_idx(msg):
 
 @bot.message_handler(commands=['pending_status'])
 def pending_status(msg):
-    with FILE_LOCK:
+
+    auto_mode = read_auto_flag()
+    auto_line = "🟢 מצב שידור: אוטומטי לפי שעות" if auto_mode == "on" else "🔴 מצב שידור: ידני לפי הגדרה"
+        with FILE_LOCK:
         pending = read_products(PENDING_CSV)
     count = len(pending)
     now_il = datetime.now(tz=IL_TZ)
-    schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
+    
+    auto_mode = read_auto_flag()
+    auto_line = "🟢 מצב שידור: אוטומטי לפי שעות" if auto_mode == "on" else "🔴 מצב שידור: ידני לפי הגדרה"
+    
+    schedule_line = auto_line + "\n" + schedule_line "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
     delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
     target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
     if count == 0:
@@ -1111,7 +1195,39 @@ def start_fallback(msg):
 
 
 # ========= SENDER LOOP =========
-def run_sender_loop():
+
+def auto_post_loop():
+    if not os.path.exists(SCHEDULE_FLAG_FILE):
+        set_schedule_enforced(True)
+    init_pending()
+
+    while True:
+        if read_auto_flag() != "on":
+            print(f"[{datetime.now(tz=IL_TZ)}] מצב ידני – שינה 5 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=5)
+            DELAY_EVENT.clear()
+            continue
+
+        delay = get_auto_delay()
+        if delay is None:
+            print(f"[{datetime.now(tz=IL_TZ)}] מחוץ לשעות שידור – שינה 60 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=60)
+            DELAY_EVENT.clear()
+            continue
+
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+        if not pending:
+            print(f"[{datetime.now(tz=IL_TZ)}] התור ריק – שינה 30 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
+
+        send_next_locked("auto")
+        print(f"[{datetime.now(tz=IL_TZ)}] פורסם. המתנה {delay} שניות", flush=True)
+        DELAY_EVENT.wait(timeout=delay)
+        DELAY_EVENT.clear()
+
     if not os.path.exists(SCHEDULE_FLAG_FILE):
         set_schedule_enforced(True)
     init_pending()
@@ -1178,7 +1294,7 @@ if __name__ == "__main__":
             print(f"[WARN] remove_webhook failed: {e2}", flush=True)
     print_webhook_info()
 
-    t = threading.Thread(target=run_sender_loop, daemon=True)
+    t = threading.Thread(target=auto_post_loop, daemon=True)
     t.start()
 
     while True:
@@ -1191,60 +1307,114 @@ if __name__ == "__main__":
             time.sleep(wait)
 
 
+@bot.message_handler(commands=['toggle_mode'])
+def toggle_mode(msg):
+    if not _is_admin(msg):
+        return
+    mode = read_auto_flag()
+    new_mode = "off" if mode == "on" else "on"
+    write_auto_flag(new_mode)
+    bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
 
-# ================= MODE TOGGLE AND AUTO DELAY =================
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler
 
-AUTO_FLAG = os.path.join(BASE_DIR, "auto_delay.flag")
+# ============ דפדוף בין פריטים ממתינים ============
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-def is_auto_mode():
-    return os.path.exists(AUTO_FLAG)
+# ניהול אינדקס צפייה לפי משתמש
+browse_positions = {}
 
-def set_auto_mode(enable: bool):
-    if enable:
-        with open(AUTO_FLAG, "w") as f:
-            f.write("1")
-    else:
-        if os.path.exists(AUTO_FLAG):
-            os.remove(AUTO_FLAG)
+def read_pending_posts():
+    posts = []
+    if not os.path.exists(PENDING_CSV):
+        return posts
+    with open(PENDING_CSV, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            posts.append(row)
+    return posts
 
-def get_post_delay():
-    if not is_auto_mode():
-        return POST_DELAY_SECONDS
-    now = datetime.now().astimezone(ZoneInfo("Asia/Jerusalem")).time()
-    if dtime(6, 0) <= now < dtime(9, 0):
-        return 20 * 60
-    elif dtime(9, 0) <= now < dtime(15, 0):
-        return 25 * 60
-    elif dtime(15, 0) <= now < dtime(22, 0):
-        return 60 * 60
-    else:
-        return 25 * 60  # ברירת מחדל מחוץ לשעות השידור
+def write_pending_posts(posts):
+    with open(PENDING_CSV, "w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=posts[0].keys())
+        writer.writeheader()
+        writer.writerows(posts)
 
-def get_mode_keyboard():
-    if is_auto_mode():
-        text = "🔁 מעבר למצב ידני"
-        callback = "set_manual"
-    else:
-        text = "⚙️ מעבר למצב אוטומטי"
-        callback = "set_auto"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=callback)]])
+def format_post_text(post, index, total):
+    title = post.get("ProductDesc", "ללא תיאור")
+    sale = post.get("SalePrice", "")
+    orig = post.get("OriginalPrice", "")
+    rating = post.get("Rating", "")
+    discount = post.get("Discount", "")
+    product_id = post.get("ProductId", "")
+    text = f"📝 <b>#{index+1} מתוך {total}</b>
 
-def handle_mode_toggle(update: Update, context: CallbackContext):
-    query = update.callback_query
-    if query.data == "set_auto":
-        set_auto_mode(True)
-        query.edit_message_text("הבוט עבר למצב אוטומטי ✅", reply_markup=get_mode_keyboard())
-    elif query.data == "set_manual":
-        set_auto_mode(False)
-        query.edit_message_text("הבוט עבר למצב ידני ❎", reply_markup=get_mode_keyboard())
-    else:
-        query.answer()
+🔹 <b>{title}</b>
+💰 מחיר מבצע: {sale} ש"ח
+💸 מחיר מקורי: {orig} ש"ח
+🎯 הנחה: {discount}
+⭐ דירוג: {rating}
+🆔 מספר פריט: {product_id}"
+    return text
 
-def mode_command(update: Update, context: CallbackContext):
-    update.message.reply_text("בחר מצב שידור:", reply_markup=get_mode_keyboard())
+def get_browse_markup(index, total):
+    kb = InlineKeyboardMarkup()
+    buttons = []
+    if index > 0:
+        buttons.append(InlineKeyboardButton("◀️ קודם", callback_data=f"browse_prev"))
+    if index < total - 1:
+        buttons.append(InlineKeyboardButton("▶️ הבא", callback_data=f"browse_next"))
+    kb.row(*buttons)
+    kb.row(InlineKeyboardButton("🗑️ הסר פרסום זה", callback_data="browse_delete"))
+    kb.row(InlineKeyboardButton("🔙 חזור", callback_data="browse_exit"))
+    return kb
 
-dispatcher.add_handler(CallbackQueryHandler(handle_mode_toggle))
-dispatcher.add_handler(CommandHandler("mode", mode_command))
+@bot.message_handler(commands=['browse_pending'])
+def cmd_browse_pending(message):
+    user_id = message.from_user.id
+    posts = read_pending_posts()
+    if not posts:
+        bot.reply_to(message, "אין פוסטים ממתינים.")
+        return
+    browse_positions[user_id] = 0
+    post = posts[0]
+    text = format_post_text(post, 0, len(posts))
+    kb = get_browse_markup(0, len(posts))
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("browse_"))
+def handle_browse_callbacks(call):
+    user_id = call.from_user.id
+    posts = read_pending_posts()
+    if user_id not in browse_positions:
+        browse_positions[user_id] = 0
+    index = browse_positions[user_id]
+    total = len(posts)
+
+    if call.data == "browse_prev":
+        index = max(0, index - 1)
+    elif call.data == "browse_next":
+        index = min(total - 1, index + 1)
+    elif call.data == "browse_delete":
+        if total == 0:
+            bot.answer_callback_query(call.id, "אין פריטים למחיקה.")
+            return
+        del posts[index]
+        write_pending_posts(posts)
+        if index >= len(posts):
+            index = max(0, len(posts) - 1)
+        browse_positions[user_id] = index
+        bot.answer_callback_query(call.id, "הפרסום הוסר.")
+    elif call.data == "browse_exit":
+        bot.edit_message_text("📋 יצאת ממצב דפדוף.", call.message.chat.id, call.message.message_id)
+        return
+
+    if not posts:
+        bot.edit_message_text("✅ כל הפריטים בתור נמחקו!", call.message.chat.id, call.message.message_id)
+        return
+
+    post = posts[index]
+    browse_positions[user_id] = index
+    text = format_post_text(post, index, len(posts))
+    kb = get_browse_markup(index, len(posts))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
