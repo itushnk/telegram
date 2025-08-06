@@ -1239,3 +1239,9 @@ def handle_mode_toggle(update: Update, context: CallbackContext):
 
 def get_buy_link(row):
     return row.get("Promotion Url", "").strip()
+
+
+def mode_command(update: Update, context: CallbackContext):
+    update.message.reply_text("בחר מצב שידור:", reply_markup=get_mode_keyboard())
+
+dispatcher.add_handler(CommandHandler("mode", mode_command))
