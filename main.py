@@ -1137,11 +1137,18 @@ def peek_idx(msg):
 
 @bot.message_handler(commands=['pending_status'])
 def pending_status(msg):
-    with FILE_LOCK:
+
+    auto_mode = read_auto_flag()
+    auto_line = "🟢 מצב שידור: אוטומטי לפי שעות" if auto_mode == "on" else "🔴 מצב שידור: ידני לפי הגדרה"
+        with FILE_LOCK:
         pending = read_products(PENDING_CSV)
     count = len(pending)
     now_il = datetime.now(tz=IL_TZ)
-    schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
+    
+    auto_mode = read_auto_flag()
+    auto_line = "🟢 מצב שידור: אוטומטי לפי שעות" if auto_mode == "on" else "🔴 מצב שידור: ידני לפי הגדרה"
+    
+    schedule_line = auto_line + "\n" + schedule_line "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
     delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
     target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
     if count == 0:
@@ -1308,3 +1315,106 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
+
+
+
+# ============ דפדוף בין פריטים ממתינים ============
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ניהול אינדקס צפייה לפי משתמש
+browse_positions = {}
+
+def read_pending_posts():
+    posts = []
+    if not os.path.exists(PENDING_CSV):
+        return posts
+    with open(PENDING_CSV, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            posts.append(row)
+    return posts
+
+def write_pending_posts(posts):
+    with open(PENDING_CSV, "w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=posts[0].keys())
+        writer.writeheader()
+        writer.writerows(posts)
+
+def format_post_text(post, index, total):
+    title = post.get("ProductDesc", "ללא תיאור")
+    sale = post.get("SalePrice", "")
+    orig = post.get("OriginalPrice", "")
+    rating = post.get("Rating", "")
+    discount = post.get("Discount", "")
+    product_id = post.get("ProductId", "")
+    text = f"📝 <b>#{index+1} מתוך {total}</b>
+
+🔹 <b>{title}</b>
+💰 מחיר מבצע: {sale} ש"ח
+💸 מחיר מקורי: {orig} ש"ח
+🎯 הנחה: {discount}
+⭐ דירוג: {rating}
+🆔 מספר פריט: {product_id}"
+    return text
+
+def get_browse_markup(index, total):
+    kb = InlineKeyboardMarkup()
+    buttons = []
+    if index > 0:
+        buttons.append(InlineKeyboardButton("◀️ קודם", callback_data=f"browse_prev"))
+    if index < total - 1:
+        buttons.append(InlineKeyboardButton("▶️ הבא", callback_data=f"browse_next"))
+    kb.row(*buttons)
+    kb.row(InlineKeyboardButton("🗑️ הסר פרסום זה", callback_data="browse_delete"))
+    kb.row(InlineKeyboardButton("🔙 חזור", callback_data="browse_exit"))
+    return kb
+
+@bot.message_handler(commands=['browse_pending'])
+def cmd_browse_pending(message):
+    user_id = message.from_user.id
+    posts = read_pending_posts()
+    if not posts:
+        bot.reply_to(message, "אין פוסטים ממתינים.")
+        return
+    browse_positions[user_id] = 0
+    post = posts[0]
+    text = format_post_text(post, 0, len(posts))
+    kb = get_browse_markup(0, len(posts))
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("browse_"))
+def handle_browse_callbacks(call):
+    user_id = call.from_user.id
+    posts = read_pending_posts()
+    if user_id not in browse_positions:
+        browse_positions[user_id] = 0
+    index = browse_positions[user_id]
+    total = len(posts)
+
+    if call.data == "browse_prev":
+        index = max(0, index - 1)
+    elif call.data == "browse_next":
+        index = min(total - 1, index + 1)
+    elif call.data == "browse_delete":
+        if total == 0:
+            bot.answer_callback_query(call.id, "אין פריטים למחיקה.")
+            return
+        del posts[index]
+        write_pending_posts(posts)
+        if index >= len(posts):
+            index = max(0, len(posts) - 1)
+        browse_positions[user_id] = index
+        bot.answer_callback_query(call.id, "הפרסום הוסר.")
+    elif call.data == "browse_exit":
+        bot.edit_message_text("📋 יצאת ממצב דפדוף.", call.message.chat.id, call.message.message_id)
+        return
+
+    if not posts:
+        bot.edit_message_text("✅ כל הפריטים בתור נמחקו!", call.message.chat.id, call.message.message_id)
+        return
+
+    post = posts[index]
+    browse_positions[user_id] = index
+    text = format_post_text(post, index, len(posts))
+    kb = get_browse_markup(index, len(posts))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
