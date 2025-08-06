@@ -1287,7 +1287,7 @@ if __name__ == "__main__":
             print(f"[WARN] remove_webhook failed: {e2}", flush=True)
     print_webhook_info()
 
-    t = threading.Thread(target=run_sender_loop, daemon=True)
+    t = threading.Thread(target=auto_post_loop, daemon=True)
     t.start()
 
     while True:
