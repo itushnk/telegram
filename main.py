@@ -354,7 +354,7 @@ def format_post(product):
         lines.append("")
     if strengths_src:
         lines.append("🔍 יתרונות:")
-        for part in [p.strip() for p in strengths_src.replace("|", "
+        for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
 ").replace(";", "
 ").split("
 ")]:
