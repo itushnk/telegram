@@ -3,7 +3,7 @@
 
 from telebot import TeleBot, types
 
-bot = TeleBot("YOUR_BOT_TOKEN")
+bot = TeleBot("8371104768:AAHi2lv7CFNFAWycjWeUSJiOn9YR0Qvep_4")
 
 POST_DELAY_SECONDS = 1200
 CURRENT_TARGET = "ערוץ ראשי"
