@@ -335,13 +335,16 @@ def format_post(product):
     orders = product.get('Orders', '')
     buy_link = product.get('BuyLink', '')
     coupon = product.get('CouponCode', '')
+
     opening = (product.get('Opening') or '').strip()
-    strengths_src = (product.get('Strengths') or '').strip()
+    strengths_src = (product.get("Strengths") or "").strip()
+
     rating_percent = rating if rating else "אין דירוג"
     orders_num = safe_int(orders, default=0)
     orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
     discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
+
     lines = []
     if opening:
         lines.append(opening)
@@ -349,12 +352,14 @@ def format_post(product):
     if title:
         lines.append(title)
         lines.append("")
+
     if strengths_src:
         for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
             if part:
                 lines.append(part)
         lines.append("")
-    price_line = f"💰 מחיר מבצע: <b>{sale_price} ש\"ח</b> (מחיר מקורי: {original_price} ש\"ח)"
+
+    price_line = f'💰 מחיר מבצע: <a href="{buy_link}">{sale_price} ש"ח</a> (מחיר מקורי: {original_price} ש"ח)'
     lines += [
         price_line,
         discount_text,
@@ -364,15 +369,18 @@ def format_post(product):
         "",
         coupon_text if coupon_text else "",
         "",
-        "👇 להזמנה מהירה לחצו כאן 👇",
-        buy_link,
+        f'להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>',
         "",
         f"מספר פריט: {item_id}",
-        'להצטרפות לערוץ לחצו עליי👉 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>',
-        ""
+        'להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>',
+        "",
+        "👇🛍הזמינו עכשיו🛍👇",
+        f'<a href="{buy_link}">לחיצה וזה בדרך </a>',
     ]
+
     post = "\n".join([l for l in lines if l is not None and str(l).strip() != ""])
     return post, image_url
+
 def post_to_channel(product):
     try:
         post_text, image_url = format_post(product)
