@@ -27,13 +27,17 @@ os.makedirs(BASE_DIR, exist_ok=True)
 # ========= CONFIG (Telegram) =========
 BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or "").strip()  # חובה ב-ENV
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
+
 ADMIN_USER_IDS_RAW = (os.environ.get("ADMIN_USER_IDS", "") or "").strip()  # "123,456"
-ADMIN_USER_IDS = set(int(x) for x in ADMIN_USER_IDS_RAW.split(",") if x.strip().isdigit()) if ADMIN_USER_IDS_RAW else set()
+ADMIN_USER_IDS = set(
+    int(x) for x in ADMIN_USER_IDS_RAW.split(",") if x.strip().isdigit()
+) if ADMIN_USER_IDS_RAW else set()
 
 # קבצים (בתיקיית DATA המתמשכת)
 DATA_CSV    = os.path.join(BASE_DIR, "workfile.csv")        # קובץ המקור האחרון שהועלה
 PENDING_CSV = os.path.join(BASE_DIR, "pending.csv")         # תור הפוסטים
 DELAY_FILE  = os.path.join(BASE_DIR, "post_delay.txt")      # מרווח שידור
+
 PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
 PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 
@@ -47,19 +51,19 @@ USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
-# נקודת קצה רשמית: https://eco.taobao.com/router/rest  (TOP gateway) :contentReference[oaicite:3]{index=3}
 AE_TOP_URL = (os.environ.get("AE_TOP_URL", "https://eco.taobao.com/router/rest") or "").strip()
 AE_APP_KEY = (os.environ.get("AE_APP_KEY", "") or "").strip()
 AE_APP_SECRET = (os.environ.get("AE_APP_SECRET", "") or "").strip()
 AE_TRACKING_ID = (os.environ.get("AE_TRACKING_ID", "") or "").strip()
 
-AE_SHIP_TO_COUNTRY = (os.environ.get("AE_SHIP_TO_COUNTRY", "US") or "US").strip().upper()  # אם יוצא ריק – נסה US
+# מומלץ IL. אם אתה רואה 0 מוצרים - נסה לשנות ל-US
+AE_SHIP_TO_COUNTRY = (os.environ.get("AE_SHIP_TO_COUNTRY", "IL") or "IL").strip().upper()
 AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip().upper()
 
-# target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח. :contentReference[oaicite:4]{index=4}
+# target_currency לא כולל ILS, לכן עובדים עם USD וממירים לש"ח
 AE_TARGET_CURRENCY = "USD"
 
-AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip() in ("1", "true", "True", "yes", "on")
+AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_REFILL_INTERVAL_SECONDS = int(os.environ.get("AE_REFILL_INTERVAL_SECONDS", "900") or "900")  # 15 דקות
 AE_REFILL_MIN_QUEUE = int(os.environ.get("AE_REFILL_MIN_QUEUE", "30") or "30")
 AE_REFILL_MAX_PAGES = int(os.environ.get("AE_REFILL_MAX_PAGES", "3") or "3")
@@ -80,6 +84,7 @@ DELAY_EVENT = threading.Event()
 EXPECTING_TARGET = {}      # dict[user_id] = "public"|"private"
 EXPECTING_UPLOAD = set()   # user_ids שמצפים ל-CSV
 FILE_LOCK = threading.Lock()
+
 
 # ========= SINGLE INSTANCE LOCK =========
 def acquire_single_instance_lock(lock_path: str):
@@ -106,6 +111,7 @@ def acquire_single_instance_lock(lock_path: str):
         print(f"[WARN] Could not acquire single-instance lock: {e}", flush=True)
         return None
 
+
 # ========= WEBHOOK DIAGNOSTICS =========
 def print_webhook_info():
     try:
@@ -122,6 +128,7 @@ def force_delete_webhook():
         print("deleteWebhook:", r.json(), flush=True)
     except Exception as e:
         print(f"[WARN] deleteWebhook failed: {e}", flush=True)
+
 
 # ========= HELPERS =========
 def _now_il():
@@ -262,6 +269,7 @@ def init_pending():
         src = read_products(DATA_CSV)
         write_products(PENDING_CSV, src)
 
+
 # ---- PRESET HELPERS ----
 def _save_preset(path: str, value):
     try:
@@ -316,6 +324,7 @@ def check_and_probe_target(target):
     except Exception as e:
         return False, f"❌ יעד לא תקין: {e}"
 
+
 # ========= BROADCAST WINDOW =========
 def should_broadcast(now: datetime | None = None) -> bool:
     if now is None:
@@ -349,6 +358,7 @@ def set_schedule_enforced(enabled: bool) -> None:
 def is_quiet_now(now: datetime | None = None) -> bool:
     return not should_broadcast(now) if is_schedule_enforced() else False
 
+
 # ========= SAFE EDIT =========
 def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
     try:
@@ -380,6 +390,7 @@ def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup
             bot.answer_callback_query(cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
         else:
             raise
+
 
 # ========= POSTING =========
 def format_post(product):
@@ -461,6 +472,7 @@ def post_to_channel(product):
     except Exception as e:
         print(f"[{_now_il().strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}", flush=True)
 
+
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
     with FILE_LOCK:
@@ -494,6 +506,7 @@ def send_next_locked(source: str = "loop") -> bool:
         print(f"[{_now_il()}] {source}: sent & advanced queue", flush=True)
         return True
 
+
 # ========= DELAY =========
 AUTO_SCHEDULE = [
     (dtime(6, 0),  dtime(9, 0),  1200),
@@ -505,13 +518,13 @@ AUTO_SCHEDULE = [
 def read_auto_flag():
     try:
         with open(AUTO_FLAG_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip() or "on"
+            return (f.read().strip() or "on").lower()
     except:
         return "on"
 
 def write_auto_flag(value):
     with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
-        f.write(value)
+        f.write((value or "").strip().lower() or "on")
 
 def get_auto_delay():
     now = _now_il().time()
@@ -540,13 +553,15 @@ def save_delay_seconds(seconds: int) -> None:
 
 POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
 
+
 # ========= ADMIN =========
 def _is_admin(msg) -> bool:
     if not ADMIN_USER_IDS:
         return True
     return msg.from_user and (msg.from_user.id in ADMIN_USER_IDS)
 
-# ========= MERGE =========
+
+# ========= MERGE / DELETE =========
 def _key_of_row(r: dict):
     item_id = (r.get("ItemId") or "").strip()
     title   = (r.get("Title") or "").strip()
@@ -596,6 +611,7 @@ def delete_source_rows_from_pending():
         write_products(PENDING_CSV, filtered)
         return removed, len(filtered)
 
+
 # ========= USD→ILS HELPERS (CSV upload option) =========
 def _decode_csv_bytes(b: bytes) -> str:
     for enc in ("utf-8-sig", "utf-8", "cp1255", "iso-8859-8"):
@@ -627,6 +643,7 @@ def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
         out.append(normalize_row_keys(rr))
     return out
 
+
 # ========= AliExpress Affiliate (TOP) =========
 def _top_sign_md5(params: dict, secret: str) -> str:
     # Taobao TOP MD5 sign: md5(secret + concat(k+v sorted) + secret).upper()
@@ -635,10 +652,17 @@ def _top_sign_md5(params: dict, secret: str) -> str:
     return hashlib.md5(base.encode("utf-8")).hexdigest().upper()
 
 def _top_call(method_name: str, biz_params: dict) -> dict:
+    """
+    ✅ תיקון חשוב:
+    TOP מצפה ל-timestamp ב-GMT+8 (Asia/Shanghai). UTC יוצר error_response / תוצאות ריקות.
+    בנוסף: אם יש error_response - נרים חריגה כדי שתראה שגיאה אמיתית בלוג/בבוט.
+    """
     if not AE_APP_KEY or not AE_APP_SECRET:
         raise RuntimeError("חסרים AE_APP_KEY / AE_APP_SECRET ב-ENV")
 
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")  # TOP expects GMT+8 allowed drift; בפועל עובד לרוב גם UTC
+    sh_tz = ZoneInfo("Asia/Shanghai")  # GMT+8
+    ts = datetime.now(tz=sh_tz).strftime("%Y-%m-%d %H:%M:%S")
+
     params = {
         "method": method_name,
         "app_key": AE_APP_KEY,
@@ -652,10 +676,21 @@ def _top_call(method_name: str, biz_params: dict) -> dict:
 
     r = SESSION.post(AE_TOP_URL, data=params, timeout=30)
     r.raise_for_status()
-    return r.json()
+    payload = r.json()
+
+    # ✅ TOP errors מגיעים כאן:
+    if isinstance(payload, dict) and "error_response" in payload:
+        er = payload.get("error_response") or {}
+        code = er.get("code")
+        msg = er.get("msg")
+        sub_code = er.get("sub_code")
+        sub_msg = er.get("sub_msg")
+        req_id = er.get("request_id")
+        raise RuntimeError(f"TOP error {code} {msg} | {sub_code} {sub_msg} | request_id={req_id}")
+
+    return payload
 
 def _extract_resp_result(payload: dict) -> dict:
-    # response wrapper key usually ends with "_response"
     if not isinstance(payload, dict):
         return {}
     wrapper_key = None
@@ -668,17 +703,17 @@ def _extract_resp_result(payload: dict) -> dict:
 
 def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict], int | None, str | None]:
     biz = {
-        "page_no": page_no,           # חשוב: page_no ולא page :contentReference[oaicite:5]{index=5}
-        "page_size": page_size,       # :contentReference[oaicite:6]{index=6}
-        "sort": AE_REFILL_SORT,       # LAST_VOLUME_DESC וכו' :contentReference[oaicite:7]{index=7}
+        "page_no": page_no,
+        "page_size": page_size,
+        "sort": AE_REFILL_SORT,
         "target_currency": AE_TARGET_CURRENCY,
         "target_language": AE_TARGET_LANGUAGE,
         "tracking_id": AE_TRACKING_ID,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
-        "fields": "product_id,product_title,product_main_image_url,promotion_link,sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url",
+        "fields": "product_id,product_title,product_main_image_url,promotion_link,sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url",
         "platform_product_type": "ALL",
     }
-    payload = _top_call("aliexpress.affiliate.hotproduct.query", biz)  # :contentReference[oaicite:8]{index=8}
+    payload = _top_call("aliexpress.affiliate.hotproduct.query", biz)
     resp = _extract_resp_result(payload)
     resp_code = resp.get("resp_code")
     resp_msg = resp.get("resp_msg")
@@ -696,7 +731,6 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     return products, resp_code, resp_msg
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
-    # בחירה חכמה של מחיר מבצע: app_sale_price אם קיים, אחרת sale_price
     sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
     orig_raw = p.get("original_price") or p.get("target_original_price") or ""
 
@@ -734,30 +768,45 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
     dup = 0
     last_error = None
     last_page = 0
+    saw_products_any = False
+    saw_missing_links = 0
 
     for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
         last_page = page_no
         try:
             products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
-            if resp_code is not None and int(resp_code) != 200:
-                last_error = f"{resp_code}: {resp_msg}"
-                break
+
+            if resp_code is not None:
+                try:
+                    if int(resp_code) != 200:
+                        last_error = f"{resp_code}: {resp_msg}"
+                        break
+                except Exception:
+                    pass
 
             if not products:
                 # תשובה תקינה אבל ריקה
+                if not saw_products_any and last_error is None:
+                    last_error = f"לא חזרו מוצרים. נסה AE_SHIP_TO_COUNTRY=US או בדוק מפתחות/Tracking."
                 break
+
+            saw_products_any = True
 
             new_rows = []
             for p in products:
                 row = _map_affiliate_product_to_row(p)
                 if not row.get("BuyLink"):
-                    continue  # בלי קישור רכישה לא נכניס לתור
+                    saw_missing_links += 1
+                    continue
                 k = _key_of_row(row)
                 if k in existing_keys:
                     dup += 1
                     continue
                 existing_keys.add(k)
                 new_rows.append(row)
+
+            if not new_rows and saw_missing_links > 0 and last_error is None:
+                last_error = f"הוחזרו מוצרים אבל בלי promotion_link. בדוק AE_TRACKING_ID/הרשאות אפילייט."
 
             if new_rows:
                 with FILE_LOCK:
@@ -777,6 +826,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
         total_after = len(read_products(PENDING_CSV))
 
     return added, dup, total_after, last_page, last_error
+
 
 # ========= INLINE MENU =========
 def inline_menu():
@@ -826,6 +876,7 @@ def inline_menu():
         f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"
     ))
     return kb
+
 
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
@@ -1000,7 +1051,6 @@ def on_inline_click(c):
                           new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "refill_now":
-        # מילוי ידני מהאפילייט: נוסיף עד 80 פריטים או עד שמיצינו דפים
         max_needed = 80
         added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed)
         text = (
@@ -1015,6 +1065,7 @@ def on_inline_click(c):
 
     else:
         bot.answer_callback_query(c.id)
+
 
 # ========= FORWARD HANDLER =========
 @bot.message_handler(
@@ -1049,6 +1100,7 @@ def handle_forward_for_target(msg):
         f"✅ נשמר יעד {label}: {target_value}\n"
         f"{details}\n\nאפשר לעבור בין יעדים מהתפריט: 🎯/🔒"
     )
+
 
 # ========= UPLOAD CSV =========
 @bot.message_handler(commands=['upload_source'])
@@ -1132,6 +1184,7 @@ def on_document(msg):
     finally:
         EXPECTING_UPLOAD.discard(uid)
 
+
 # ========= TEXT COMMANDS =========
 @bot.message_handler(commands=['cancel'])
 def cmd_cancel(msg):
@@ -1153,30 +1206,6 @@ def cmd_start(msg):
     _save_admin_chat_id(msg.chat.id)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
-@bot.message_handler(commands=['pending_status'])
-def pending_status_cmd(msg):
-    # אותו מידע כמו הכפתור
-    with FILE_LOCK:
-        pending = read_products(PENDING_CSV)
-    count = len(pending)
-    now_il = _now_il()
-    schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
-    delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
-    target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
-    if count == 0:
-        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅")
-        return
-    total_seconds = (count - 1) * POST_DELAY_SECONDS
-    eta = now_il + timedelta(seconds=total_seconds)
-    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
-    status_line = "🎙️ שידור אפשרי עכשיו" if not is_quiet_now(now_il) else "⏸️ כרגע מחוץ לחלון השידור"
-    bot.reply_to(msg,
-        f"{schedule_line}\n{status_line}\n{delay_line}\n{target_line}\n"
-        f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
-        f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>",
-        parse_mode="HTML"
-    )
-
 @bot.message_handler(commands=['refill_now'])
 def cmd_refill_now(msg):
     if not _is_admin(msg):
@@ -1192,6 +1221,7 @@ def cmd_refill_now(msg):
         f"דף אחרון שנבדק: {last_page}\n"
         f"שגיאה אחרונה: {last_error}"
     )
+
 
 # ========= SENDER LOOP =========
 def auto_post_loop():
@@ -1237,6 +1267,7 @@ def auto_post_loop():
         DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
         DELAY_EVENT.clear()
 
+
 # ========= REFILL DAEMON =========
 def refill_daemon():
     if not AE_REFILL_ENABLED:
@@ -1253,7 +1284,6 @@ def refill_daemon():
                 need = max(AE_REFILL_MIN_QUEUE - qlen, 30)
                 added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=need)
 
-                # דיווח קצר ללוג + הודעה לאדמין (אם יש)
                 msg = (
                     "🔥 מילוי מהאפילייט הושלם.\n"
                     f"נוספו לתור: {added}\n"
@@ -1261,7 +1291,7 @@ def refill_daemon():
                     f"סה\"כ בתור: {total_after}\n"
                 )
                 if added == 0:
-                    msg += f"לא חזרו מוצרים (page={last_page}). שגיאה אחרונה: {last_error}"
+                    msg += f"page={last_page} | שגיאה אחרונה: {last_error}"
                 notify_admin(msg)
                 print(msg.replace("\n", " | "), flush=True)
 
@@ -1269,6 +1299,7 @@ def refill_daemon():
             print(f"[WARN] refill_daemon error: {e}", flush=True)
 
         time.sleep(AE_REFILL_INTERVAL_SECONDS)
+
 
 # ========= MAIN =========
 if __name__ == "__main__":
