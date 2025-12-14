@@ -22,8 +22,10 @@ BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # ========= CONFIG =========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
-CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
+BOT_TOKEN = os.environ.get("Here is the token for bot בוט כולל תרגום גרסא 22 @hebrew22_bot:
+
+8301372230:AAHlPnFgPmqhxcLJCN1UjNivOIjgB-KBvj8", "")  # חובה ב-ENV
+CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
 # קבצים (בתיקיית DATA המתמשכת או לוקאלית)
