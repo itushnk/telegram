@@ -57,20 +57,32 @@ USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
-# TOP gateway: ברירת מחדל ל-Overseas לפי הדוקומנטציה: https://api.taobao.com/router/rest
-# חלופות נפוצות (EU): https://de-api.aliexpress.com/router/rest
-AE_TOP_URL = (os.environ.get("AE_TOP_URL", "https://api.taobao.com/router/rest") or "").strip()
-# אם לא הוגדר AE_TOP_URL ב-ENV, ננסה כמה שערים מוכרים במקרה של "isv.appkey-not-exists".
-AE_TOP_URL_FROM_ENV = "AE_TOP_URL" in os.environ and (os.environ.get("AE_TOP_URL") or "").strip() != ""
-if AE_TOP_URL_FROM_ENV:
-    AE_TOP_URL_CANDIDATES = [AE_TOP_URL]
-else:
-    AE_TOP_URL_CANDIDATES = [
-        "https://api.taobao.com/router/rest",       # Overseas (US)
-        "https://de-api.aliexpress.com/router/rest",# Overseas (EU)
-        "https://eco.taobao.com/router/rest",       # Legacy/alt
-    ]
-    AE_TOP_URL = AE_TOP_URL_CANDIDATES[0]
+# TOP gateway: לפי הדוקומנטציה שער ברירת המחדל ל-Overseas הוא https://api.taobao.com/router/rest
+# בפועל, יש משתמשים שמקבלים "isv.appkey-not-exists" על שער מסוים אבל עובדים על שער אחר.
+# לכן אנחנו מגדירים *רשימת* שערים וננסה אחד-אחד עד הצלחה.
+_env_top_url  = (os.environ.get("AE_TOP_URL", "") or "").strip()      # שער מועדף (אם הוגדר)
+_env_top_urls = (os.environ.get("AE_TOP_URLS", "") or "").strip()    # רשימה מופרדת בפסיקים (אם הוגדרה)
+
+_default_candidates = [
+    "https://api.taobao.com/router/rest",        # Overseas (US)
+    "https://gw.api.taobao.com/router/rest",     # Legacy gateway
+    "https://eco.taobao.com/router/rest",        # Alt/legacy
+    "https://de-api.aliexpress.com/router/rest", # Overseas (EU)
+]
+
+AE_TOP_URL_CANDIDATES = []
+if _env_top_url:
+    AE_TOP_URL_CANDIDATES.append(_env_top_url)
+if _env_top_urls:
+    for u in _env_top_urls.split(","):
+        u = (u or "").strip()
+        if u:
+            AE_TOP_URL_CANDIDATES.append(u)
+for u in _default_candidates:
+    if u not in AE_TOP_URL_CANDIDATES:
+        AE_TOP_URL_CANDIDATES.append(u)
+
+AE_TOP_URL = AE_TOP_URL_CANDIDATES[0]
 AE_APP_KEY = (os.environ.get("AE_APP_KEY", "") or "").strip()
 AE_APP_SECRET = (os.environ.get("AE_APP_SECRET", "") or "").strip()
 AE_TRACKING_ID = (os.environ.get("AE_TRACKING_ID", "") or "").strip()
@@ -713,8 +725,9 @@ def _top_call(method_name: str, biz_params: dict) -> dict:
 
                 last_err = f"TOP error {code}: {msg} | sub_code={sub_code} | sub_msg={sub_msg} | url={top_url}"
 
-                # אם לא הוגדר AE_TOP_URL ב-ENV ואנחנו מקבלים appkey-not-exists — ננסה URL אחר
-                if (not AE_TOP_URL_FROM_ENV) and (sub_code == "isv.appkey-not-exists" or code == 29):
+                # appkey-not-exists בדרך כלל אומר שנפלנו על gateway שלא מכיר את ה-AppKey.
+                # ננסה URL נוסף (גם אם הוגדר AE_TOP_URL ב-ENV), כדי לחסוך הסתבכויות בהגדרה.
+                if sub_code == "isv.appkey-not-exists" or code == 29:
                     continue
 
                 raise RuntimeError(last_err)
@@ -725,10 +738,8 @@ def _top_call(method_name: str, biz_params: dict) -> dict:
             return payload
 
         except Exception as e:
-            # אם זה לא היה error_response אלא בעיית רשת/HTTP — נשמור וננסה URL הבא רק כשאין URL מוגדר ב-ENV
+            # אם זה לא היה error_response אלא בעיית רשת/HTTP — נשמור וננסה URL הבא
             last_err = f"TOP request failed via {top_url}: {type(e).__name__}: {e}"
-            if AE_TOP_URL_FROM_ENV:
-                break
             continue
 
     raise RuntimeError(last_err or "TOP call failed")
@@ -1378,7 +1389,7 @@ if __name__ == "__main__":
     print(f"Instance: {socket.gethostname()}", flush=True)
 
     # הדפסה קצרה של קונפיג (מסכות)
-    print(f"[CFG] AE_TOP_URL={AE_TOP_URL}", flush=True)
+    print(f"[CFG] AE_TOP_URL={AE_TOP_URL} | CANDIDATES={' | '.join(AE_TOP_URL_CANDIDATES)}", flush=True)
     print(f"[CFG] AE_APP_KEY={_mask(AE_APP_KEY)} | AE_APP_SECRET={_mask(AE_APP_SECRET)} | AE_TRACKING_ID={_mask(AE_TRACKING_ID)}", flush=True)
     print(f"[CFG] AE_SHIP_TO_COUNTRY={AE_SHIP_TO_COUNTRY} | AE_TARGET_LANGUAGE={AE_TARGET_LANGUAGE} | SORT={AE_REFILL_SORT}", flush=True)
 
