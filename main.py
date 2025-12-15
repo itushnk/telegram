@@ -57,8 +57,20 @@ USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
-# TOP gateway: https://eco.taobao.com/router/rest
-AE_TOP_URL = (os.environ.get("AE_TOP_URL", "https://eco.taobao.com/router/rest") or "").strip()
+# TOP gateway: ברירת מחדל ל-Overseas לפי הדוקומנטציה: https://api.taobao.com/router/rest
+# חלופות נפוצות (EU): https://de-api.aliexpress.com/router/rest
+AE_TOP_URL = (os.environ.get("AE_TOP_URL", "https://api.taobao.com/router/rest") or "").strip()
+# אם לא הוגדר AE_TOP_URL ב-ENV, ננסה כמה שערים מוכרים במקרה של "isv.appkey-not-exists".
+AE_TOP_URL_FROM_ENV = "AE_TOP_URL" in os.environ and (os.environ.get("AE_TOP_URL") or "").strip() != ""
+if AE_TOP_URL_FROM_ENV:
+    AE_TOP_URL_CANDIDATES = [AE_TOP_URL]
+else:
+    AE_TOP_URL_CANDIDATES = [
+        "https://api.taobao.com/router/rest",       # Overseas (US)
+        "https://de-api.aliexpress.com/router/rest",# Overseas (EU)
+        "https://eco.taobao.com/router/rest",       # Legacy/alt
+    ]
+    AE_TOP_URL = AE_TOP_URL_CANDIDATES[0]
 AE_APP_KEY = (os.environ.get("AE_APP_KEY", "") or "").strip()
 AE_APP_SECRET = (os.environ.get("AE_APP_SECRET", "") or "").strip()
 AE_TRACKING_ID = (os.environ.get("AE_TRACKING_ID", "") or "").strip()
@@ -683,19 +695,43 @@ def _top_call(method_name: str, biz_params: dict) -> dict:
     }
     params["sign"] = _top_sign_md5(params, AE_APP_SECRET)
 
-    r = SESSION.post(AE_TOP_URL, data=params, timeout=30)
-    r.raise_for_status()
-    payload = r.json()
+    last_err = None
 
-    # חשוב: אם יש error_response — נזרוק חריגה כדי שתופיע בשדה last_error (ולא יבלע כ-0 מוצרים)
-    if isinstance(payload, dict) and payload.get("error_response"):
-        er = payload.get("error_response") or {}
-        raise RuntimeError(
-            f"TOP error {er.get('code')}: {er.get('msg')} | sub_code={er.get('sub_code')} | sub_msg={er.get('sub_msg')}"
-        )
+    for top_url in AE_TOP_URL_CANDIDATES:
+        try:
+            r = SESSION.post(top_url, data=params, timeout=30)
+            r.raise_for_status()
+            payload = r.json()
 
-    return payload
+            # אם יש error_response — נחליט האם לנסות URL נוסף או לזרוק חריגה
+            if isinstance(payload, dict) and payload.get("error_response"):
+                er = payload.get("error_response") or {}
+                code = er.get("code")
+                sub_code = er.get("sub_code")
+                msg = er.get("msg")
+                sub_msg = er.get("sub_msg")
 
+                last_err = f"TOP error {code}: {msg} | sub_code={sub_code} | sub_msg={sub_msg} | url={top_url}"
+
+                # אם לא הוגדר AE_TOP_URL ב-ENV ואנחנו מקבלים appkey-not-exists — ננסה URL אחר
+                if (not AE_TOP_URL_FROM_ENV) and (sub_code == "isv.appkey-not-exists" or code == 29):
+                    continue
+
+                raise RuntimeError(last_err)
+
+            # הצלחה: נשמור את ה-URL שעבד (כדי שכל הקריאות הבאות ישתמשו בו)
+            global AE_TOP_URL
+            AE_TOP_URL = top_url
+            return payload
+
+        except Exception as e:
+            # אם זה לא היה error_response אלא בעיית רשת/HTTP — נשמור וננסה URL הבא רק כשאין URL מוגדר ב-ENV
+            last_err = f"TOP request failed via {top_url}: {type(e).__name__}: {e}"
+            if AE_TOP_URL_FROM_ENV:
+                break
+            continue
+
+    raise RuntimeError(last_err or "TOP call failed")
 def _extract_resp_result(payload: dict) -> dict:
     # response wrapper key usually ends with "_response"
     if not isinstance(payload, dict):
@@ -1338,7 +1374,7 @@ def refill_daemon():
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    print("[BOOT] main.py v2025-12-15a", flush=True)
+    print("[BOOT] main.py v2025-12-15b", flush=True)
     print(f"Instance: {socket.gethostname()}", flush=True)
 
     # הדפסה קצרה של קונפיג (מסכות)
