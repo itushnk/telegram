@@ -18,10 +18,11 @@ except Exception:
 
 import logging
 import hashlib
+import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17d")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17e")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -69,6 +70,39 @@ def _get_state_str(key: str, default: str = "") -> str:
 def _set_state_str(key: str, value: str):
     BOT_STATE[key] = (value or "").strip()
     _save_state(BOT_STATE)
+
+
+def _get_state_int(key: str, default: int = 0) -> int:
+    try:
+        s = _get_state_str(key, str(default))
+        if s == "":
+            return int(default)
+        return int(float(s))
+    except Exception:
+        return int(default)
+
+def _get_state_float(key: str, default: float = 0.0) -> float:
+    try:
+        s = _get_state_str(key, str(default))
+        if s == "":
+            return float(default)
+        return float(s)
+    except Exception:
+        return float(default)
+
+def _get_state_bool(key: str, default: bool = False) -> bool:
+    s = _get_state_str(key, "1" if default else "0").lower()
+    return s in ("1", "true", "yes", "y", "on", "t")
+
+def _get_state_csv_set(key: str, default_raw: str = "") -> set[str]:
+    raw = _get_state_str(key, default_raw)
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    return set(parts)
+
+def _set_state_csv_set(key: str, values: set[str]):
+    raw = ",".join(sorted({(v or "").strip() for v in (values or set()) if (v or "").strip()}))
+    _set_state_str(key, raw)
+
 
 
 
@@ -207,6 +241,63 @@ AE_PRICE_BUCKETS_RAW_DEFAULT = (os.environ.get("AE_PRICE_BUCKETS", "") or os.env
 # Allow runtime override via inline buttons (persisted in BOT_STATE)
 AE_PRICE_BUCKETS_RAW = _get_state_str("price_buckets_raw", AE_PRICE_BUCKETS_RAW_DEFAULT)
 AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
+
+# Optional other filters (persisted)
+AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "0") or "0"))
+AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "0") or "0")  # percent (0-100)
+AE_FREE_SHIP_ONLY_DEFAULT = (os.environ.get("AE_FREE_SHIP_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
+AE_FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("AE_FREE_SHIP_THRESHOLD_ILS", "38") or "38")  # heuristic
+AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
+
+MIN_ORDERS = _get_state_int("min_orders", AE_MIN_ORDERS_DEFAULT)
+MIN_RATING = _get_state_float("min_rating", AE_MIN_RATING_DEFAULT)
+FREE_SHIP_ONLY = _get_state_bool("free_ship_only", AE_FREE_SHIP_ONLY_DEFAULT)
+CATEGORY_IDS_RAW = _get_state_str("category_ids_raw", AE_CATEGORY_IDS_DEFAULT)
+
+def set_min_orders(n: int):
+    global MIN_ORDERS
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    MIN_ORDERS = max(0, n)
+    _set_state_str("min_orders", str(MIN_ORDERS))
+
+def set_min_rating(v: float):
+    global MIN_RATING
+    try:
+        v = float(v)
+    except Exception:
+        v = 0.0
+    MIN_RATING = max(0.0, v)
+    _set_state_str("min_rating", str(MIN_RATING))
+
+def set_free_ship_only(flag: bool):
+    global FREE_SHIP_ONLY
+    FREE_SHIP_ONLY = bool(flag)
+    _set_state_str("free_ship_only", "1" if FREE_SHIP_ONLY else "0")
+
+def _parse_category_ids(raw: str) -> list[str]:
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    # keep order, unique
+    seen = set()
+    out = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+def get_selected_category_ids() -> list[str]:
+    return _parse_category_ids(CATEGORY_IDS_RAW)
+
+def set_category_ids(ids: list[str]):
+    global CATEGORY_IDS_RAW
+    raw = ",".join([str(i).strip() for i in ids if str(i).strip()])
+    CATEGORY_IDS_RAW = raw
+    _set_state_str("category_ids_raw", CATEGORY_IDS_RAW)
+
 
 def set_price_buckets_raw(raw: str):
     global AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS
@@ -1105,6 +1196,37 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
 
     return products, resp_code, resp_msg
 
+
+def affiliate_product_query(page_no: int, page_size: int, category_id: str | None = None) -> tuple[list[dict], int | None, str | None]:
+    """Affiliate product query with optional category filter."""
+    fields = "product_id,product_title,product_main_image_url,promotion_link,promotion_url,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
+    biz = {
+        "tracking_id": AE_TRACKING_ID,
+        "page_no": str(page_no),
+        "page_size": str(page_size),
+        "sort": AE_REFILL_SORT,
+        "ship_to_country": AE_SHIP_TO_COUNTRY,
+        "target_language": AE_TARGET_LANGUAGE,
+        "fields": fields,
+        "platform_product_type": "ALL",
+    }
+    if category_id:
+        biz["category_ids"] = str(category_id).strip()
+    payload = _top_call("aliexpress.affiliate.product.query", biz)
+    resp = _extract_resp_result(payload)
+    resp_code = resp.get("resp_code")
+    resp_msg = resp.get("resp_msg")
+
+    result = resp.get("result") or {}
+    products = result.get("products") or result.get("product_list") or []
+    if isinstance(products, dict) and "product" in products:
+        products = products.get("product") or []
+    if products is None:
+        products = []
+    if not isinstance(products, list):
+        products = [products]
+    return products, resp_code, resp_msg
+
 def _map_affiliate_product_to_row(p: dict) -> dict:
     # בחירה חכמה של מחיר מבצע: app_sale_price אם קיים, אחרת sale_price
     sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
@@ -1161,54 +1283,159 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
     last_page = 0
     last_resp = None
 
-    for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
-        last_page = page_no
-        try:
-            products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
-            last_resp = (resp_code, resp_msg, len(products))
+    
+    # Build active filters snapshot
+    selected_cats = get_selected_category_ids()
+    # Distribute evenly if categories selected
+    if selected_cats:
+        n = len(selected_cats)
+        base = max_needed // n
+        rem = max_needed % n
+        per_cat = []
+        for i, cid in enumerate(selected_cats):
+            need = base + (1 if i < rem else 0)
+            if need > 0:
+                per_cat.append((cid, need))
 
-            if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
-                last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
-                break
+        max_pages_per_cat = max(1, AE_REFILL_MAX_PAGES // max(1, len(per_cat)))
 
-            if not products:
-                # תשובה תקינה אבל ריקה
-                break
+        for (cat_id, need_cat) in per_cat:
+            got_cat = 0
+            last_page = 0
+            for page_no in range(1, max_pages_per_cat + 1):
+                last_page = page_no
+                try:
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id)
+                    last_resp = (resp_code, resp_msg, len(products))
 
-            new_rows = []
-            for p in products:
-                row = _map_affiliate_product_to_row(p)
+                    if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
+                        last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
+                        break
 
-                # Price bucket filter (SalePrice is already ILS string in our rows)
-                if AE_PRICE_BUCKETS:
-                    sale_num = _extract_float(row.get("SalePrice") or "")
-                    if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
-                        skipped_price += 1
-                        continue
+                    if not products:
+                        break
 
-                if not row.get("BuyLink"):
-                    skipped_no_link += 1
-                    continue
-                k = _key_of_row(row)
-                if k in existing_keys:
-                    dup += 1
-                    continue
-                existing_keys.add(k)
-                new_rows.append(row)
+                    new_rows = []
+                    for p in products:
+                        row = _map_affiliate_product_to_row(p)
 
-            if new_rows:
-                with FILE_LOCK:
-                    pending_rows = read_products(PENDING_CSV)
-                    pending_rows.extend(new_rows)
-                    write_products(PENDING_CSV, pending_rows)
-                added += len(new_rows)
+                        # Filters
+                        if AE_PRICE_BUCKETS:
+                            sale_num = _extract_float(row.get("SalePrice") or "")
+                            if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                                skipped_price += 1
+                                continue
+
+                        if MIN_ORDERS:
+                            o = safe_int(row.get("Orders") or "0", 0)
+                            if o < int(MIN_ORDERS):
+                                continue
+
+                        if MIN_RATING:
+                            r = _extract_float(row.get("Rating") or "")
+                            if r is None or float(r) < float(MIN_RATING):
+                                continue
+
+                        if FREE_SHIP_ONLY:
+                            sale_num = _extract_float(row.get("SalePrice") or "")
+                            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                                continue
+
+                        if not row.get("BuyLink"):
+                            skipped_no_link += 1
+                            continue
+
+                        k = _key_of_row(row)
+                        if k in existing_keys:
+                            dup += 1
+                            continue
+                        existing_keys.add(k)
+                        new_rows.append(row)
+                        got_cat += 1
+                        if got_cat >= need_cat:
+                            break
+
+                    if new_rows:
+                        with FILE_LOCK:
+                            pending_rows = read_products(PENDING_CSV)
+                            pending_rows.extend(new_rows)
+                            write_products(PENDING_CSV, pending_rows)
+                        added += len(new_rows)
+
+                    if got_cat >= need_cat or added >= max_needed:
+                        break
+
+                except Exception as e:
+                    last_error = str(e)
+                    break
 
             if added >= max_needed:
                 break
 
-        except Exception as e:
-            last_error = str(e)
-            break
+    else:
+        # No categories selected -> use HotProduct feed (most stable) + apply filters
+        for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
+            last_page = page_no
+            try:
+                products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
+                last_resp = (resp_code, resp_msg, len(products))
+
+                if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
+                    last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
+                    break
+
+                if not products:
+                    break
+
+                new_rows = []
+                for p in products:
+                    row = _map_affiliate_product_to_row(p)
+
+                    if AE_PRICE_BUCKETS:
+                        sale_num = _extract_float(row.get("SalePrice") or "")
+                        if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                            skipped_price += 1
+                            continue
+
+                    if MIN_ORDERS:
+                        o = safe_int(row.get("Orders") or "0", 0)
+                        if o < int(MIN_ORDERS):
+                            continue
+
+                    if MIN_RATING:
+                        r = _extract_float(row.get("Rating") or "")
+                        if r is None or float(r) < float(MIN_RATING):
+                            continue
+
+                    if FREE_SHIP_ONLY:
+                        sale_num = _extract_float(row.get("SalePrice") or "")
+                        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                            continue
+
+                    if not row.get("BuyLink"):
+                        skipped_no_link += 1
+                        continue
+
+                    k = _key_of_row(row)
+                    if k in existing_keys:
+                        dup += 1
+                        continue
+                    existing_keys.add(k)
+                    new_rows.append(row)
+
+                if new_rows:
+                    with FILE_LOCK:
+                        pending_rows = read_products(PENDING_CSV)
+                        pending_rows.extend(new_rows)
+                        write_products(PENDING_CSV, pending_rows)
+                    added += len(new_rows)
+
+                if added >= max_needed:
+                    break
+
+            except Exception as e:
+                last_error = str(e)
+                break
 
     with FILE_LOCK:
         total_after = len(read_products(PENDING_CSV))
@@ -1271,6 +1498,287 @@ def _price_filter_menu_kb():
     kb.add(types.InlineKeyboardButton(f"מצב נוכחי: {AE_PRICE_BUCKETS_RAW or 'ללא'}", callback_data="noop_info"))
     return kb
 
+
+# ========= Additional Filters UI & Category list =========
+CATEGORIES_CACHE_PATH = os.path.join(LOG_DIR, "categories_cache.json")
+_CATEGORIES_CACHE = None  # list of dicts: {"id": "...", "name": "..."}
+
+def _load_categories_cache():
+    global _CATEGORIES_CACHE
+    try:
+        if _CATEGORIES_CACHE is not None:
+            return _CATEGORIES_CACHE
+        if not os.path.exists(CATEGORIES_CACHE_PATH):
+            _CATEGORIES_CACHE = []
+            return _CATEGORIES_CACHE
+        with open(CATEGORIES_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+        ts = payload.get("ts") or 0
+        # refresh every 7 days
+        if time.time() - float(ts) > 7 * 24 * 3600:
+            _CATEGORIES_CACHE = []
+            return _CATEGORIES_CACHE
+        _CATEGORIES_CACHE = payload.get("cats") or []
+        if not isinstance(_CATEGORIES_CACHE, list):
+            _CATEGORIES_CACHE = []
+        return _CATEGORIES_CACHE
+    except Exception:
+        _CATEGORIES_CACHE = []
+        return _CATEGORIES_CACHE
+
+def _save_categories_cache(cats: list[dict]):
+    global _CATEGORIES_CACHE
+    try:
+        _CATEGORIES_CACHE = cats or []
+        tmp = CATEGORIES_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "cats": _CATEGORIES_CACHE}, f, ensure_ascii=False)
+        os.replace(tmp, CATEGORIES_CACHE_PATH)
+    except Exception:
+        pass
+
+def affiliate_category_get() -> tuple[list[dict], str | None]:
+    """Returns (cats, err). Each cat dict has keys: id, name"""
+    try:
+        # Some gateways require fields parameter
+        biz = {"fields": "category_id,category_name", "language": AE_TARGET_LANGUAGE or "EN"}
+        payload = _top_call("aliexpress.affiliate.category.get", biz)
+        resp = _extract_resp_result(payload)
+        result = resp.get("result") or {}
+        cats = result.get("categories") or result.get("category_list") or result.get("category") or []
+        if isinstance(cats, dict) and "category" in cats:
+            cats = cats.get("category") or []
+        if cats is None:
+            cats = []
+        if not isinstance(cats, list):
+            cats = [cats]
+        out = []
+        for c in cats:
+            cid = str(c.get("category_id") or c.get("id") or "").strip()
+            name = str(c.get("category_name") or c.get("name") or "").strip()
+            if cid:
+                out.append({"id": cid, "name": name or cid})
+        if out:
+            _save_categories_cache(out)
+        return out, None
+    except Exception as e:
+        return [], str(e)
+
+def get_categories() -> list[dict]:
+    cats = _load_categories_cache()
+    return cats or []
+
+# ---------- Filter menus ----------
+ORDERS_PRESETS = [0, 10, 50, 100, 300, 500, 1000, 3000, 5000]
+RATING_PRESETS = [0, 80, 85, 90, 92, 94, 95, 97]
+
+def _filters_home_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    price_label = AE_PRICE_BUCKETS_RAW or "ללא"
+    kb.add(types.InlineKeyboardButton(f"💸 מחיר: {price_label}", callback_data="pf_menu"))
+
+    kb.add(
+        types.InlineKeyboardButton(f"📦 מינ' הזמנות: {MIN_ORDERS or 0}", callback_data="fo_menu"),
+        types.InlineKeyboardButton(f"⭐ מינ' דירוג: {MIN_RATING or 0:g}%", callback_data="fr_menu"),
+    )
+    ship_lbl = "✅" if FREE_SHIP_ONLY else "❌"
+    kb.add(types.InlineKeyboardButton(f"🚚 משלוח חינם לישראל: {ship_lbl}", callback_data="fs_toggle"))
+
+    cats = get_selected_category_ids()
+    cats_lbl = f"{len(cats)} נבחרו" if cats else "ללא"
+    kb.add(types.InlineKeyboardButton(f"🧩 קטגוריות: {cats_lbl}", callback_data="fc_menu_0"))
+
+    kb.add(
+        types.InlineKeyboardButton("🧹 נקה כל הסינונים", callback_data="flt_clear_all"),
+        types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_back"),
+    )
+    return kb
+
+def _orders_filter_menu_kb():
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    btns = []
+    for v in ORDERS_PRESETS:
+        mark = "✅ " if int(MIN_ORDERS or 0) == int(v) else ""
+        btns.append(types.InlineKeyboardButton(f"{mark}{v}", callback_data=f"fo_set_{v}"))
+    kb.add(*btns)
+    kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
+    return kb
+
+def _rating_filter_menu_kb():
+    kb = types.InlineKeyboardMarkup(row_width=4)
+    btns = []
+    for v in RATING_PRESETS:
+        mark = "✅ " if float(MIN_RATING or 0) == float(v) else ""
+        btns.append(types.InlineKeyboardButton(f"{mark}{v}%", callback_data=f"fr_set_{v}"))
+    kb.add(*btns)
+    kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
+    return kb
+
+def _categories_menu_kb(page: int = 0, per_page: int = 10):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    cats = get_categories()
+    selected = set(get_selected_category_ids())
+    total = len(cats)
+
+    if total == 0:
+        kb.add(types.InlineKeyboardButton("🔄 סנכרן קטגוריות מאליאקספרס", callback_data="fc_sync"))
+        kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
+        return kb
+
+    page = max(0, int(page))
+    start = page * per_page
+    end = min(total, start + per_page)
+    slice_cats = cats[start:end]
+
+    btns = []
+    for c in slice_cats:
+        cid = str(c.get("id") or "")
+        name = str(c.get("name") or cid)
+        mark = "✅ " if cid in selected else ""
+        # keep name short in button
+        short = name
+        if len(short) > 22:
+            short = short[:21] + "…"
+        btns.append(types.InlineKeyboardButton(f"{mark}{short}", callback_data=f"fc_t_{cid}_{page}"))
+    if btns:
+        kb.add(*btns)
+
+    # controls
+    nav = []
+    if start > 0:
+        nav.append(types.InlineKeyboardButton("⬅️ הקודם", callback_data=f"fc_menu_{page-1}"))
+    if end < total:
+        nav.append(types.InlineKeyboardButton("הבא ➡️", callback_data=f"fc_menu_{page+1}"))
+    if nav:
+        kb.add(*nav)
+
+    kb.add(
+        types.InlineKeyboardButton("🎲 בחר קטגוריה רנדומלית", callback_data="fc_random"),
+        types.InlineKeyboardButton("🧹 נקה קטגוריות", callback_data="fc_clear"),
+    )
+    kb.add(types.InlineKeyboardButton("🔄 סנכרן קטגוריות", callback_data="fc_sync"))
+    kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
+    kb.add(types.InlineKeyboardButton(f"נבחרו: {len(selected)} | עמוד {page+1}/{max(1, (total + per_page - 1)//per_page)}", callback_data="noop_info"))
+    return kb
+
+def handle_filters_callback(c, data: str, chat_id: int) -> bool:
+    """Return True if handled."""
+    try:
+        # home
+        if data == "flt_menu":
+            txt = "🧰 סינונים\nבחר מה לשנות:"
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_filters_home_kb(), cb_id=c.id)
+            return True
+        if data == "flt_back":
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="✅ תפריט ראשי", reply_markup=inline_menu(), cb_id=c.id)
+            return True
+        if data == "flt_clear_all":
+            with FILE_LOCK:
+                set_price_buckets_raw("")
+                set_min_orders(0)
+                set_min_rating(0.0)
+                set_free_ship_only(False)
+                set_category_ids([])
+            bot.answer_callback_query(c.id, "כל הסינונים אופסו.")
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧰 סינונים\nבחר מה לשנות:", reply_markup=_filters_home_kb(), cb_id=None)
+            return True
+
+        # orders
+        if data == "fo_menu":
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"📦 מינימום הזמנות (כרגע: {MIN_ORDERS})", reply_markup=_orders_filter_menu_kb(), cb_id=c.id)
+            return True
+        if data.startswith("fo_set_"):
+            val = int(data.split("_")[-1])
+            with FILE_LOCK:
+                set_min_orders(val)
+            bot.answer_callback_query(c.id, f"עודכן מינ' הזמנות ל-{val}")
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"📦 מינימום הזמנות (כרגע: {MIN_ORDERS})", reply_markup=_orders_filter_menu_kb(), cb_id=None)
+            return True
+
+        # rating
+        if data == "fr_menu":
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"⭐ מינימום דירוג באחוזים (כרגע: {MIN_RATING:g}%)", reply_markup=_rating_filter_menu_kb(), cb_id=c.id)
+            return True
+        if data.startswith("fr_set_"):
+            val = float(data.split("_")[-1])
+            with FILE_LOCK:
+                set_min_rating(val)
+            bot.answer_callback_query(c.id, f"עודכן מינ' דירוג ל-{val:g}%")
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"⭐ מינימום דירוג באחוזים (כרגע: {MIN_RATING:g}%)", reply_markup=_rating_filter_menu_kb(), cb_id=None)
+            return True
+
+        # shipping toggle
+        if data == "fs_toggle":
+            with FILE_LOCK:
+                set_free_ship_only(not FREE_SHIP_ONLY)
+            bot.answer_callback_query(c.id, "עודכן.")
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧰 סינונים\nבחר מה לשנות:", reply_markup=_filters_home_kb(), cb_id=None)
+            return True
+
+        # categories menu
+        if data.startswith("fc_menu_"):
+            page = int(data.split("_")[-1])
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(page), cb_id=c.id)
+            return True
+
+        if data == "fc_clear":
+            with FILE_LOCK:
+                set_category_ids([])
+            bot.answer_callback_query(c.id, "קטגוריות נוקו.")
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(0), cb_id=None)
+            return True
+
+        if data == "fc_sync":
+            bot.answer_callback_query(c.id, "מסנכרן…")
+            cats, err = affiliate_category_get()
+            if err:
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"❌ סנכרון נכשל: {err}", reply_markup=_categories_menu_kb(0), cb_id=None)
+            else:
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"✅ סונכרנו {len(cats)} קטגוריות.", reply_markup=_categories_menu_kb(0), cb_id=None)
+            return True
+
+        if data == "fc_random":
+            cats = get_categories()
+            if not cats:
+                bot.answer_callback_query(c.id, "אין קטגוריות במטמון. לחץ סנכרון.", show_alert=True)
+                return True
+            choice = random.choice(cats)
+            cid = str(choice.get("id"))
+            with FILE_LOCK:
+                set_category_ids([cid])
+            bot.answer_callback_query(c.id, f"נבחרה: {choice.get('name')}")
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(0), cb_id=None)
+            return True
+
+        if data.startswith("fc_t_"):
+            # fc_t_<cid>_<page>
+            parts = data.split("_")
+            if len(parts) >= 4:
+                cid = parts[2]
+                page = int(parts[3])
+            else:
+                return False
+            selected = get_selected_category_ids()
+            sset = set(selected)
+            if cid in sset:
+                sset.remove(cid)
+            else:
+                sset.add(cid)
+            # preserve original order as much as possible
+            new_order = [x for x in selected if x in sset] + [x for x in sset if x not in selected]
+            with FILE_LOCK:
+                set_category_ids(new_order)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(page), cb_id=c.id)
+            return True
+
+    except Exception as e:
+        try:
+            bot.answer_callback_query(c.id, f"שגיאה: {e}", show_alert=True)
+        except Exception:
+            pass
+        return True
+    return False
+
 def inline_menu():
     kb = types.InlineKeyboardMarkup(row_width=3)
 
@@ -1281,7 +1789,7 @@ def inline_menu():
     )
 
     kb.add(
-        types.InlineKeyboardButton("💸 סינון מחיר", callback_data="pf_menu"),
+        types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
     )
 
     kb.add(
@@ -1334,6 +1842,10 @@ def on_inline_click(c):
 
     data = c.data or ""
     chat_id = c.message.chat.id
+
+    # Handle filter menus / callbacks
+    if handle_filters_callback(c, data, chat_id):
+        return
 
     if data == "publish_now":
         ok = send_next_locked("manual")
@@ -1856,6 +2368,7 @@ if __name__ == "__main__":
     log_info(f"[CFG] PUBLIC_CHANNEL={os.environ.get('PUBLIC_CHANNEL', '')} | CURRENT_TARGET={CURRENT_TARGET}")
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
+    log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
