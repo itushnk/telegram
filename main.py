@@ -21,7 +21,7 @@ import hashlib
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17a")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17b")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
