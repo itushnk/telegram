@@ -21,7 +21,7 @@ import hashlib
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-16j")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-16k")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -87,6 +87,21 @@ os.makedirs(BASE_DIR, exist_ok=True)
 # ========= CONFIG (Telegram) =========
 BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or "").strip()  # חובה ב-ENV
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
+
+# Join link for the channel (used in captions/buttons). Prefer explicit env var; fallback to https://t.me/<channel>
+JOIN_URL = (
+    os.environ.get("JOIN_URL")
+    or os.environ.get("CHANNEL_JOIN_URL")
+    or os.environ.get("PUBLIC_JOIN_URL")
+    or ""
+).strip()
+if not JOIN_URL:
+    if CHANNEL_ID.startswith("@"):
+        JOIN_URL = f"https://t.me/{CHANNEL_ID[1:]}"
+    elif CHANNEL_ID.startswith("http"):
+        JOIN_URL = CHANNEL_ID
+    else:
+        JOIN_URL = f"https://t.me/{CHANNEL_ID}"
 ADMIN_USER_IDS_RAW = (os.environ.get("ADMIN_USER_IDS", "") or "").strip()  # "123,456"
 ADMIN_USER_IDS = set(int(x) for x in ADMIN_USER_IDS_RAW.split(",") if x.strip().isdigit()) if ADMIN_USER_IDS_RAW else set()
 
@@ -498,6 +513,12 @@ def format_post(product):
     rating = product.get('Rating', '')
     orders = product.get('Orders', '')
     buy_link = product.get('BuyLink', '')
+    # Use a shortened buy link for HTML anchors to avoid huge URLs in captions
+    buy_link_short = ''
+    try:
+        buy_link_short = _maybe_shorten_buy_link(item_id, buy_link) if buy_link else ''
+    except Exception:
+        buy_link_short = buy_link
     coupon = product.get('CouponCode', '')
 
     opening = (product.get('Opening') or '').strip()
@@ -537,13 +558,13 @@ def format_post(product):
 
     lines += [
         "",
-        f'להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>',
+        f'להזמנה מהירה👈 <a href="{buy_link_short}">לחצו כאן</a>',
         "",
         f"מספר פריט: {item_id}",
         f'להצטרפות לערוץ לחצו כאן👈 <a href="{JOIN_URL}">קליק והצטרפתם</a>',
         "",
         "👇🛍הזמינו עכשיו🛍👇",
-        f'<a href="{buy_link}">לחיצה וזה בדרך </a>',
+        f'<a href="{buy_link_short}">לחיצה וזה בדרך </a>',
     ]
 
     # לא מסננים שורות ריקות לגמרי, כדי לשמור על ריווח נעים
@@ -1617,6 +1638,7 @@ if __name__ == "__main__":
 
     # Extra runtime diagnostics (safe)
     log_info(f"[CFG] PUBLIC_CHANNEL={os.environ.get('PUBLIC_CHANNEL', '')} | CURRENT_TARGET={CURRENT_TARGET}")
+    log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
@@ -1645,7 +1667,12 @@ if __name__ == "__main__":
 
     while True:
         try:
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+            while True:
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+    except Exception as e:
+        log_error(f"Polling crashed: {e}")
+        time.sleep(5)
         except Exception as e:
             msg = str(e)
             wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
