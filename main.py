@@ -10,6 +10,7 @@ Changes vs previous:
 """
 
 import os, sys
+import html
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -518,25 +519,28 @@ def post_to_channel(product):
         video_url = (product.get('Video Url') or "").strip()
         target = resolve_target(CURRENT_TARGET)
 
-        # Telegram caption limit safety: אם ארוך מדי — שולחים טקסט בנפרד
-        caption = post_text
-        if caption and len(caption) > 900:  # מרווח ביטחון
-            # שולחים תמונה ואז טקסט
-            resp = SESSION.get(image_url, timeout=30)
-            resp.raise_for_status()
-            bot.send_photo(target, resp.content)
-            bot.send_message(target, caption)
-            return
-
-        if video_url.endswith('.mp4') and video_url.startswith("http"):
-            resp = SESSION.get(video_url, timeout=30)
-            resp.raise_for_status()
-            bot.send_video(target, resp.content, caption=caption)
-        else:
-            resp = SESSION.get(image_url, timeout=30)
-            resp.raise_for_status()
-            bot.send_photo(target, resp.content, caption=caption)
-
+        # Telegram caption limit: captions on photo/video are 0-1024 chars after entities parsing.
+        # אם הטקסט ארוך מדי, לא ניתן להכניס את כולו כ-caption. במקום "לפצל" לשתי הודעות,
+        # נשלח הודעת טקסט אחת עם preview של התמונה למעלה (עד 4096 תווים בטקסט).
+        caption = post_text or ""
+        try:
+            if video_url.endswith('.mp4') and video_url.startswith("http"):
+                resp = SESSION.get(video_url, timeout=30)
+                resp.raise_for_status()
+                bot.send_video(target, resp.content, caption=caption, supports_streaming=True)
+            else:
+                resp = SESSION.get(image_url, timeout=30)
+                resp.raise_for_status()
+                bot.send_photo(target, resp.content, caption=caption)
+        except Exception as _send_e:
+            # אם ה-caption ארוך מדי ל-photo/video (0-1024 תווים), ננסה הודעת טקסט אחת עם preview של התמונה למעלה.
+            # זה שומר על "הודעה אחת" (עם תמונה למעלה), כל עוד הטקסט <= 4096 תווים.
+            msg = str(_send_e).lower()
+            if 'caption' in msg and ('too long' in msg or '1024' in msg) and len(caption) <= 4096 and image_url:
+                preview_text = f'<a href="{image_url}">&#8205;</a>' + html.escape(caption)
+                bot.send_message(target, preview_text, parse_mode="HTML", disable_web_page_preview=False)
+            else:
+                raise
     except Exception as e:
         print(f"[{_now_il().strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}", flush=True)
 
