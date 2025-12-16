@@ -21,7 +21,7 @@ import hashlib
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-16h")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-16i")
 
 def _code_fingerprint() -> str:
     try:
@@ -523,7 +523,7 @@ def format_post(product):
                 lines.append(part)
         lines.append("")
 
-    price_line = f'💰 מחיר מבצע: <a href="{buy_link}">{sale_price} ש"ח</a> (מחיר מקורי: {original_price} ש"ח)'
+    price_line = f'💰 מחיר מבצע: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
     lines += [
         price_line,
         discount_text,
@@ -540,7 +540,7 @@ def format_post(product):
         f'להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>',
         "",
         f"מספר פריט: {item_id}",
-        'להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>',
+        f'להצטרפות לערוץ לחצו כאן👈 <a href="{JOIN_URL}">קליק והצטרפתם</a>',
         "",
         "👇🛍הזמינו עכשיו🛍👇",
         f'<a href="{buy_link}">לחיצה וזה בדרך </a>',
@@ -556,6 +556,77 @@ def _strip_html(s: str) -> str:
     except Exception:
         return s or ""
 
+
+def _canonical_item_url(item_id: str) -> str:
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        return ""
+    return f"https://www.aliexpress.com/item/{item_id}.html"
+
+def _find_first_url(obj):
+    """Best-effort search for a URL inside nested dict/list responses."""
+    if isinstance(obj, str):
+        if obj.startswith("http://") or obj.startswith("https://"):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        for k in ("promotion_link", "promotionUrl", "promotion_url", "url", "short_url"):
+            got = _find_first_url(obj.get(k))
+            if got:
+                return got
+        for v in obj.values():
+            got = _find_first_url(v)
+            if got:
+                return got
+    if isinstance(obj, list):
+        for it in obj:
+            got = _find_first_url(it)
+            if got:
+                return got
+    return None
+
+def _maybe_shorten_buy_link(item_id: str, buy_link: str) -> str:
+    """If link is very long, regenerate a clean affiliate link via link.generate.
+    Fallback to canonical item URL.
+    """
+    buy_link = (buy_link or "").strip()
+    if buy_link and len(buy_link) <= 512 and "/s/" not in buy_link:
+        return buy_link
+
+    canonical = _canonical_item_url(item_id)
+    fallback = canonical or (buy_link[:512] if buy_link else "")
+
+    try:
+        if not AE_APP_KEY or not AE_APP_SECRET or not AE_TRACKING_ID:
+            return fallback
+        payload = _top_call("aliexpress.affiliate.link.generate", {
+            "tracking_id": AE_TRACKING_ID,
+            "promotion_link_type": "0",
+            "source_values": canonical or buy_link,
+        })
+        rr = _extract_resp_result(payload)
+        short = _find_first_url(rr)
+        if short and len(short) <= 512:
+            return short
+    except Exception as e:
+        logging.warning("link.generate failed (fallback to canonical): %s", e)
+
+    return fallback
+
+def _build_post_buttons(item_id: str, buy_link: str):
+    try:
+        url_buy = _maybe_shorten_buy_link(item_id, buy_link)
+        url_join = (JOIN_URL or "").strip()
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        if url_buy:
+            mk.add(types.InlineKeyboardButton("👇🛍 הזמינו עכשיו 🛍👇", url=url_buy))
+        if url_join:
+            mk.add(types.InlineKeyboardButton("👈 להצטרפות לערוץ", url=url_join))
+        return mk
+    except Exception as e:
+        logging.warning("failed to build buttons: %s", e)
+        return None
+
 def post_to_channel(product) -> bool:
     """Send a single media message (photo/video) with HTML caption when possible.
     Returns True on success, False on failure (so queue won't advance on failures).
@@ -564,6 +635,10 @@ def post_to_channel(product) -> bool:
         post_text, image_url = format_post(product)
         video_url = (product.get('Video Url') or product.get('VideoURL') or product.get('VideoURL'.lower()) or "").strip()
         target = resolve_target(CURRENT_TARGET)
+
+        item_id = str(product.get("ProductId") or product.get("ItemId") or product.get("item_id") or "")
+        buy_link_btn = str(product.get("BuyLink") or "")
+        buttons = _build_post_buttons(item_id, buy_link_btn)
 
         # Caption safety: Telegram captions are 0-1024 characters AFTER entities parsing
         # We'll estimate using visible text (strip HTML tags).
@@ -810,7 +885,12 @@ def _top_call(method_name: str, biz_params: dict) -> dict:
 
     for top_url in AE_TOP_URL_CANDIDATES:
         try:
-            r = SESSION.post(top_url, data=params, timeout=30)
+            if "/sync" in top_url.rstrip("/"):
+                r = SESSION.get(top_url, params=params, timeout=30)
+                if r.status_code in (405, 414):
+                    r = SESSION.post(top_url, data=params, timeout=30)
+            else:
+                r = SESSION.post(top_url, data=params, timeout=30)
             r.raise_for_status()
             payload = r.json()
 
