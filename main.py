@@ -13,7 +13,7 @@ def _html_attr(s) -> str:
 """
 main.py — Telegram Post Bot + AliExpress Affiliate refill
 
-Version: 2025-12-16e
+Version: 2025-12-16g
 Changes vs previous:
 - Fix TOP timestamp to GMT+8 (per TOP gateway requirement)
 - Raise on TOP error_response (so you finally see the real error instead of '0 products' and None)
@@ -26,48 +26,6 @@ try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
-
-
-
-import logging
-from logging.handlers import RotatingFileHandler
-
-LOG_LEVEL = (os.environ.get("LOG_LEVEL", "INFO") or "INFO").upper()
-
-def setup_logging(log_file: str | None = None):
-    """Configure logs to stdout (Railway Logs) and optional rotating file under BOT_DATA_DIR."""
-    level = getattr(logging, LOG_LEVEL, logging.INFO)
-    root = logging.getLogger()
-    root.setLevel(level)
-
-    # Clear existing handlers to avoid duplicates on reloads
-    for h in list(root.handlers):
-        root.removeHandler(h)
-
-    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(level)
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
-
-    if log_file:
-        try:
-            fh = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-            fh.setLevel(level)
-            fh.setFormatter(fmt)
-            root.addHandler(fh)
-        except Exception as e:
-            print(f"[WARN] Failed to init file logger: {e}", flush=True)
-
-    # Make sure telebot internal logger follows our level
-    try:
-        import telebot as _tb
-        _tb.logger.setLevel(level)
-    except Exception:
-        pass
-
-    return logging.getLogger("bot")
 
 import csv
 import time
@@ -83,30 +41,50 @@ from zoneinfo import ZoneInfo
 import telebot
 from telebot import types
 
+# ========= LOGGING =========
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+import pathlib as _pathlib
+
+APP_VERSION = "2025-12-16g"
+# Fingerprint to verify which code is running
+try:
+    _FP = hashlib.sha256(_pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
+except Exception:
+    _FP = "nofp"
+
+# Make stdout/stderr line-buffered (helps Railway show logs in real time)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+LOG_LEVEL = (os.environ.get("LOG_LEVEL", "INFO") or "INFO").upper().strip()
+LOG_FILE = os.path.join(os.environ.get("BOT_DATA_DIR", "./data"), "bot.log")
+
+def _setup_logging():
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    fmt = "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"
+    handlers = [
+        logging.StreamHandler(sys.stdout),
+        RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"),
+    ]
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format=fmt, handlers=handlers, force=True)
+
+_setup_logging()
+log = logging.getLogger("bot")
+
+def runtime_banner() -> str:
+    commit = os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("RAILWAY_COMMIT_SHA") or os.environ.get("GIT_COMMIT") or ""
+    commit_short = commit[:8] if commit else "n/a"
+    return f"[BOOT] main.py v{APP_VERSION} fp={_FP} commit={commit_short} instance={socket.gethostname()}"
+
+
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
-
-
-os.makedirs(BASE_DIR, exist_ok=True)
-
-LOG_FILE = os.path.join(BASE_DIR, "bot.log")
-LOGGER = setup_logging(LOG_FILE)
-
-def _tail_log_lines(max_lines: int = 200) -> str:
-    """Return last N lines from rotating log file (for /logs in Telegram)."""
-    try:
-        if not os.path.exists(LOG_FILE):
-            return "(log file does not exist yet)"
-        with open(LOG_FILE, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(size - 65536, 0), os.SEEK_SET)
-            data = f.read().decode("utf-8", errors="replace")
-        lines = data.splitlines()[-max_lines:]
-        return "\n".join(lines) if lines else "(no log lines)"
-    except Exception as e:
-        return f"(failed reading logs: {e})"
 
 # ========= CONFIG (Telegram) =========
 BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or "").strip()  # חובה ב-ENV
@@ -517,28 +495,28 @@ def format_post(product):
     orders_num = safe_int(orders, default=0)
     orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
     discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
-    coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
+    coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {_html_text(coupon)}" if str(coupon).strip() else ""
 
     lines = []
     if opening:
-        lines.append(str(opening))
+        lines.append(_html_text(opening))
         lines.append("")
     if title:
-        lines.append(str(title))
+        lines.append(_html_text(title))
         lines.append("")
 
     if strengths_src:
         for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
             if part:
-                lines.append(str(part))
+                lines.append(_html_text(part))
         lines.append("")
 
-    price_line = f'💰 מחיר מבצע: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
+    price_line = f'💰 מחיר מבצע: <a href="{_html_attr(buy_link)}">{_html_text(sale_price)} ש"ח</a> (מחיר מקורי: {_html_text(original_price)} ש"ח)'
     lines += [
         price_line,
         discount_text,
-        f"⭐️ דירוג: {rating_percent}",
-        f"📦 {orders_text}",
+        f"⭐ דירוג: {_html_text(rating_percent)}",
+        f"📦 {_html_text(orders_text)}",
         "🚚 משלוח חינם מעל 38 ש\"ח או 7.49 ש\"ח",
     ]
 
@@ -547,7 +525,7 @@ def format_post(product):
 
     lines += [
         "",
-        f"מספר פריט: {item_id}",
+        f"מספר פריט: {_html_text(item_id)}",
     ]
 
     # לא מסננים שורות ריקות לגמרי, כדי לשמור על ריווח נעים
@@ -571,77 +549,66 @@ def _trim_caption_html(caption: str, limit: int = 1024) -> str:
     head = head[:max_head].rstrip()
     return (head + "\n\n" + tail).strip()
 
-
-URL_RE = re.compile(r"https?://\S+")
-def _strip_urls(text: str) -> str:
-    if not text:
-        return ""
-    t = URL_RE.sub("", text)
-    t = re.sub(r"\(\s*\)", "", t)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = "\n".join([ln.rstrip() for ln in t.splitlines()])
-    return t.strip()
-
-
 def post_to_channel(product):
+    """
+    Send one product post to CURRENT_TARGET as a single media message (photo/video) with caption.
+
+    Logs:
+      - start (caption_len + trimmed)
+      - media download (status + bytes)
+      - success/failure (with traceback)
+    """
+    product_id = (
+        product.get("ProductId") or product.get("Product ID") or product.get("ItemId") or
+        product.get("Item ID") or product.get("id") or product.get("product_id") or ""
+    )
+    target = CURRENT_TARGET
+
+    post_text, image_url = format_post(product)
+    video_url = (product.get("Video Url") or product.get("VideoUrl") or "").strip()
+
+    caption_raw = post_text or ""
+    caption = _trim_caption_html(caption_raw, 1024)
+    trimmed = (len(caption) != len(caption_raw))
+
+    use_video = bool(video_url) and video_url.lower().endswith(".mp4") and video_url.startswith("http")
+    media = "video" if use_video else "photo"
+
+    log.info("POST start id=%s media=%s caption_len=%d trimmed=%s target=%s",
+             product_id, media, len(caption_raw), trimmed, target)
+
     try:
-        post_text, image_url = format_post(product)
-        video_url = (product.get('Video Url') or "").strip()
-        target = resolve_target(CURRENT_TARGET)
-
-        promo_url = (product.get('BuyLink', '') or '').strip()
-        join_url = (PUBLIC_CHANNEL or '').strip() or "https://t.me/+LlMY8B9soOdhNmZk"
-
-        order_text = "להזמנה מהירה👈 לחצו כאן"
-        join_text  = "להצטרפות לערוץ לחצו כאן👈 קליק והצטרפתם"
-
-        caption = (post_text or "").strip()
-        caption = _strip_urls(caption)
-        caption = (caption + "\n\n" if caption else "") + order_text + "\n" + join_text
-
-        raw_len = len(caption)
-        caption = _trim_caption_html(caption, 1024)
-        trimmed = (len(caption) != raw_len)
-
-        kb = types.InlineKeyboardMarkup()
-        if promo_url:
-            kb.add(types.InlineKeyboardButton("🛍 להזמנה", url=promo_url))
-        if join_url:
-            kb.add(types.InlineKeyboardButton("📲 הצטרפות לערוץ", url=join_url))
-
-        item_id = (product.get("ItemId") or "").strip()
-        media_kind = "video" if (video_url.endswith(".mp4") and video_url.startswith("http")) else "photo"
-        LOGGER.info("POST start item=%s target=%s media=%s caption_len=%s trimmed=%s has_promo=%s has_join=%s",
-                    item_id, target, media_kind, len(caption), trimmed, bool(promo_url), bool(join_url))
-
-        if media_kind == "video":
+        if use_video:
             resp = SESSION.get(video_url, timeout=30)
+            log.info("POST download video id=%s status=%s bytes=%s", product_id, getattr(resp, "status_code", "?"), len(getattr(resp, "content", b"") or b""))
             resp.raise_for_status()
-            LOGGER.info("POST media_download ok kind=video bytes=%s status=%s", len(resp.content), resp.status_code)
-            bot.send_video(target, resp.content, caption=caption, reply_markup=kb, parse_mode=None)
+            bot.send_video(target, resp.content, caption=caption, parse_mode="HTML")
         else:
             resp = SESSION.get(image_url, timeout=30)
+            log.info("POST download photo id=%s status=%s bytes=%s", product_id, getattr(resp, "status_code", "?"), len(getattr(resp, "content", b"") or b""))
             resp.raise_for_status()
-            LOGGER.info("POST media_download ok kind=photo bytes=%s status=%s", len(resp.content), resp.status_code)
-            bot.send_photo(target, resp.content, caption=caption, reply_markup=kb, parse_mode=None)
+            bot.send_photo(target, resp.content, caption=caption, parse_mode="HTML")
 
-        LOGGER.info("POST sent item=%s", item_id)
+        log.info("POST sent id=%s media=%s", product_id, media)
 
-    except Exception:
-        LOGGER.exception("POST failed")
+    except Exception as e:
+        # Log full traceback + key context
+        log.exception("POST failed id=%s media=%s image_url=%s video_url=%s", product_id, media, image_url, video_url)
+        print(f"[{_now_il().strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post id={product_id}: {e}", flush=True)
 
 # ========= ATOMIC SEND =========
+
 def send_next_locked(source: str = "loop") -> bool:
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
-            LOGGER.info("QUEUE empty source=%s", source)
+            print(f"[{_now_il()}] {source}: no pending", flush=True)
             return False
 
         item = pending[0]
         item_id = (item.get("ItemId") or "").strip()
         title = (item.get("Title") or "").strip()[:120]
-        LOGGER.info("QUEUE send_next source=%s item=%s title=%s", source, item_id, title)
+        print(f"[{_now_il()}] {source}: sending ItemId={item_id} | Title={title}", flush=True)
 
         try:
             post_to_channel(item)
@@ -660,7 +627,7 @@ def send_next_locked(source: str = "loop") -> bool:
                 print(f"[{_now_il()}] {source}: write FAILED permanently: {e2}", flush=True)
                 return True
 
-        LOGGER.info("QUEUE advanced source=%s item=%s", source, item_id)
+        print(f"[{_now_il()}] {source}: sent & advanced queue", flush=True)
         return True
 
 # ========= DELAY =========
@@ -1387,43 +1354,6 @@ def cmd_start(msg):
     _save_admin_chat_id(msg.chat.id)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
-
-@bot.message_handler(commands=['version'])
-def cmd_version(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    try:
-        fp = "unknown"
-        try:
-            with open(__file__, "rb") as f:
-                fp = hashlib.sha1(f.read()).hexdigest()[:10]
-        except Exception:
-            pass
-        env_bits = []
-        for k in ("RAILWAY_GIT_COMMIT_SHA", "RAILWAY_DEPLOYMENT_ID", "RAILWAY_SERVICE_NAME"):
-            v = (os.environ.get(k) or "").strip()
-            if v:
-                env_bits.append(f"{k}={v}")
-        env_line = ("\n" + "\n".join(env_bits)) if env_bits else ""
-        bot.reply_to(msg, f"גרסה: 2025-12-16e\nFingerprint: {fp}{env_line}")
-    except Exception as e:
-        bot.reply_to(msg, f"שגיאה: {e}")
-
-@bot.message_handler(commands=['logs'])
-def cmd_logs(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    text = _tail_log_lines(200)
-    if not text:
-        bot.reply_to(msg, "אין לוגים.")
-        return
-    chunk_size = 3500
-    parts = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    for part in parts[:4]:
-        bot.send_message(msg.chat.id, f"<pre>{_html_text(part)}</pre>", parse_mode="HTML")
-
 @bot.message_handler(commands=['pending_status'])
 def pending_status_cmd(msg):
     with FILE_LOCK:
@@ -1462,6 +1392,46 @@ def cmd_refill_now(msg):
         f"דף אחרון שנבדק: {last_page}\n"
         f"שגיאה/מידע: {last_error}"
     )
+
+
+
+# ========= ADMIN DEBUG =========
+def _tail_text_file(path: str, max_lines: int = 200, max_chars: int = 3500) -> str:
+    try:
+        if not os.path.exists(path):
+            return f"(no log file: {path})"
+        # Read last ~128KB for speed
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 131072))
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()[-max_lines:]
+        out = "\n".join(lines)
+        if len(out) > max_chars:
+            out = out[-max_chars:]
+        return out or "(empty)"
+    except Exception as e:
+        return f"(tail failed: {e})"
+
+@bot.message_handler(commands=['version'])
+def cmd_version(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    info = runtime_banner() + f"\nLOG_FILE={LOG_FILE}\nLOG_LEVEL={LOG_LEVEL}\nTARGET={CURRENT_TARGET}\nAUTO={read_auto_flag()}"
+    bot.reply_to(msg, info)
+
+@bot.message_handler(commands=['logs'])
+def cmd_logs(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    tail = _tail_text_file(LOG_FILE)
+    # Wrap in <pre> for readability
+    bot.reply_to(msg, "<pre>" + _html.escape(tail) + "</pre>", parse_mode="HTML")
+
 
 # ========= SENDER LOOP =========
 def auto_post_loop():
@@ -1538,21 +1508,8 @@ def refill_daemon():
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    print("[BOOT] main.py v2025-12-16e", flush=True)
-    print(f"Instance: {socket.gethostname()}", flush=True)
-
-# Boot diagnostics
-try:
-    with open(__file__, "rb") as f:
-        fp = hashlib.sha1(f.read()).hexdigest()[:10]
-except Exception:
-    fp = "unknown"
-LOGGER.info("BOOT version=2025-12-16e instance=%s fingerprint=%s", socket.gethostname(), fp)
-for k in ("RAILWAY_GIT_COMMIT_SHA", "RAILWAY_DEPLOYMENT_ID", "RAILWAY_SERVICE_NAME"):
-    v = (os.environ.get(k) or "").strip()
-    if v:
-        LOGGER.info("BOOT env %s=%s", k, v)
-
+    print(runtime_banner(), flush=True)
+    log.info(runtime_banner())
 
     # הדפסה קצרה של קונפיג (מסכות)
     print(f"[CFG] AE_TOP_URL={AE_TOP_URL} | CANDIDATES={' | '.join(AE_TOP_URL_CANDIDATES)}", flush=True)
