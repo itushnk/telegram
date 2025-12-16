@@ -64,6 +64,7 @@ _env_top_url  = (os.environ.get("AE_TOP_URL", "") or "").strip()      # שער �
 _env_top_urls = (os.environ.get("AE_TOP_URLS", "") or "").strip()    # רשימה מופרדת בפסיקים (אם הוגדרה)
 
 _default_candidates = [
+    "https://api-sg.aliexpress.com/sync",       # Newer business API gateway
     "https://api.taobao.com/router/rest",        # Overseas (US)
     "https://gw.api.taobao.com/router/rest",     # Legacy gateway
     "https://eco.taobao.com/router/rest",        # Alt/legacy
@@ -392,36 +393,61 @@ def is_quiet_now(now: datetime | None = None) -> bool:
     return not should_broadcast(now) if is_schedule_enforced() else False
 
 # ========= SAFE EDIT =========
+def safe_answer_callback(bot, cb_id: str | None, text: str | None = None, show_alert: bool = False) -> None:
+    """מגן מפני 400: query is too old / query id invalid וגם מפני מצב שכבר ענית ל-callback."""
+    if not cb_id:
+        return
+    try:
+        if text is None:
+            bot.answer_callback_query(cb_id)
+        else:
+            bot.answer_callback_query(cb_id, text=text, show_alert=show_alert)
+    except Exception as e:
+        s = str(e).lower()
+        if "query is too old" in s or "response timeout expired" in s or "query id is invalid" in s:
+            return
+        # לא נרצה להפיל את הבוט בגלל callback — מתעלמים גם משאר בעיות callback נפוצות.
+        if "bad request" in s:
+            return
+        raise
+
 def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
+    # אם הגיע cb_id — ננסה לענות מיד (במיוחד כשיש פעולות כבדות כמו refill)
+    if cb_id:
+        try:
+            safe_answer_callback(bot, cb_id)
+        except Exception:
+            pass
+
     try:
         curr_text = (message.text or message.caption or "")
-        if curr_text == (new_text or ""):
-            try:
-                if reply_markup is not None:
+        target_text = (new_text or "")
+
+        # אם הטקסט זהה — ננסה לעדכן רק markup (אם יש), ואז נצא
+        if curr_text == target_text:
+            if reply_markup is not None:
+                try:
                     bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-                if cb_id:
-                    bot.answer_callback_query(cb_id)
-                return
-            except Exception as e_rm:
-                if "message is not modified" in str(e_rm):
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-        bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        if cb_id:
-            bot.answer_callback_query(cb_id)
-    except Exception as e:
-        if "message is not modified" in str(e):
-            if cb_id:
-                bot.answer_callback_query(cb_id)
+                except Exception as e_rm:
+                    if "message is not modified" not in str(e_rm).lower():
+                        raise
             return
+
+        # אחרת נעדכן טקסט (וגם markup אם הועבר)
+        bot.edit_message_text(target_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            return
+
+        # אם ביקשת להציג הודעת שגיאה ב-callback — ננסה (גם אם כבר ענו קודם, זה לא יפיל)
         if cb_id and cb_info:
-            bot.answer_callback_query(cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
-        else:
-            raise
+            try:
+                safe_answer_callback(bot, cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
+                return
+            except Exception:
+                return
+        raise
 
 # ========= POSTING =========
 def format_post(product):
@@ -692,26 +718,43 @@ def _top_timestamp_gmt8() -> str:
     ts = datetime.now(timezone.utc) + timedelta(hours=8)
     return ts.strftime("%Y-%m-%d %H:%M:%S")
 
+def _top_timestamp_for_url(top_url: str) -> str:
+    """
+    חלק מה-Gateways החדשים של AliExpress (למשל /sync) מצפים ל-timestamp כ-Unix time (שניות).
+    לעומת זאת שערי TOP (router/rest) עובדים מצוין עם פורמט "YYYY-MM-DD HH:MM:SS" ב-GMT+8.
+    """
+    u = (top_url or "").lower()
+    if "/sync" in u:
+        return str(int(time.time()))
+    return _top_timestamp_gmt8()
+
 def _top_call(method_name: str, biz_params: dict) -> dict:
     if not AE_APP_KEY or not AE_APP_SECRET:
         raise RuntimeError("חסרים AE_APP_KEY / AE_APP_SECRET ב-ENV")
 
-    params = {
+    base_params = {
         "method": method_name,
         "app_key": AE_APP_KEY,
         "format": "json",
         "v": "2.0",
         "sign_method": "md5",
-        "timestamp": _top_timestamp_gmt8(),
         **{k: v for k, v in biz_params.items() if v is not None and v != ""},
     }
-    params["sign"] = _top_sign_md5(params, AE_APP_SECRET)
 
     last_err = None
 
     for top_url in AE_TOP_URL_CANDIDATES:
         try:
-            r = SESSION.post(top_url, data=params, timeout=30)
+            params = dict(base_params)
+            params["timestamp"] = _top_timestamp_for_url(top_url)
+            params["sign"] = _top_sign_md5(params, AE_APP_SECRET)
+
+            # /sync בדרך כלל עובד טוב יותר עם GET + params, בעוד router/rest עובד מצוין עם POST + form-data
+            if "/sync" in (top_url or "").lower():
+                r = SESSION.get(top_url, params=params, timeout=30)
+            else:
+                r = SESSION.post(top_url, data=params, timeout=30)
+
             r.raise_for_status()
             payload = r.json()
 
@@ -953,19 +996,24 @@ def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET
 
     if not _is_admin(c.message):
-        bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
+        safe_answer_callback(bot, c.id, "אין הרשאה.", show_alert=True)
         return
 
     data = c.data or ""
+    # חשוב: חייבים לענות ל-CallbackQuery מהר, אחרת Telegram מחזיר 400 (query is too old).
+    if data == "refill_now":
+        safe_answer_callback(bot, c.id, "⏳ מבצע מילוי מהאפילייט…")
+    else:
+        safe_answer_callback(bot, c.id)
     chat_id = c.message.chat.id
 
     if data == "publish_now":
         ok = send_next_locked("manual")
         if not ok:
-            bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
+            safe_answer_callback(bot, c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
             return
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
+                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu())
 
     elif data == "pending_status":
         with FILE_LOCK:
@@ -994,20 +1042,20 @@ def on_inline_click(c):
                 f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
             )
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=text, reply_markup=inline_menu(), parse_mode='HTML', cb_id=c.id)
+                          new_text=text, reply_markup=inline_menu(), parse_mode='HTML')
 
     elif data == "reload_merge":
         added, already, total_after = merge_from_data_into_pending()
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🔄 מיזוג הושלם.\nנוספו: {added}\nכבר היו בתור: {already}\nסה\"כ בתור כעת: {total_after}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "upload_source":
         EXPECTING_UPLOAD.add(getattr(c.from_user, "id", None))
         safe_edit_message(
             bot, chat_id=chat_id, message=c.message,
             new_text="שלח/י עכשיו קובץ CSV (כמסמך). הבוט ימפה עמודות, יעדכן workfile.csv וימזג אל התור.",
-            reply_markup=inline_menu(), cb_id=c.id
+            reply_markup=inline_menu()
         )
 
     elif data == "toggle_schedule":
@@ -1015,7 +1063,7 @@ def on_inline_click(c):
         state = "🕰️ מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 תמיד-פעיל"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"החלפתי מצב לשידור: {state}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data.startswith("delay_"):
         try:
@@ -1029,9 +1077,9 @@ def on_inline_click(c):
             mins = seconds // 60
             safe_edit_message(bot, chat_id=chat_id, message=c.message,
                               new_text=f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות). (מצב ידני)",
-                              reply_markup=inline_menu(), cb_id=c.id)
+                              reply_markup=inline_menu())
         except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
+            safe_answer_callback(bot, c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
 
     elif data == "toggle_auto_mode":
         current = read_auto_flag()
@@ -1040,49 +1088,49 @@ def on_inline_click(c):
         new_label = "🟢 מצב אוטומטי פעיל" if new_mode == "on" else "🔴 מצב ידני בלבד"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"החלפתי מצב שידור: {new_label}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "target_public":
         v = _load_preset(PUBLIC_PRESET_FILE)
         if v is None:
-            bot.answer_callback_query(c.id, "לא הוגדר יעד ציבורי. בחר דרך '🆕 בחר ערוץ ציבורי'.", show_alert=True)
+            safe_answer_callback(bot, c.id, "לא הוגדר יעד ציבורי. בחר דרך '🆕 בחר ערוץ ציבורי'.", show_alert=True)
             return
         CURRENT_TARGET = resolve_target(v)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🎯 עברתי לשדר ליעד הציבורי: {v}\n{details}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "target_private":
         v = _load_preset(PRIVATE_PRESET_FILE)
         if v is None:
-            bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. בחר דרך '🆕 בחר ערוץ פרטי'.", show_alert=True)
+            safe_answer_callback(bot, c.id, "לא הוגדר יעד פרטי. בחר דרך '🆕 בחר ערוץ פרטי'.", show_alert=True)
             return
         CURRENT_TARGET = resolve_target(v)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🔒 עברתי לשדר ליעד הפרטי: {v}\n{details}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "choose_public":
         EXPECTING_TARGET[c.from_user.id] = "public"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=("שלח/י *Forward* של הודעה מאותו ערוץ **ציבורי** כדי לשמור אותו כיעד.\n\n"
                                     "טיפ: פוסט בערוץ → ••• → Forward → בחר/י את הבוט."),
-                          reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id)
+                          reply_markup=inline_menu(), parse_mode='Markdown')
 
     elif data == "choose_private":
         EXPECTING_TARGET[c.from_user.id] = "private"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=("שלח/י *Forward* של הודעה מאותו ערוץ **פרטי** כדי לשמור אותו כיעד.\n\n"
                                     "חשוב: הוסף/י את הבוט כמנהל בערוץ הפרטי."),
-                          reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id)
+                          reply_markup=inline_menu(), parse_mode='Markdown')
 
     elif data == "choose_cancel":
         EXPECTING_TARGET.pop(getattr(c.from_user, "id", None), None)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "convert_next":
         try:
@@ -1091,10 +1139,10 @@ def on_inline_click(c):
             safe_edit_message(
                 bot, chat_id=chat_id, message=c.message,
                 new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
-                reply_markup=inline_menu(), cb_id=c.id
+                reply_markup=inline_menu()
             )
         except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
+            safe_answer_callback(bot, c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
 
     elif data == "reset_from_data":
         src = read_products(DATA_CSV)
@@ -1102,21 +1150,21 @@ def on_inline_click(c):
             write_products(PENDING_CSV, src)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🔁 התור אופס ומתחיל מחדש ({len(src)} פריטים) מהקובץ הראשי.",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "delete_source_from_pending":
         removed, left = delete_source_rows_from_pending()
         safe_edit_message(
             bot, chat_id=chat_id, message=c.message,
             new_text=f"🗑️ הוסר מהתור: {removed} פריטים שנמצאו ב-workfile.csv\nנשארו בתור: {left}",
-            reply_markup=inline_menu(), cb_id=c.id
+            reply_markup=inline_menu()
         )
 
     elif data == "delete_source_file":
         ok = delete_source_csv_file()
         msg_txt = "🧹 workfile.csv אופס לריק (נשמרו רק כותרות). התור לא שונה." if ok else "שגיאה במחיקת workfile.csv"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id)
+                          new_text=msg_txt, reply_markup=inline_menu())
 
     elif data == "refill_now":
         max_needed = 80
@@ -1129,10 +1177,10 @@ def on_inline_click(c):
             f"דף אחרון שנבדק: {last_page}\n"
             f"שגיאה/מידע: {last_error}"
         )
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu(), cb_id=c.id)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu())
 
     else:
-        bot.answer_callback_query(c.id)
+        safe_answer_callback(bot, c.id)
 
 # ========= FORWARD HANDLER =========
 @bot.message_handler(
