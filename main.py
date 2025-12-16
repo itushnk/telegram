@@ -21,7 +21,7 @@ import hashlib
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-16k")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17a")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -1665,16 +1665,12 @@ if __name__ == "__main__":
     t2 = threading.Thread(target=refill_daemon, daemon=True)
     t2.start()
 
+    # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
     while True:
         try:
-            while True:
-    try:
-        bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-    except Exception as e:
-        log_error(f"Polling crashed: {e}")
-        time.sleep(5)
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
         except Exception as e:
             msg = str(e)
             wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-            print(f"[{_now_il().strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
+            log_error(f"Polling error: {e}. Retrying in {wait}s...")
             time.sleep(wait)
