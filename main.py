@@ -21,7 +21,7 @@ import hashlib
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17b")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17d")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -37,6 +37,40 @@ except Exception:
     pass
 
 LOG_PATH = os.path.join(LOG_DIR, "bot.log")
+
+STATE_PATH = os.path.join(LOG_DIR, "bot_state.json")
+
+def _load_state():
+    try:
+        if not os.path.exists(STATE_PATH):
+            return {}
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _save_state(state: dict):
+    try:
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state or {}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_PATH)
+    except Exception:
+        pass
+
+BOT_STATE = _load_state()
+
+def _get_state_str(key: str, default: str = "") -> str:
+    v = BOT_STATE.get(key)
+    if v is None:
+        v = default
+    return str(v or "").strip()
+
+def _set_state_str(key: str, value: str):
+    BOT_STATE[key] = (value or "").strip()
+    _save_state(BOT_STATE)
+
+
 
 _logger = logging.getLogger("bot")
 _logger.setLevel(logging.INFO)
@@ -166,6 +200,23 @@ AE_REFILL_MIN_QUEUE = int(os.environ.get("AE_REFILL_MIN_QUEUE", "30") or "30")
 AE_REFILL_MAX_PAGES = int(os.environ.get("AE_REFILL_MAX_PAGES", "3") or "3")
 AE_REFILL_PAGE_SIZE = int(os.environ.get("AE_REFILL_PAGE_SIZE", "50") or "50")
 AE_REFILL_SORT = (os.environ.get("AE_REFILL_SORT", "LAST_VOLUME_DESC") or "LAST_VOLUME_DESC").strip().upper()
+
+# Optional price filtering (ILS buckets) for refill results.
+# Example: AE_PRICE_BUCKETS=1-5,5-10,10-20,20-50,50+
+AE_PRICE_BUCKETS_RAW_DEFAULT = (os.environ.get("AE_PRICE_BUCKETS", "") or os.environ.get("AE_PRICE_FILTER", "") or "").strip()
+# Allow runtime override via inline buttons (persisted in BOT_STATE)
+AE_PRICE_BUCKETS_RAW = _get_state_str("price_buckets_raw", AE_PRICE_BUCKETS_RAW_DEFAULT)
+AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
+
+def set_price_buckets_raw(raw: str):
+    global AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS
+    raw = (raw or "").strip()
+    _set_state_str("price_buckets_raw", raw)
+    AE_PRICE_BUCKETS_RAW = raw
+    AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
+
+# Keep last refill stats for debugging
+LAST_REFILL_STATS = {"added": 0, "dup": 0, "skipped_no_link": 0, "price_filtered": 0, "last_error": None, "last_page": 0}
 
 # ========= INIT =========
 if not BOT_TOKEN:
@@ -303,6 +354,57 @@ def usd_to_ils(price_text: str, rate: float) -> str:
         return ""
     ils = round(num * rate)
     return str(int(ils))
+
+def _parse_price_buckets(raw: str):
+    """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
+    Returns list of (min_inclusive, max_exclusive_or_None). Prices are assumed to be in ILS
+    (after USD->ILS conversion in the mapped rows).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    buckets = []
+    for part in raw.split(","):
+        part = (part or "").strip()
+        if not part:
+            continue
+        part = part.replace("–", "-").replace("—", "-")  # common dashes
+        if part.endswith("+"):
+            mn = _extract_float(part[:-1])
+            if mn is not None:
+                buckets.append((float(mn), None))
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            mn = _extract_float(a)
+            mx = _extract_float(b)
+            if mn is None or mx is None:
+                continue
+            # normalize if reversed
+            if mx < mn:
+                mn, mx = mx, mn
+            buckets.append((float(mn), float(mx)))
+            continue
+        # single number -> treat as exact bucket [n, n+1)
+        n = _extract_float(part)
+        if n is not None:
+            buckets.append((float(n), float(n) + 1.0))
+    return buckets
+
+def _price_in_buckets(price_ils: float, buckets) -> bool:
+    if not buckets:
+        return True
+    if price_ils is None:
+        return False
+    for mn, mx in buckets:
+        if mx is None:
+            if price_ils >= mn:
+                return True
+        else:
+            if price_ils >= mn and price_ils < mx:
+                return True
+    return False
+
 
 def normalize_row_keys(row):
     out = dict(row)
@@ -577,6 +679,15 @@ def _strip_html(s: str) -> str:
     except Exception:
         return s or ""
 
+def _count_buttons(markup) -> int:
+    try:
+        if not markup or not getattr(markup, 'keyboard', None):
+            return 0
+        return sum(len(row) for row in markup.keyboard if row)
+    except Exception:
+        return 0
+
+
 
 def _canonical_item_url(item_id: str) -> str:
     item_id = str(item_id or "").strip()
@@ -683,8 +794,15 @@ def post_to_channel(product) -> bool:
             visible_total += vis + 1
 
         caption = "\n".join(caption_lines).strip()
+        # Telegram caption hard limit is 1024 chars (raw, including hidden URLs in HTML).
+        # If the caption is still too long, truncate safely by dropping lines from the bottom.
+        while len(caption) > 1024 and len(caption_lines) > 1:
+            caption_lines.pop()
+            caption = "\n".join(caption_lines)
+        if len(caption) > 1024:
+            caption = caption[:1020] + "…"
 
-        log_info(f"POST start item={product.get('ItemId','')} media={'video' if (video_url.startswith('http') and video_url.endswith('.mp4')) else 'photo'} vis_len={len(_strip_html(caption))} target={target}")
+        log_info(f"POST start item={product.get('ItemId','')} media={'video' if video_url.startswith('http') else 'photo'} raw_len={len(caption)} vis_len={len(_strip_html(caption))} buttons={_count_buttons(buttons)} target={target}")
 
         if video_url.startswith("http"):
             try:
@@ -1038,6 +1156,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
     added = 0
     dup = 0
     skipped_no_link = 0
+    skipped_price = 0
     last_error = None
     last_page = 0
     last_resp = None
@@ -1059,6 +1178,14 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
             new_rows = []
             for p in products:
                 row = _map_affiliate_product_to_row(p)
+
+                # Price bucket filter (SalePrice is already ILS string in our rows)
+                if AE_PRICE_BUCKETS:
+                    sale_num = _extract_float(row.get("SalePrice") or "")
+                    if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                        skipped_price += 1
+                        continue
+
                 if not row.get("BuyLink"):
                     skipped_no_link += 1
                     continue
@@ -1096,9 +1223,54 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
         elif last_resp is not None:
             rc, rm, n = last_resp
             last_error = f"0 מוצרים (resp_code={rc}, resp_msg={rm}, ship_to={AE_SHIP_TO_COUNTRY}, sort={AE_REFILL_SORT})"
+    # update last stats snapshot
+    try:
+        LAST_REFILL_STATS.update({
+            'added': added,
+            'dup': dup,
+            'skipped_no_link': skipped_no_link,
+            'price_filtered': skipped_price,
+            'last_error': last_error,
+            'last_page': last_page,
+        })
+    except Exception:
+        pass
     return added, dup, total_after, last_page, last_error
 
 # ========= INLINE MENU =========
+PRICE_BUCKET_PRESETS = [
+    ("1-5", "1-5"),
+    ("5-10", "5-10"),
+    ("10-20", "10-20"),
+    ("20-50", "20-50"),
+    ("50+", "50+"),
+]
+
+def _active_price_bucket_ids():
+    raw = (AE_PRICE_BUCKETS_RAW or "").strip()
+    if not raw:
+        return set()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return set(parts)
+
+def _price_filter_menu_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    active = _active_price_bucket_ids()
+
+    btns = []
+    for label, bid in PRICE_BUCKET_PRESETS:
+        mark = "✅ " if bid in active else ""
+        suffix = bid.replace("-", "_").replace("+", "p")  # 50+ -> 50p
+        btns.append(types.InlineKeyboardButton(f"{mark}₪ {label}", callback_data="pf_" + suffix))
+    kb.add(*btns)
+
+    kb.add(
+        types.InlineKeyboardButton("🧹 נקה סינון", callback_data="pf_clear"),
+        types.InlineKeyboardButton("⬅️ חזרה", callback_data="pf_back"),
+    )
+    kb.add(types.InlineKeyboardButton(f"מצב נוכחי: {AE_PRICE_BUCKETS_RAW or 'ללא'}", callback_data="noop_info"))
+    return kb
+
 def inline_menu():
     kb = types.InlineKeyboardMarkup(row_width=3)
 
@@ -1106,6 +1278,10 @@ def inline_menu():
         types.InlineKeyboardButton("📢 פרסם עכשיו", callback_data="publish_now"),
         types.InlineKeyboardButton("📊 סטטוס שידור", callback_data="pending_status"),
         types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
+    )
+
+    kb.add(
+        types.InlineKeyboardButton("💸 סינון מחיר", callback_data="pf_menu"),
     )
 
     kb.add(
@@ -1150,7 +1326,7 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
-    global POST_DELAY_SECONDS, CURRENT_TARGET
+    global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS
 
     if not _is_admin(c.message):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
@@ -1195,6 +1371,40 @@ def on_inline_click(c):
             )
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=text, reply_markup=inline_menu(), parse_mode='HTML', cb_id=c.id)
+
+    elif data == "pf_menu":
+        txt = f'💸 סינון מחיר (בש"ח)\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"}\nבחר טווחים:'
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=c.id)
+
+    elif data == "pf_back":
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="✅ תפריט ראשי", reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "pf_clear":
+        with FILE_LOCK:
+            set_price_buckets_raw("")
+        bot.answer_callback_query(c.id, "סינון מחיר בוטל.")
+        txt = '💸 סינון מחיר (בש"ח)\nמצב נוכחי: ללא\nבחר טווחים:'
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=None)
+
+    elif data.startswith("pf_"):
+        suffix = data[3:]  # 1_5 or 50p
+        bid = "50+" if suffix == "50p" else suffix.replace("_", "-")
+        allowed = {b for _, b in PRICE_BUCKET_PRESETS}
+        if bid not in allowed:
+            bot.answer_callback_query(c.id, "טווח לא מוכר.", show_alert=True)
+            return
+        active = _active_price_bucket_ids()
+        if bid in active:
+            active.remove(bid)
+        else:
+            active.add(bid)
+        order = [b for _, b in PRICE_BUCKET_PRESETS]
+        raw = ",".join([b for b in order if b in active])
+        with FILE_LOCK:
+            set_price_buckets_raw(raw)
+        bot.answer_callback_query(c.id, f"עודכן: {raw or 'ללא'}")
+        txt = f'💸 סינון מחיר (בש"ח)\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"}\nבחר טווחים:'
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=None)
 
     elif data == "reload_merge":
         added, already, total_after = merge_from_data_into_pending()
@@ -1471,7 +1681,7 @@ def cmd_start(msg):
     _save_admin_chat_id(msg.chat.id)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
-@bot.message_handler(commands=['pending_status'])
+@bot.message_handler(commands=['pending_status','queue'])
 def pending_status_cmd(msg):
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
@@ -1494,6 +1704,12 @@ def pending_status_cmd(msg):
         parse_mode="HTML"
     )
 
+@bot.message_handler(commands=['queue'])
+def queue_cmd(msg):
+    # Alias for /pending_status
+    return pending_status_cmd(msg)
+
+
 
 @bot.message_handler(commands=['version'])
 def cmd_version(msg):
@@ -1504,7 +1720,7 @@ def cmd_version(msg):
     fp = _code_fingerprint()
     bot.reply_to(
         msg,
-        f"<b>Version</b>: {CODE_VERSION}\n<b>Fingerprint</b>: {fp}\n<b>Commit</b>: {commit}\n<b>Instance</b>: {socket.gethostname()}\n<b>Target</b>: {CURRENT_TARGET}",
+        f"<b>Version</b>: {CODE_VERSION}\n<b>Fingerprint</b>: {fp}\n<b>Commit</b>: {commit}\n<b>Instance</b>: {socket.gethostname()}\n<b>Target</b>: {CURRENT_TARGET}\n<b>PriceFilter</b>: {AE_PRICE_BUCKETS_RAW or 'none'}",
         parse_mode="HTML",
     )
 
@@ -1639,6 +1855,7 @@ if __name__ == "__main__":
     # Extra runtime diagnostics (safe)
     log_info(f"[CFG] PUBLIC_CHANNEL={os.environ.get('PUBLIC_CHANNEL', '')} | CURRENT_TARGET={CURRENT_TARGET}")
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
+    log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
