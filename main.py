@@ -1665,7 +1665,6 @@ if __name__ == "__main__":
     t2 = threading.Thread(target=refill_daemon, daemon=True)
     t2.start()
 
-if __name__ == "__main__":
     # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
     while True:
         try:
