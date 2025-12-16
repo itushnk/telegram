@@ -451,17 +451,42 @@ def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup
         raise
 
 # ========= POSTING =========
+def _fit_caption(text: str, max_chars: int = 1000) -> str:
+    # Telegram captions are limited to 0-1024 characters after entities parsing.
+    # We keep a small safety margin.
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return (text[:max_chars - 1].rstrip() + "…")
+
+def _build_post_buttons(buy_link: str, join_link: str):
+    # Keep long affiliate URLs OUT of the caption so photo+post stays as ONE message.
+    try:
+        markup = types.InlineKeyboardMarkup()
+        row = []
+        if buy_link:
+            row.append(types.InlineKeyboardButton("🛍 להזמנה", url=buy_link))
+        if join_link:
+            row.append(types.InlineKeyboardButton("📲 הצטרפות לערוץ", url=join_link))
+        if row:
+            markup.row(*row)
+            return markup
+    except Exception:
+        pass
+    return None
+
 def format_post(product):
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
-    title = product.get('Title', '')
-    original_price = product.get('OriginalPrice', '')
-    sale_price = product.get('SalePrice', '')
-    discount = product.get('Discount', '')
-    rating = product.get('Rating', '')
-    orders = product.get('Orders', '')
-    buy_link = product.get('BuyLink', '')
-    coupon = product.get('CouponCode', '')
+    title = (product.get('Title', '') or '').strip()
+    original_price = (product.get('OriginalPrice', '') or '').strip()
+    sale_price = (product.get('SalePrice', '') or '').strip()
+    discount = (product.get('Discount', '') or '').strip()
+    rating = (product.get('Rating', '') or '').strip()
+    orders = (product.get('Orders', '') or '').strip()
+    buy_link = (product.get('BuyLink', '') or '').strip()
+    coupon = (product.get('CouponCode', '') or '').strip()
 
     opening = (product.get('Opening') or '').strip()
     strengths_src = (product.get("Strengths") or "").strip()
@@ -470,15 +495,13 @@ def format_post(product):
     orders_num = safe_int(orders, default=0)
     orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
     discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
-    coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
+    coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if coupon else ""
 
     lines = []
     if opening:
-        lines.append(opening)
-        lines.append("")
+        lines += [opening, ""]
     if title:
-        lines.append(title)
-        lines.append("")
+        lines += [title, ""]
 
     if strengths_src:
         for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
@@ -486,11 +509,11 @@ def format_post(product):
                 lines.append(part)
         lines.append("")
 
-    price_line = f'💰 מחיר מבצע: <a href="{buy_link}">{sale_price} ש"ח</a> (מחיר מקורי: {original_price} ש"ח)'
+    price_line = f"💰 מחיר מבצע: {sale_price} ש\"ח (מחיר מקורי: {original_price} ש\"ח)"
     lines += [
         price_line,
         discount_text,
-        f"⭐ דירוג: {rating_percent}",
+        f"⭐️ דירוג: {rating_percent}",
         f"📦 {orders_text}",
         "🚚 משלוח חינם מעל 38 ש\"ח או 7.49 ש\"ח",
     ]
@@ -500,23 +523,26 @@ def format_post(product):
 
     lines += [
         "",
-        f'להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>',
+        "להזמנה מהירה👈 לחצו על הכפתור למטה",
         "",
         f"מספר פריט: {item_id}",
-        'להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>',
-        "",
-        "👇🛍הזמינו עכשיו🛍👇",
-        f'<a href="{buy_link}">לחיצה וזה בדרך </a>',
     ]
 
-    # לא מסננים שורות ריקות לגמרי, כדי לשמור על ריווח נעים
-    post = "\n".join([l if l is not None else "" for l in lines])
-    return post, image_url
+    if PUBLIC_CHANNEL:
+        lines += ["להצטרפות לערוץ לחצו כאן👈 קליק והצטרפתם"]
+
+    lines += ["", "👇🛍הזמינו עכשיו🛍👇", "לחצו על הכפתור למטה להזמנה"]
+
+    post = "\n".join([l if l is not None else "" for l in lines if l != ""])
+    post = _fit_caption(post)
+
+    return post, image_url, buy_link
 
 def post_to_channel(product):
     try:
-        post_text, image_url = format_post(product)
+        post_text, image_url, buy_link = format_post(product)
         video_url = (product.get('Video Url') or "").strip()
+        markup = _build_post_buttons(buy_link, PUBLIC_CHANNEL)
         target = resolve_target(CURRENT_TARGET)
 
         # Telegram caption limit: captions on photo/video are 0-1024 chars after entities parsing.
@@ -527,18 +553,18 @@ def post_to_channel(product):
             if video_url.endswith('.mp4') and video_url.startswith("http"):
                 resp = SESSION.get(video_url, timeout=30)
                 resp.raise_for_status()
-                bot.send_video(target, resp.content, caption=caption, supports_streaming=True)
+                bot.send_video(target, resp.content, caption=caption, supports_streaming=True, reply_markup=markup)
             else:
                 resp = SESSION.get(image_url, timeout=30)
                 resp.raise_for_status()
-                bot.send_photo(target, resp.content, caption=caption)
+                bot.send_photo(target, resp.content, caption=caption, reply_markup=markup)
         except Exception as _send_e:
             # אם ה-caption ארוך מדי ל-photo/video (0-1024 תווים), ננסה הודעת טקסט אחת עם preview של התמונה למעלה.
             # זה שומר על "הודעה אחת" (עם תמונה למעלה), כל עוד הטקסט <= 4096 תווים.
             msg = str(_send_e).lower()
             if 'caption' in msg and ('too long' in msg or '1024' in msg) and len(caption) <= 4096 and image_url:
                 preview_text = f'<a href="{image_url}">&#8205;</a>' + html.escape(caption)
-                bot.send_message(target, preview_text, parse_mode="HTML", disable_web_page_preview=False)
+                bot.send_message(target, preview_text, parse_mode="HTML", disable_web_page_preview=False, reply_markup=markup)
             else:
                 raise
     except Exception as e:
