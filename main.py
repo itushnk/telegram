@@ -21,8 +21,7 @@ import hashlib
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-16i")
-
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-16j")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -115,10 +114,11 @@ _env_top_url  = (os.environ.get("AE_TOP_URL", "") or "").strip()      # שער �
 _env_top_urls = (os.environ.get("AE_TOP_URLS", "") or "").strip()    # רשימה מופרדת בפסיקים (אם הוגדרה)
 
 _default_candidates = [
+    "https://api-sg.aliexpress.com/sync",       # Newer AliExpress gateway (/sync)
     "https://api.taobao.com/router/rest",        # Overseas (US)
     "https://gw.api.taobao.com/router/rest",     # Legacy gateway
     "https://eco.taobao.com/router/rest",        # Alt/legacy
-    "https://de-api.aliexpress.com/router/rest", # Overseas (EU)
+    # "https://de-api.aliexpress.com/router/rest", # EU gateway (often returns isv.appkey-not-exists)
 ]
 
 AE_TOP_URL_CANDIDATES = []
@@ -885,7 +885,7 @@ def _top_call(method_name: str, biz_params: dict) -> dict:
 
     for top_url in AE_TOP_URL_CANDIDATES:
         try:
-            if "/sync" in top_url.rstrip("/"):
+            if "/sync" in (top_url or "").lower().rstrip("/"):
                 r = SESSION.get(top_url, params=params, timeout=30)
                 if r.status_code in (405, 414):
                     r = SESSION.post(top_url, data=params, timeout=30)
