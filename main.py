@@ -1,19 +1,8 @@
-# ========= HTML HELPERS =========
-import html as _html
-def _html_text(s) -> str:
-    """Escape text for Telegram HTML parse_mode."""
-    return _html.escape(str(s or ""), quote=False)
-
-def _html_attr(s) -> str:
-    """Escape attribute values (href="...") safely."""
-    return _html.escape(str(s or ""), quote=True)
-
-
 # -*- coding: utf-8 -*-
 """
 main.py — Telegram Post Bot + AliExpress Affiliate refill
 
-Version: 2025-12-16e
+Version: 2025-12-15a
 Changes vs previous:
 - Fix TOP timestamp to GMT+8 (per TOP gateway requirement)
 - Raise on TOP error_response (so you finally see the real error instead of '0 products' and None)
@@ -21,53 +10,12 @@ Changes vs previous:
 """
 
 import os, sys
+import html
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
-
-
-
-import logging
-from logging.handlers import RotatingFileHandler
-
-LOG_LEVEL = (os.environ.get("LOG_LEVEL", "INFO") or "INFO").upper()
-
-def setup_logging(log_file: str | None = None):
-    """Configure logs to stdout (Railway Logs) and optional rotating file under BOT_DATA_DIR."""
-    level = getattr(logging, LOG_LEVEL, logging.INFO)
-    root = logging.getLogger()
-    root.setLevel(level)
-
-    # Clear existing handlers to avoid duplicates on reloads
-    for h in list(root.handlers):
-        root.removeHandler(h)
-
-    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(level)
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
-
-    if log_file:
-        try:
-            fh = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-            fh.setLevel(level)
-            fh.setFormatter(fmt)
-            root.addHandler(fh)
-        except Exception as e:
-            print(f"[WARN] Failed to init file logger: {e}", flush=True)
-
-    # Make sure telebot internal logger follows our level
-    try:
-        import telebot as _tb
-        _tb.logger.setLevel(level)
-    except Exception:
-        pass
-
-    return logging.getLogger("bot")
 
 import csv
 import time
@@ -86,27 +34,6 @@ from telebot import types
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
-
-
-os.makedirs(BASE_DIR, exist_ok=True)
-
-LOG_FILE = os.path.join(BASE_DIR, "bot.log")
-LOGGER = setup_logging(LOG_FILE)
-
-def _tail_log_lines(max_lines: int = 200) -> str:
-    """Return last N lines from rotating log file (for /logs in Telegram)."""
-    try:
-        if not os.path.exists(LOG_FILE):
-            return "(log file does not exist yet)"
-        with open(LOG_FILE, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(size - 65536, 0), os.SEEK_SET)
-            data = f.read().decode("utf-8", errors="replace")
-        lines = data.splitlines()[-max_lines:]
-        return "\n".join(lines) if lines else "(no log lines)"
-    except Exception as e:
-        return f"(failed reading logs: {e})"
 
 # ========= CONFIG (Telegram) =========
 BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or "").strip()  # חובה ב-ENV
@@ -138,6 +65,7 @@ _env_top_url  = (os.environ.get("AE_TOP_URL", "") or "").strip()      # שער �
 _env_top_urls = (os.environ.get("AE_TOP_URLS", "") or "").strip()    # רשימה מופרדת בפסיקים (אם הוגדרה)
 
 _default_candidates = [
+    "https://api-sg.aliexpress.com/sync",       # Newer business API gateway
     "https://api.taobao.com/router/rest",        # Overseas (US)
     "https://gw.api.taobao.com/router/rest",     # Legacy gateway
     "https://eco.taobao.com/router/rest",        # Alt/legacy
@@ -466,49 +394,99 @@ def is_quiet_now(now: datetime | None = None) -> bool:
     return not should_broadcast(now) if is_schedule_enforced() else False
 
 # ========= SAFE EDIT =========
+def safe_answer_callback(bot, cb_id: str | None, text: str | None = None, show_alert: bool = False) -> None:
+    """מגן מפני 400: query is too old / query id invalid וגם מפני מצב שכבר ענית ל-callback."""
+    if not cb_id:
+        return
+    try:
+        if text is None:
+            bot.answer_callback_query(cb_id)
+        else:
+            bot.answer_callback_query(cb_id, text=text, show_alert=show_alert)
+    except Exception as e:
+        s = str(e).lower()
+        if "query is too old" in s or "response timeout expired" in s or "query id is invalid" in s:
+            return
+        # לא נרצה להפיל את הבוט בגלל callback — מתעלמים גם משאר בעיות callback נפוצות.
+        if "bad request" in s:
+            return
+        raise
+
 def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
+    # אם הגיע cb_id — ננסה לענות מיד (במיוחד כשיש פעולות כבדות כמו refill)
+    if cb_id:
+        try:
+            safe_answer_callback(bot, cb_id)
+        except Exception:
+            pass
+
     try:
         curr_text = (message.text or message.caption or "")
-        if curr_text == (new_text or ""):
-            try:
-                if reply_markup is not None:
+        target_text = (new_text or "")
+
+        # אם הטקסט זהה — ננסה לעדכן רק markup (אם יש), ואז נצא
+        if curr_text == target_text:
+            if reply_markup is not None:
+                try:
                     bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-                if cb_id:
-                    bot.answer_callback_query(cb_id)
-                return
-            except Exception as e_rm:
-                if "message is not modified" in str(e_rm):
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-        bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        if cb_id:
-            bot.answer_callback_query(cb_id)
-    except Exception as e:
-        if "message is not modified" in str(e):
-            if cb_id:
-                bot.answer_callback_query(cb_id)
+                except Exception as e_rm:
+                    if "message is not modified" not in str(e_rm).lower():
+                        raise
             return
+
+        # אחרת נעדכן טקסט (וגם markup אם הועבר)
+        bot.edit_message_text(target_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            return
+
+        # אם ביקשת להציג הודעת שגיאה ב-callback — ננסה (גם אם כבר ענו קודם, זה לא יפיל)
         if cb_id and cb_info:
-            bot.answer_callback_query(cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
-        else:
-            raise
+            try:
+                safe_answer_callback(bot, cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
+                return
+            except Exception:
+                return
+        raise
 
 # ========= POSTING =========
+def _fit_caption(text: str, max_chars: int = 1000) -> str:
+    # Telegram captions are limited to 0-1024 characters after entities parsing.
+    # We keep a small safety margin.
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return (text[:max_chars - 1].rstrip() + "…")
+
+def _build_post_buttons(buy_link: str, join_link: str):
+    # Keep long affiliate URLs OUT of the caption so photo+post stays as ONE message.
+    try:
+        markup = types.InlineKeyboardMarkup()
+        row = []
+        if buy_link:
+            row.append(types.InlineKeyboardButton("🛍 להזמנה", url=buy_link))
+        if join_link:
+            row.append(types.InlineKeyboardButton("📲 הצטרפות לערוץ", url=join_link))
+        if row:
+            markup.row(*row)
+            return markup
+    except Exception:
+        pass
+    return None
+
 def format_post(product):
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
-    title = product.get('Title', '')
-    original_price = product.get('OriginalPrice', '')
-    sale_price = product.get('SalePrice', '')
-    discount = product.get('Discount', '')
-    rating = product.get('Rating', '')
-    orders = product.get('Orders', '')
+    title = (product.get('Title', '') or '').strip()
+    original_price = (product.get('OriginalPrice', '') or '').strip()
+    sale_price = (product.get('SalePrice', '') or '').strip()
+    discount = (product.get('Discount', '') or '').strip()
+    rating = (product.get('Rating', '') or '').strip()
+    orders = (product.get('Orders', '') or '').strip()
     buy_link = (product.get('BuyLink', '') or '').strip()
-    coupon = product.get('CouponCode', '')
+    coupon = (product.get('CouponCode', '') or '').strip()
 
     opening = (product.get('Opening') or '').strip()
     strengths_src = (product.get("Strengths") or "").strip()
@@ -517,23 +495,21 @@ def format_post(product):
     orders_num = safe_int(orders, default=0)
     orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
     discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
-    coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
+    coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if coupon else ""
 
     lines = []
     if opening:
-        lines.append(str(opening))
-        lines.append("")
+        lines += [opening, ""]
     if title:
-        lines.append(str(title))
-        lines.append("")
+        lines += [title, ""]
 
     if strengths_src:
         for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
             if part:
-                lines.append(str(part))
+                lines.append(part)
         lines.append("")
 
-    price_line = f'💰 מחיר מבצע: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
+    price_line = f"💰 מחיר מבצע: {sale_price} ש\"ח (מחיר מקורי: {original_price} ש\"ח)"
     lines += [
         price_line,
         discount_text,
@@ -547,101 +523,65 @@ def format_post(product):
 
     lines += [
         "",
+        "להזמנה מהירה👈 לחצו על הכפתור למטה",
+        "",
         f"מספר פריט: {item_id}",
     ]
 
-    # לא מסננים שורות ריקות לגמרי, כדי לשמור על ריווח נעים
-    post = "\n".join([l if l is not None else "" for l in lines])
-    return post, image_url
+    if PUBLIC_CHANNEL:
+        lines += ["להצטרפות לערוץ לחצו כאן👈 קליק והצטרפתם"]
 
-def _trim_caption_html(caption: str, limit: int = 1024) -> str:
-    """Keep caption within Telegram limit; preserve last two lines (CTA)."""
-    if not caption:
-        return caption
-    if len(caption) <= limit:
-        return caption
-    parts = caption.split("\n")
-    tail = "\n".join(parts[-2:]) if len(parts) >= 2 else caption
-    head = "\n".join(parts[:-2])
-    if len(tail) >= limit:
-        return tail[:limit]
-    max_head = limit - len(tail) - 2
-    if max_head < 0:
-        max_head = 0
-    head = head[:max_head].rstrip()
-    return (head + "\n\n" + tail).strip()
+    lines += ["", "👇🛍הזמינו עכשיו🛍👇", "לחצו על הכפתור למטה להזמנה"]
 
+    post = "\n".join([l if l is not None else "" for l in lines if l != ""])
+    post = _fit_caption(post)
 
-URL_RE = re.compile(r"https?://\S+")
-def _strip_urls(text: str) -> str:
-    if not text:
-        return ""
-    t = URL_RE.sub("", text)
-    t = re.sub(r"\(\s*\)", "", t)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = "\n".join([ln.rstrip() for ln in t.splitlines()])
-    return t.strip()
-
+    return post, image_url, buy_link
 
 def post_to_channel(product):
     try:
-        post_text, image_url = format_post(product)
+        post_text, image_url, buy_link = format_post(product)
         video_url = (product.get('Video Url') or "").strip()
+        markup = _build_post_buttons(buy_link, PUBLIC_CHANNEL)
         target = resolve_target(CURRENT_TARGET)
 
-        promo_url = (product.get('BuyLink', '') or '').strip()
-        join_url = (PUBLIC_CHANNEL or '').strip() or "https://t.me/+LlMY8B9soOdhNmZk"
-
-        order_text = "להזמנה מהירה👈 לחצו כאן"
-        join_text  = "להצטרפות לערוץ לחצו כאן👈 קליק והצטרפתם"
-
-        caption = (post_text or "").strip()
-        caption = _strip_urls(caption)
-        caption = (caption + "\n\n" if caption else "") + order_text + "\n" + join_text
-
-        raw_len = len(caption)
-        caption = _trim_caption_html(caption, 1024)
-        trimmed = (len(caption) != raw_len)
-
-        kb = types.InlineKeyboardMarkup()
-        if promo_url:
-            kb.add(types.InlineKeyboardButton("🛍 להזמנה", url=promo_url))
-        if join_url:
-            kb.add(types.InlineKeyboardButton("📲 הצטרפות לערוץ", url=join_url))
-
-        item_id = (product.get("ItemId") or "").strip()
-        media_kind = "video" if (video_url.endswith(".mp4") and video_url.startswith("http")) else "photo"
-        LOGGER.info("POST start item=%s target=%s media=%s caption_len=%s trimmed=%s has_promo=%s has_join=%s",
-                    item_id, target, media_kind, len(caption), trimmed, bool(promo_url), bool(join_url))
-
-        if media_kind == "video":
-            resp = SESSION.get(video_url, timeout=30)
-            resp.raise_for_status()
-            LOGGER.info("POST media_download ok kind=video bytes=%s status=%s", len(resp.content), resp.status_code)
-            bot.send_video(target, resp.content, caption=caption, reply_markup=kb, parse_mode=None)
-        else:
-            resp = SESSION.get(image_url, timeout=30)
-            resp.raise_for_status()
-            LOGGER.info("POST media_download ok kind=photo bytes=%s status=%s", len(resp.content), resp.status_code)
-            bot.send_photo(target, resp.content, caption=caption, reply_markup=kb, parse_mode=None)
-
-        LOGGER.info("POST sent item=%s", item_id)
-
-    except Exception:
-        LOGGER.exception("POST failed")
+        # Telegram caption limit: captions on photo/video are 0-1024 chars after entities parsing.
+        # אם הטקסט ארוך מדי, לא ניתן להכניס את כולו כ-caption. במקום "לפצל" לשתי הודעות,
+        # נשלח הודעת טקסט אחת עם preview של התמונה למעלה (עד 4096 תווים בטקסט).
+        caption = post_text or ""
+        try:
+            if video_url.endswith('.mp4') and video_url.startswith("http"):
+                resp = SESSION.get(video_url, timeout=30)
+                resp.raise_for_status()
+                bot.send_video(target, resp.content, caption=caption, supports_streaming=True, reply_markup=markup)
+            else:
+                resp = SESSION.get(image_url, timeout=30)
+                resp.raise_for_status()
+                bot.send_photo(target, resp.content, caption=caption, reply_markup=markup)
+        except Exception as _send_e:
+            # אם ה-caption ארוך מדי ל-photo/video (0-1024 תווים), ננסה הודעת טקסט אחת עם preview של התמונה למעלה.
+            # זה שומר על "הודעה אחת" (עם תמונה למעלה), כל עוד הטקסט <= 4096 תווים.
+            msg = str(_send_e).lower()
+            if 'caption' in msg and ('too long' in msg or '1024' in msg) and len(caption) <= 4096 and image_url:
+                preview_text = f'<a href="{image_url}">&#8205;</a>' + html.escape(caption)
+                bot.send_message(target, preview_text, parse_mode="HTML", disable_web_page_preview=False, reply_markup=markup)
+            else:
+                raise
+    except Exception as e:
+        print(f"[{_now_il().strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}", flush=True)
 
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
-            LOGGER.info("QUEUE empty source=%s", source)
+            print(f"[{_now_il()}] {source}: no pending", flush=True)
             return False
 
         item = pending[0]
         item_id = (item.get("ItemId") or "").strip()
         title = (item.get("Title") or "").strip()[:120]
-        LOGGER.info("QUEUE send_next source=%s item=%s title=%s", source, item_id, title)
+        print(f"[{_now_il()}] {source}: sending ItemId={item_id} | Title={title}", flush=True)
 
         try:
             post_to_channel(item)
@@ -660,7 +600,7 @@ def send_next_locked(source: str = "loop") -> bool:
                 print(f"[{_now_il()}] {source}: write FAILED permanently: {e2}", flush=True)
                 return True
 
-        LOGGER.info("QUEUE advanced source=%s item=%s", source, item_id)
+        print(f"[{_now_il()}] {source}: sent & advanced queue", flush=True)
         return True
 
 # ========= DELAY =========
@@ -808,26 +748,43 @@ def _top_timestamp_gmt8() -> str:
     ts = datetime.now(timezone.utc) + timedelta(hours=8)
     return ts.strftime("%Y-%m-%d %H:%M:%S")
 
+def _top_timestamp_for_url(top_url: str) -> str:
+    """
+    חלק מה-Gateways החדשים של AliExpress (למשל /sync) מצפים ל-timestamp כ-Unix time (שניות).
+    לעומת זאת שערי TOP (router/rest) עובדים מצוין עם פורמט "YYYY-MM-DD HH:MM:SS" ב-GMT+8.
+    """
+    u = (top_url or "").lower()
+    if "/sync" in u:
+        return str(int(time.time()))
+    return _top_timestamp_gmt8()
+
 def _top_call(method_name: str, biz_params: dict) -> dict:
     if not AE_APP_KEY or not AE_APP_SECRET:
         raise RuntimeError("חסרים AE_APP_KEY / AE_APP_SECRET ב-ENV")
 
-    params = {
+    base_params = {
         "method": method_name,
         "app_key": AE_APP_KEY,
         "format": "json",
         "v": "2.0",
         "sign_method": "md5",
-        "timestamp": _top_timestamp_gmt8(),
         **{k: v for k, v in biz_params.items() if v is not None and v != ""},
     }
-    params["sign"] = _top_sign_md5(params, AE_APP_SECRET)
 
     last_err = None
 
     for top_url in AE_TOP_URL_CANDIDATES:
         try:
-            r = SESSION.post(top_url, data=params, timeout=30)
+            params = dict(base_params)
+            params["timestamp"] = _top_timestamp_for_url(top_url)
+            params["sign"] = _top_sign_md5(params, AE_APP_SECRET)
+
+            # /sync בדרך כלל עובד טוב יותר עם GET + params, בעוד router/rest עובד מצוין עם POST + form-data
+            if "/sync" in (top_url or "").lower():
+                r = SESSION.get(top_url, params=params, timeout=30)
+            else:
+                r = SESSION.post(top_url, data=params, timeout=30)
+
             r.raise_for_status()
             payload = r.json()
 
@@ -1069,19 +1026,24 @@ def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET
 
     if not _is_admin(c.message):
-        bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
+        safe_answer_callback(bot, c.id, "אין הרשאה.", show_alert=True)
         return
 
     data = c.data or ""
+    # חשוב: חייבים לענות ל-CallbackQuery מהר, אחרת Telegram מחזיר 400 (query is too old).
+    if data == "refill_now":
+        safe_answer_callback(bot, c.id, "⏳ מבצע מילוי מהאפילייט…")
+    else:
+        safe_answer_callback(bot, c.id)
     chat_id = c.message.chat.id
 
     if data == "publish_now":
         ok = send_next_locked("manual")
         if not ok:
-            bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
+            safe_answer_callback(bot, c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
             return
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
+                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu())
 
     elif data == "pending_status":
         with FILE_LOCK:
@@ -1110,20 +1072,20 @@ def on_inline_click(c):
                 f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
             )
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=text, reply_markup=inline_menu(), parse_mode='HTML', cb_id=c.id)
+                          new_text=text, reply_markup=inline_menu(), parse_mode='HTML')
 
     elif data == "reload_merge":
         added, already, total_after = merge_from_data_into_pending()
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🔄 מיזוג הושלם.\nנוספו: {added}\nכבר היו בתור: {already}\nסה\"כ בתור כעת: {total_after}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "upload_source":
         EXPECTING_UPLOAD.add(getattr(c.from_user, "id", None))
         safe_edit_message(
             bot, chat_id=chat_id, message=c.message,
             new_text="שלח/י עכשיו קובץ CSV (כמסמך). הבוט ימפה עמודות, יעדכן workfile.csv וימזג אל התור.",
-            reply_markup=inline_menu(), cb_id=c.id
+            reply_markup=inline_menu()
         )
 
     elif data == "toggle_schedule":
@@ -1131,7 +1093,7 @@ def on_inline_click(c):
         state = "🕰️ מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 תמיד-פעיל"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"החלפתי מצב לשידור: {state}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data.startswith("delay_"):
         try:
@@ -1145,9 +1107,9 @@ def on_inline_click(c):
             mins = seconds // 60
             safe_edit_message(bot, chat_id=chat_id, message=c.message,
                               new_text=f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות). (מצב ידני)",
-                              reply_markup=inline_menu(), cb_id=c.id)
+                              reply_markup=inline_menu())
         except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
+            safe_answer_callback(bot, c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
 
     elif data == "toggle_auto_mode":
         current = read_auto_flag()
@@ -1156,49 +1118,49 @@ def on_inline_click(c):
         new_label = "🟢 מצב אוטומטי פעיל" if new_mode == "on" else "🔴 מצב ידני בלבד"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"החלפתי מצב שידור: {new_label}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "target_public":
         v = _load_preset(PUBLIC_PRESET_FILE)
         if v is None:
-            bot.answer_callback_query(c.id, "לא הוגדר יעד ציבורי. בחר דרך '🆕 בחר ערוץ ציבורי'.", show_alert=True)
+            safe_answer_callback(bot, c.id, "לא הוגדר יעד ציבורי. בחר דרך '🆕 בחר ערוץ ציבורי'.", show_alert=True)
             return
         CURRENT_TARGET = resolve_target(v)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🎯 עברתי לשדר ליעד הציבורי: {v}\n{details}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "target_private":
         v = _load_preset(PRIVATE_PRESET_FILE)
         if v is None:
-            bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. בחר דרך '🆕 בחר ערוץ פרטי'.", show_alert=True)
+            safe_answer_callback(bot, c.id, "לא הוגדר יעד פרטי. בחר דרך '🆕 בחר ערוץ פרטי'.", show_alert=True)
             return
         CURRENT_TARGET = resolve_target(v)
         ok, details = check_and_probe_target(CURRENT_TARGET)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🔒 עברתי לשדר ליעד הפרטי: {v}\n{details}",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "choose_public":
         EXPECTING_TARGET[c.from_user.id] = "public"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=("שלח/י *Forward* של הודעה מאותו ערוץ **ציבורי** כדי לשמור אותו כיעד.\n\n"
                                     "טיפ: פוסט בערוץ → ••• → Forward → בחר/י את הבוט."),
-                          reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id)
+                          reply_markup=inline_menu(), parse_mode='Markdown')
 
     elif data == "choose_private":
         EXPECTING_TARGET[c.from_user.id] = "private"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=("שלח/י *Forward* של הודעה מאותו ערוץ **פרטי** כדי לשמור אותו כיעד.\n\n"
                                     "חשוב: הוסף/י את הבוט כמנהל בערוץ הפרטי."),
-                          reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id)
+                          reply_markup=inline_menu(), parse_mode='Markdown')
 
     elif data == "choose_cancel":
         EXPECTING_TARGET.pop(getattr(c.from_user, "id", None), None)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "convert_next":
         try:
@@ -1207,10 +1169,10 @@ def on_inline_click(c):
             safe_edit_message(
                 bot, chat_id=chat_id, message=c.message,
                 new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
-                reply_markup=inline_menu(), cb_id=c.id
+                reply_markup=inline_menu()
             )
         except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
+            safe_answer_callback(bot, c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
 
     elif data == "reset_from_data":
         src = read_products(DATA_CSV)
@@ -1218,21 +1180,21 @@ def on_inline_click(c):
             write_products(PENDING_CSV, src)
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"🔁 התור אופס ומתחיל מחדש ({len(src)} פריטים) מהקובץ הראשי.",
-                          reply_markup=inline_menu(), cb_id=c.id)
+                          reply_markup=inline_menu())
 
     elif data == "delete_source_from_pending":
         removed, left = delete_source_rows_from_pending()
         safe_edit_message(
             bot, chat_id=chat_id, message=c.message,
             new_text=f"🗑️ הוסר מהתור: {removed} פריטים שנמצאו ב-workfile.csv\nנשארו בתור: {left}",
-            reply_markup=inline_menu(), cb_id=c.id
+            reply_markup=inline_menu()
         )
 
     elif data == "delete_source_file":
         ok = delete_source_csv_file()
         msg_txt = "🧹 workfile.csv אופס לריק (נשמרו רק כותרות). התור לא שונה." if ok else "שגיאה במחיקת workfile.csv"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id)
+                          new_text=msg_txt, reply_markup=inline_menu())
 
     elif data == "refill_now":
         max_needed = 80
@@ -1245,10 +1207,10 @@ def on_inline_click(c):
             f"דף אחרון שנבדק: {last_page}\n"
             f"שגיאה/מידע: {last_error}"
         )
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu(), cb_id=c.id)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu())
 
     else:
-        bot.answer_callback_query(c.id)
+        safe_answer_callback(bot, c.id)
 
 # ========= FORWARD HANDLER =========
 @bot.message_handler(
@@ -1387,43 +1349,6 @@ def cmd_start(msg):
     _save_admin_chat_id(msg.chat.id)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
-
-@bot.message_handler(commands=['version'])
-def cmd_version(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    try:
-        fp = "unknown"
-        try:
-            with open(__file__, "rb") as f:
-                fp = hashlib.sha1(f.read()).hexdigest()[:10]
-        except Exception:
-            pass
-        env_bits = []
-        for k in ("RAILWAY_GIT_COMMIT_SHA", "RAILWAY_DEPLOYMENT_ID", "RAILWAY_SERVICE_NAME"):
-            v = (os.environ.get(k) or "").strip()
-            if v:
-                env_bits.append(f"{k}={v}")
-        env_line = ("\n" + "\n".join(env_bits)) if env_bits else ""
-        bot.reply_to(msg, f"גרסה: 2025-12-16e\nFingerprint: {fp}{env_line}")
-    except Exception as e:
-        bot.reply_to(msg, f"שגיאה: {e}")
-
-@bot.message_handler(commands=['logs'])
-def cmd_logs(msg):
-    if not _is_admin(msg):
-        bot.reply_to(msg, "אין הרשאה.")
-        return
-    text = _tail_log_lines(200)
-    if not text:
-        bot.reply_to(msg, "אין לוגים.")
-        return
-    chunk_size = 3500
-    parts = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    for part in parts[:4]:
-        bot.send_message(msg.chat.id, f"<pre>{_html_text(part)}</pre>", parse_mode="HTML")
-
 @bot.message_handler(commands=['pending_status'])
 def pending_status_cmd(msg):
     with FILE_LOCK:
@@ -1538,21 +1463,8 @@ def refill_daemon():
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    print("[BOOT] main.py v2025-12-16e", flush=True)
+    print("[BOOT] main.py v2025-12-15b", flush=True)
     print(f"Instance: {socket.gethostname()}", flush=True)
-
-# Boot diagnostics
-try:
-    with open(__file__, "rb") as f:
-        fp = hashlib.sha1(f.read()).hexdigest()[:10]
-except Exception:
-    fp = "unknown"
-LOGGER.info("BOOT version=2025-12-16e instance=%s fingerprint=%s", socket.gethostname(), fp)
-for k in ("RAILWAY_GIT_COMMIT_SHA", "RAILWAY_DEPLOYMENT_ID", "RAILWAY_SERVICE_NAME"):
-    v = (os.environ.get(k) or "").strip()
-    if v:
-        LOGGER.info("BOOT env %s=%s", k, v)
-
 
     # הדפסה קצרה של קונפיג (מסכות)
     print(f"[CFG] AE_TOP_URL={AE_TOP_URL} | CANDIDATES={' | '.join(AE_TOP_URL_CANDIDATES)}", flush=True)
