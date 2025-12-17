@@ -231,8 +231,8 @@ AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
+PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")  # 0/1/2 ... מספר ספרות אחרי הנקודה
 
-PRICE_DECIMALS = int(os.environ.get('PRICE_DECIMALS', '2') or '2')  # 0=שקל שלם, 2=כולל אגורות
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
@@ -489,15 +489,28 @@ def _extract_float(s: str):
     return float(m.group(1).replace(",", "."))
 
 def usd_to_ils(price_text: str, rate: float) -> str:
+    """Convert a USD price text to ILS string with configurable decimals.
+
+    By default we keep 2 decimals (PRICE_DECIMALS=2).
+    Set PRICE_DECIMALS=0 in Railway if you *want* whole-number ILS.
+    """
     num = _extract_float(price_text)
     if num is None:
         return ""
-    # משתמשים ב-Decimal כדי להימנע משגיאות float ולשלוט במספר ספרות אחרי הנקודה
-    q = Decimal("1") if PRICE_DECIMALS == 0 else Decimal("0.01")
-    ils = (Decimal(str(num)) * Decimal(str(rate))).quantize(q, rounding=ROUND_HALF_UP)
-    if PRICE_DECIMALS == 0:
-        return str(int(ils))
-    return f"{ils:.2f}"
+    try:
+        dec = int(PRICE_DECIMALS)
+    except Exception:
+        dec = 2
+    dec = max(0, min(4, dec))  # sanity cap
+    # Use Decimal to avoid float rounding surprises
+    d = Decimal(str(num)) * Decimal(str(rate))
+    if dec == 0:
+        q = Decimal("1")
+    else:
+        q = Decimal("1." + ("0" * dec))
+    d = d.quantize(q, rounding=ROUND_HALF_UP)
+    # Always return with the requested decimals (e.g. 49.90)
+    return format(d, "f")
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
