@@ -18,8 +18,8 @@ except Exception:
 
 import logging
 import hashlib
-import random
 from decimal import Decimal, ROUND_HALF_UP
+import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
@@ -167,17 +167,15 @@ if not _logger.handlers:
     except Exception:
         pass
 
-def log_error(msg: str):
-    try:
-        logger.error(msg)
-    except Exception:
-        print(msg, flush=True)
-
 def log_info(msg: str):
     try:
         _logger.info(msg)
     except Exception:
         print(msg, flush=True)
+def log_error(msg: str):
+    # Backward compatible alias
+    log_exc(msg)
+
 
 def log_exc(msg: str):
     try:
@@ -237,44 +235,7 @@ AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
-# Number of decimals to show for ILS prices in posts (e.g., 2 -> 12.30). Use 0 for whole numbers.
-try:
-    PRICE_DECIMALS = int((os.environ.get("PRICE_DECIMALS", "2") or "2").strip())
-except Exception:
-    PRICE_DECIMALS = 2
-PRICE_DECIMALS = max(0, min(4, PRICE_DECIMALS))  # safety cap
-
-
-# Price parsing: if API returns a range (e.g., "36.29-2.72"), choose which number to use.
-try:
-    AE_PRICE_PICK_MODE = (os.environ.get("AE_PRICE_PICK_MODE", "min") or "min").strip().lower()
-except Exception:
-    AE_PRICE_PICK_MODE = "min"
-if AE_PRICE_PICK_MODE not in ("min", "max", "first"):
-    AE_PRICE_PICK_MODE = "min"
-# De-duplication across refills / restarts (best effort; for persistence across restarts on Railway add a Volume).
-AE_DEDUP_KEY_MODE = (os.environ.get("AE_DEDUP_KEY_MODE", "itemid") or "itemid").strip().lower()
-AE_DEDUP_SCOPE = (os.environ.get("AE_DEDUP_SCOPE", "both") or "both").strip().lower()  # queue / posted / both
-try:
-    AE_DEDUP_MAX_DAYS = int((os.environ.get("AE_DEDUP_MAX_DAYS", "365") or "365").strip())
-except Exception:
-    AE_DEDUP_MAX_DAYS = 365
-try:
-    AE_DEDUP_MAX_ITEMS = int((os.environ.get("AE_DEDUP_MAX_ITEMS", "20000") or "20000").strip())
-except Exception:
-    AE_DEDUP_MAX_ITEMS = 20000
-AE_DEDUP_MAX_DAYS = max(1, AE_DEDUP_MAX_DAYS)
-AE_DEDUP_MAX_ITEMS = max(100, AE_DEDUP_MAX_ITEMS)
-
-def _env_bool(name: str, default: bool=False) -> bool:
-    v = os.environ.get(name, "")
-    if v is None or v == "":
-        return default
-    return str(v).strip().lower() in ("1","true","yes","y","on")
-
-AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND = _env_bool("AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND", True)
-
-POSTED_KEYS_PATH = os.path.join(LOG_DIR, "posted_keys.json")
+PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
 
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
@@ -316,6 +277,10 @@ AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip(
 
 # target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח.
 AE_TARGET_CURRENCY = "USD"
+
+# Prefer app_sale_price (in-app price) when available. Set AE_USE_APP_PRICE=1 to enable.
+AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1","true","yes","on")
+AE_PRICE_INT_IS_CENTS = (os.environ.get("AE_PRICE_INT_IS_CENTS", "1") or "1").strip().lower() in ("1","true","yes","on")
 
 AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_REFILL_INTERVAL_SECONDS = int(os.environ.get("AE_REFILL_INTERVAL_SECONDS", "900") or "900")  # 15 דקות
@@ -403,6 +368,7 @@ if not BOT_TOKEN:
     print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יתחבר לטלגרם עד שתגדיר ENV.", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+SEND_LOCK = threading.Lock()
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -520,66 +486,20 @@ def clean_price_text(s):
     out = "".join(ch for ch in s if ch.isdigit() or ch == "." or ch == ",")
     return out.strip().replace(",", ".")
 
-def _extract_numbers(s: str):
-    """Extract all numeric values from a string (supports both 1,234.56 and 1.234,56 styles)."""
-    if s is None:
-        return []
-    txt = str(s)
-    out = []
-    # Grab number-like tokens (digits with optional thousands/decimal separators)
-    for token in re.findall(r"[-+]?\d[\d.,]*", txt):
-        t = token.strip().strip(".,")
-        if not t:
-            continue
-        # Normalize separators
-        if "," in t and "." in t:
-            # Decide which is decimal: assume the last separator is the decimal mark.
-            if t.rfind(".") > t.rfind(","):
-                # 1,234.56 -> comma thousands
-                t = t.replace(",", "")
-            else:
-                # 1.234,56 -> dot thousands, comma decimal
-                t = t.replace(".", "").replace(",", ".")
-        else:
-            # Only one of comma/dot present -> treat comma as decimal
-            t = t.replace(",", ".")
-        try:
-            out.append(float(t))
-        except Exception:
-            pass
-    return out
-
 def _extract_float(s: str):
-    """Pick one numeric value from a string according to AE_PRICE_PICK_MODE."""
-    nums = _extract_numbers(s)
-    if not nums:
+    if s is None:
         return None
-    if AE_PRICE_PICK_MODE == "first":
-        return float(nums[0])
-    if AE_PRICE_PICK_MODE == "max":
-        return float(max(nums))
-    # default: min
-    return float(min(nums))
-
+    m = re.search(r"([-+]?\d+(?:[.,]\d+)?)", str(s))
+    if not m:
+        return None
+    return float(m.group(1).replace(",", "."))
 
 def usd_to_ils(price_text: str, rate: float) -> str:
-    """Convert a USD-like text/number into an ILS string with PRICE_DECIMALS digits.
-    Returns "" for missing/invalid input.
-    """
     num = _extract_float(price_text)
     if num is None:
         return ""
-    try:
-        d = Decimal(str(num)) * Decimal(str(rate))
-        q = Decimal("1") if PRICE_DECIMALS == 0 else Decimal("1." + ("0" * PRICE_DECIMALS))
-        d = d.quantize(q, rounding=ROUND_HALF_UP)
-        return format(d, "f")  # keep fixed decimals (e.g., 12.30)
-    except Exception:
-        try:
-            val = float(num) * float(rate)
-            return f"{val:.{PRICE_DECIMALS}f}" if PRICE_DECIMALS > 0 else str(int(round(val)))
-        except Exception:
-            return ""
+    ils = round(num * rate)
+    return str(int(ils))
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -872,8 +792,8 @@ def format_post(product):
                 lines.append(part)
         lines.append("")
 
-    price_label = 'מחיר החל מ' if (row.get('PriceIsFrom') or '').strip() else 'מחיר מבצע'
-    price_line = f"💰 {price_label}: {sale_price} ש\"ח (מחיר מקורי: {original_price} ש\"ח)"
+    price_label = 'מחיר החל מ' if (product.get('PriceIsFrom') or '').strip() else 'מחיר מבצע'
+    price_line = f'💰 {price_label}: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
     lines += [
         price_line,
         discount_text,
@@ -990,6 +910,7 @@ def post_to_channel(product) -> bool:
     """Send a single media message (photo/video) with HTML caption when possible.
     Returns True on success, False on failure (so queue won't advance on failures).
     """
+    SEND_LOCK.acquire()
     try:
         post_text, image_url = format_post(product)
         video_url = (product.get('Video Url') or product.get('VideoURL') or product.get('VideoURL'.lower()) or "").strip()
@@ -1052,6 +973,9 @@ def post_to_channel(product) -> bool:
         log_exc(f"POST failed item={product.get('ItemId','')} err={e}")
         return False
 
+    finally:
+        SEND_LOCK.release()
+
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
@@ -1082,8 +1006,6 @@ def send_next_locked(source: str = "loop") -> bool:
             except Exception as e2:
                 log_exc(f"{source}: write FAILED permanently: {e2}")
                 return False
-
-        _mark_posted(item) if AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND else None
 
         log_info(f"{source}: sent & advanced queue (ItemId={item_id})")
         return True
@@ -1343,6 +1265,7 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "page_no": str(page_no),
         "page_size": str(page_size),
         "sort": AE_REFILL_SORT,
+        "target_currency": AE_TARGET_CURRENCY,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "target_language": AE_TARGET_LANGUAGE,
         "fields": fields,
@@ -1366,19 +1289,76 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     return products, resp_code, resp_msg
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
-    # בחירה חכמה של מחיר מבצע: app_sale_price אם קיים, אחרת sale_price
-    sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
-    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
+    """
+    Normalize an Affiliate/TOP product object into our CSV row schema.
 
-    _sale_nums = _extract_numbers(str(sale_raw))
-    price_is_from = (len(_sale_nums) >= 2) or ("-" in str(sale_raw))
+    Fixes the "price off by thousands of percent" issue by:
+    1) ensuring affiliate.product.query requests target_currency=USD (so prices are in USD),
+    2) converting USD->ILS with USD_TO_ILS_RATE_DEFAULT,
+    3) handling a known edge case where app_sale_price is ~100x sale_price (cents-without-dot).
+    """
+    def _parse_price_usd(raw) -> float | None:
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        s = clean_price_text(s)
+        if not s:
+            return None
+        # Some gateways return cents as an integer string (e.g. '3690' meaning 36.90)
+        if AE_PRICE_INT_IS_CENTS and s.isdigit() and len(s) >= 4:
+            try:
+                return float(int(s)) / 100.0
+            except Exception:
+                pass
+        return _extract_float(s)
 
-    sale_ils = usd_to_ils(str(sale_raw), USD_TO_ILS_RATE_DEFAULT)
-    orig_ils = usd_to_ils(str(orig_raw), USD_TO_ILS_RATE_DEFAULT)
+    def _maybe_fix_cents(app_v: float | None, std_v: float | None) -> float | None:
+        # If app price is ~100x the regular price, it's likely "cents without a dot" -> divide by 100.
+        if app_v is None or std_v is None:
+            return app_v
+        try:
+            if std_v > 0:
+                ratio = app_v / std_v
+                if 80.0 <= ratio <= 120.0:
+                    return app_v / 100.0
+        except Exception:
+            pass
+        return app_v
+
+    # Parse both variants if present (prefer target_* if available)
+    std_sale_usd = _parse_price_usd(p.get("target_sale_price") or p.get("sale_price"))
+    app_sale_usd = _parse_price_usd(p.get("target_app_sale_price") or p.get("app_sale_price"))
+    raw_sale_text = str(p.get("target_app_sale_price") or p.get("target_sale_price") or p.get("app_sale_price") or p.get("sale_price") or "")
+    price_is_from = "1" if re.search(r"\d\s*-\s*\d", raw_sale_text) else ""
+    app_sale_usd = _maybe_fix_cents(app_sale_usd, std_sale_usd)
+
+    # Choose based on flag, with safe fallback
+    chosen_sale_usd = (app_sale_usd if AE_USE_APP_PRICE else std_sale_usd) or (std_sale_usd or app_sale_usd)
+
+    orig_usd = _parse_price_usd(p.get("target_original_price") or p.get("original_price"))
+
+    def _usd_to_ils_str(v: float | None) -> str:
+        if v is None:
+            return ""
+        try:
+            d = (Decimal(str(v)) * Decimal(str(USD_TO_ILS_RATE_DEFAULT)))
+            if PRICE_DECIMALS <= 0:
+                d = d.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                return str(int(d))
+            q = Decimal("1") / (Decimal(10) ** PRICE_DECIMALS)
+            d = d.quantize(q, rounding=ROUND_HALF_UP)
+            return f"{d:.{PRICE_DECIMALS}f}"
+        except Exception:
+            return ""
+
+    sale_ils = _usd_to_ils_str(chosen_sale_usd)
+    orig_ils = _usd_to_ils_str(orig_usd)
 
     product_id = str(p.get("product_id", "")).strip()
 
-    # לפעמים TOP מחזיר promotion_link ריק אם tracking_id לא תקין/לא משויך.
+    # Sometimes TOP returns promotion_link empty if tracking_id isn't valid/linked.
     detail_url = (p.get("product_detail_url") or p.get("product_url") or "").strip()
     if not detail_url and product_id:
         detail_url = f"https://www.aliexpress.com/item/{product_id}.html"
@@ -1393,7 +1373,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Title": (p.get("product_title") or "").strip(),
         "OriginalPrice": orig_ils,
         "SalePrice": sale_ils,
-        "PriceIsFrom": "1" if price_is_from else "",
+        "PriceIsFrom": price_is_from,
         "Discount": (p.get("discount") or "").strip(),
         "Rating": (p.get("evaluate_rate") or "").strip(),
         "Orders": str(p.get("lastest_volume") or "").strip(),
@@ -1404,79 +1384,6 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Video Url": (p.get("product_video_url") or "").strip(),
     })
 
-
-
-
-# --------- De-dup store (posted history) ----------
-def _dedup_key_of_row(r: dict) -> str:
-    """Build a stable de-dup key according to AE_DEDUP_KEY_MODE."""
-    item_id = str((r.get("ItemId") or r.get("product_id") or "")).strip()
-    buy = str((r.get("BuyLink") or "")).strip()
-    title = str((r.get("Title") or "")).strip()
-    mode = (AE_DEDUP_KEY_MODE or "itemid").strip().lower()
-    if mode in ("buy", "buy_link", "promotion_link", "link"):
-        return buy or item_id or title
-    if mode in ("itemid_buy", "itemid+buy", "both"):
-        return f"{item_id}|{buy}" if (item_id or buy) else title
-    if mode in ("title", "name"):
-        return title or item_id or buy
-    return item_id or buy or title
-
-def _load_posted_keys() -> dict:
-    try:
-        if not os.path.exists(POSTED_KEYS_PATH):
-            return {}
-        with open(POSTED_KEYS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-        if isinstance(data, list):
-            return {str(k): time.time() for k in data}
-        if isinstance(data, dict):
-            return {str(k): float(v) for k, v in data.items() if k}
-        return {}
-    except Exception:
-        return {}
-
-def _save_posted_keys(store: dict):
-    try:
-        tmp = POSTED_KEYS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(store or {}, f, ensure_ascii=False)
-        os.replace(tmp, POSTED_KEYS_PATH)
-    except Exception:
-        pass
-
-def _prune_posted_keys(store: dict) -> dict:
-    try:
-        now = time.time()
-        max_age = AE_DEDUP_MAX_DAYS * 24 * 3600
-        pruned = {k: v for k, v in (store or {}).items() if (now - float(v)) <= max_age}
-        if len(pruned) > AE_DEDUP_MAX_ITEMS:
-            items = sorted(pruned.items(), key=lambda kv: float(kv[1]), reverse=True)[:AE_DEDUP_MAX_ITEMS]
-            pruned = dict(items)
-        return pruned
-    except Exception:
-        return store or {}
-
-def _get_posted_keyset() -> set:
-    store = _prune_posted_keys(_load_posted_keys())
-    try:
-        _save_posted_keys(store)  # persist pruning
-    except Exception:
-        pass
-    return set(store.keys())
-
-def _mark_posted(row: dict):
-    try:
-        k = _dedup_key_of_row(row)
-        if not k:
-            return
-        store = _load_posted_keys()
-        store[str(k)] = time.time()
-        store = _prune_posted_keys(store)
-        _save_posted_keys(store)
-    except Exception:
-        pass
-
 def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | None]:
     """
     מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
@@ -1486,9 +1393,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
 
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
-        existing_keys = {_dedup_key_of_row(r) for r in pending_rows}
-        if AE_DEDUP_SCOPE in ('posted','both','all'):
-            existing_keys |= _get_posted_keyset()
+        existing_keys = {_key_of_row(r) for r in pending_rows}
 
     added = 0
     dup = 0
@@ -1560,7 +1465,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                             skipped_no_link += 1
                             continue
 
-                        k = _dedup_key_of_row(row)
+                        k = _key_of_row(row)
                         if k in existing_keys:
                             dup += 1
                             continue
@@ -1631,7 +1536,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                         skipped_no_link += 1
                         continue
 
-                    k = _dedup_key_of_row(row)
+                    k = _key_of_row(row)
                     if k in existing_keys:
                         dup += 1
                         continue
@@ -2584,7 +2489,6 @@ if __name__ == "__main__":
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
     log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
-    log_info(f"[CFG] PRICE_DECIMALS={PRICE_DECIMALS} | USD_TO_ILS_RATE={USD_TO_ILS_RATE_DEFAULT:g} | DEDUP_SCOPE={AE_DEDUP_SCOPE} | DEDUP_KEY_MODE={AE_DEDUP_KEY_MODE} | DEDUP_MAX_DAYS={AE_DEDUP_MAX_DAYS} | DEDUP_MAX_ITEMS={AE_DEDUP_MAX_ITEMS} | DEDUP_ON_SEND={AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
