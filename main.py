@@ -1338,10 +1338,25 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     orig_usd = _parse_price_usd(p.get("target_original_price") or p.get("original_price"))
 
     def _usd_to_ils_str(v: float | None) -> str:
+        """USD->ILS formatting for affiliate refill, respecting PRICE_DECIMALS."""
         if v is None:
             return ""
         try:
-            return str(int(round(float(v) * float(USD_TO_ILS_RATE_DEFAULT))))
+            # Sanity cap to avoid absurd precision
+            try:
+                dec = int(PRICE_DECIMALS)
+            except Exception:
+                dec = 2
+            dec = max(0, min(4, dec))
+
+            d = Decimal(str(v)) * Decimal(str(USD_TO_ILS_RATE_DEFAULT))
+            if dec == 0:
+                q = Decimal("1")
+            else:
+                q = Decimal("1." + ("0" * dec))
+            d = d.quantize(q, rounding=ROUND_HALF_UP)
+            # Keep trailing zeros (e.g. 49.90)
+            return format(d, "f")
         except Exception:
             return ""
 
