@@ -22,7 +22,7 @@ import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17e")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17f")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -240,6 +240,47 @@ AE_REFILL_SORT = (os.environ.get("AE_REFILL_SORT", "LAST_VOLUME_DESC") or "LAST_
 AE_PRICE_BUCKETS_RAW_DEFAULT = (os.environ.get("AE_PRICE_BUCKETS", "") or os.environ.get("AE_PRICE_FILTER", "") or "").strip()
 # Allow runtime override via inline buttons (persisted in BOT_STATE)
 AE_PRICE_BUCKETS_RAW = _get_state_str("price_buckets_raw", AE_PRICE_BUCKETS_RAW_DEFAULT)
+def _parse_price_buckets(raw: str):
+    """Parse price buckets string like '1-5,5-10,10-20,20-50,50+' into list of tuples (lo, hi_or_None).
+    Returns [] when raw is empty/None.
+    """
+    if not raw:
+        return []
+    raw = str(raw).strip()
+    if not raw:
+        return []
+    buckets = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if p.endswith("+"):
+            lo_s = p[:-1].strip()
+            try:
+                lo = float(lo_s)
+            except Exception:
+                continue
+            buckets.append((lo, None))
+            continue
+        if "-" in p:
+            lo_s, hi_s = p.split("-", 1)
+            try:
+                lo = float(lo_s.strip())
+                hi = float(hi_s.strip())
+            except Exception:
+                continue
+            if hi < lo:
+                lo, hi = hi, lo
+            buckets.append((lo, hi))
+            continue
+        # single number means exact bucket of that number to that number
+        try:
+            v = float(p)
+        except Exception:
+            continue
+        buckets.append((v, v))
+    return buckets
+
 AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
 
 # Optional other filters (persisted)
