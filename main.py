@@ -10,6 +10,7 @@ Changes vs previous:
 """
 
 import os, sys
+import unicodedata
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -236,6 +237,18 @@ ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשי�
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
 PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
+# ========= CONFIG (OpenAI / AI copywriting) =========
+GPT_ENABLED = (os.environ.get("GPT_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY", "") or "").strip()  # לשים ב-Railway
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+GPT_BATCH_SIZE = int(os.environ.get("GPT_BATCH_SIZE", "10") or "10")
+GPT_TIMEOUT_SECONDS = float(os.environ.get("GPT_TIMEOUT_SECONDS", "45") or "45")
+GPT_MAX_RETRIES = int(os.environ.get("GPT_MAX_RETRIES", "2") or "2")
+GPT_OVERWRITE = (os.environ.get("GPT_OVERWRITE", "1") or "1").strip().lower() in ("1","true","yes","on")
+GPT_ON_REFILL = (os.environ.get("GPT_ON_REFILL", "1") or "1").strip().lower() in ("1","true","yes","on")
+GPT_ON_UPLOAD = (os.environ.get("GPT_ON_UPLOAD", "1") or "1").strip().lower() in ("1","true","yes","on")
+GPT_ON_SEND_FALLBACK = (os.environ.get("GPT_ON_SEND_FALLBACK", "1") or "1").strip().lower() in ("1","true","yes","on")
+
 
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
@@ -589,6 +602,188 @@ def normalize_row_keys(row):
 
     return out
 
+# ========= AI COPYWRITING (ChatGPT via OpenAI API) =========
+_OPENAI_CLIENT = None
+
+def _nfc_clean(s: str) -> str:
+    s = "" if s is None else str(s)
+    # Unicode normalize (helps prevent weird '�' / broken emoji)
+    s = unicodedata.normalize("NFC", s)
+    return s.replace("\uFFFD", "").replace("�", "").strip()
+
+def _openai_get_client():
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is not None:
+        return _OPENAI_CLIENT
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        from openai import OpenAI
+        _OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
+        return _OPENAI_CLIENT
+    except Exception as e:
+        log_error(f"[AI] OpenAI client init failed: {e}")
+        return None
+
+def _ai_should_process_row(row: dict) -> bool:
+    if not GPT_ENABLED:
+        return False
+    if GPT_OVERWRITE:
+        return True
+    # only fill if missing something
+    return not (_to_str(row.get("Opening")) and _to_str(row.get("Title")) and _to_str(row.get("Strengths")))
+
+def _ai_build_input_payload(rows: list[dict]) -> str:
+    # Keep it compact to control tokens
+    items = []
+    for r in rows:
+        item_id = _to_str(r.get("ItemId") or r.get("ProductId") or r.get("item_id"))
+        title = _to_str(r.get("Title") or r.get("Product Desc") or r.get("ProductDesc") or r.get("ProductDesc".lower()))
+        if not item_id:
+            continue
+        if not title:
+            title = "מוצר כללי ללא כותרת"
+        items.append({"item_id": item_id, "title": title})
+    return json.dumps({"items": items}, ensure_ascii=False)
+
+def _ai_call_openai(rows: list[dict]) -> dict:
+    """
+    Returns: { item_id: {"opening": str, "description": str, "strengths": [str,str,str]} }
+    """
+    client = _openai_get_client()
+    if client is None:
+        return {}
+    payload = _ai_build_input_payload(rows)
+    schema = {
+        "name": "marketing_copy",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "string"},
+                            "opening": {"type": "string"},
+                            "description": {"type": "string"},
+                            "strengths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 3,
+                                "maxItems": 3
+                            }
+                        },
+                        "required": ["item_id","opening","description","strengths"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": False
+        }
+    }
+
+    system_msg = (
+        "אתה קופירייטר ישראלי לטלגרם. לכל מוצר תכתוב בעברית שיווקית ולא גנרית: "
+        "1) opening = משפט פתיחה שנון ורלוונטי (לא כשאלה), "
+        "2) description = תיאור קצר וברור (שורה אחת-שתיים), "
+        "3) strengths = בדיוק 3 שורות חוזקה, כל שורה מתחילה באימוג'י מתאים. "
+        "אל תמציא מפרט שלא מופיע בכותרת. אל תזכיר מחירים/הנחות/משלוח."
+    )
+
+    # Retry a couple of times in case of transient network errors
+    last_err = None
+    for attempt in range(max(1, GPT_MAX_RETRIES + 1)):
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                input=[
+                    {"role":"system","content":system_msg},
+                    {"role":"user","content": payload}
+                ],
+                text={"format": {"type":"json_schema", "json_schema": schema}},
+                timeout=GPT_TIMEOUT_SECONDS,
+            )
+
+            # Extract JSON text robustly
+            out_text = getattr(resp, "output_text", None)
+            if not out_text:
+                try:
+                    out_text = resp.output[0].content[0].text
+                except Exception:
+                    out_text = None
+            if not out_text:
+                raise RuntimeError("No output_text from OpenAI response")
+
+            data = json.loads(out_text)
+            out = {}
+            for it in (data.get("items") or []):
+                iid = _to_str(it.get("item_id"))
+                if not iid:
+                    continue
+                out[iid] = {
+                    "opening": _nfc_clean(it.get("opening")),
+                    "description": _nfc_clean(it.get("description")),
+                    "strengths": [_nfc_clean(x) for x in (it.get("strengths") or [])][:3],
+                }
+            return out
+        except Exception as e:
+            last_err = e
+            log_error(f"[AI] OpenAI call failed (attempt {attempt}/{max(1, GPT_MAX_RETRIES + 1)}): {e}")
+            time.sleep(1.5)
+
+    log_error(f"[AI] OpenAI call ultimately failed: {last_err}")
+    return {}
+
+def ai_enrich_rows_inplace(rows: list[dict]) -> int:
+    """
+    Enrich rows with Opening/Title/Strengths (in-place). Works in batches of GPT_BATCH_SIZE.
+    Returns count of rows enriched.
+    """
+    if not (GPT_ENABLED and OPENAI_API_KEY):
+        return 0
+    if not rows:
+        return 0
+
+    enriched = 0
+    batch_size = max(1, int(GPT_BATCH_SIZE or 10))
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i+batch_size]
+        todo = [r for r in batch if _ai_should_process_row(r)]
+        if not todo:
+            continue
+        res = _ai_call_openai(todo)
+        if not res:
+            continue
+        for r in todo:
+            iid = _to_str(r.get("ItemId") or r.get("ProductId") or r.get("item_id"))
+            rr = res.get(iid)
+            if not rr:
+                continue
+            r["Opening"] = rr["opening"]
+            # Use Title field as the "description" line shown in the post
+            r["Title"] = rr["description"]
+            r["Strengths"] = "\n".join(rr["strengths"])
+            enriched += 1
+    return enriched
+
+def maybe_ai_enrich_product(product: dict) -> dict:
+    """
+    Lightweight fallback: before sending, ensure the product has AI fields.
+    """
+    try:
+        if not (GPT_ENABLED and GPT_ON_SEND_FALLBACK and OPENAI_API_KEY):
+            return product
+        if not _ai_should_process_row(product):
+            return product
+        ai_enrich_rows_inplace([product])
+        return product
+    except Exception as e:
+        log_error(f"[AI] fallback enrich failed: {e}")
+        return product
+
 def read_products(path):
     if not os.path.exists(path):
         return []
@@ -912,6 +1107,7 @@ def post_to_channel(product) -> bool:
     """
     SEND_LOCK.acquire()
     try:
+        maybe_ai_enrich_product(product)
         post_text, image_url = format_post(product)
         video_url = (product.get('Video Url') or product.get('VideoURL') or product.get('VideoURL'.lower()) or "").strip()
         target = resolve_target(CURRENT_TARGET)
@@ -1476,6 +1672,8 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                             break
 
                     if new_rows:
+                        if GPT_ON_REFILL:
+                            ai_enrich_rows_inplace(new_rows)
                         with FILE_LOCK:
                             pending_rows = read_products(PENDING_CSV)
                             pending_rows.extend(new_rows)
@@ -1544,6 +1742,8 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                     new_rows.append(row)
 
                 if new_rows:
+                    if GPT_ON_REFILL:
+                        ai_enrich_rows_inplace(new_rows)
                     with FILE_LOCK:
                         pending_rows = read_products(PENDING_CSV)
                         pending_rows.extend(new_rows)
@@ -2260,6 +2460,11 @@ def on_document(msg):
                 pass
 
         rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
+
+        # AI copywriting on upload (batches of GPT_BATCH_SIZE, default 10)
+        if GPT_ON_UPLOAD:
+            ai_enrich_rows_inplace(rows)
+
 
         with FILE_LOCK:
             write_products(DATA_CSV, rows)
