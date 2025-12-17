@@ -167,6 +167,12 @@ if not _logger.handlers:
     except Exception:
         pass
 
+def log_error(msg: str):
+    try:
+        logger.error(msg)
+    except Exception:
+        print(msg, flush=True)
+
 def log_info(msg: str):
     try:
         _logger.info(msg)
@@ -231,7 +237,36 @@ AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
-PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")  # 0/1/2 ... מספר ספרות אחרי הנקודה
+# Number of decimals to show for ILS prices in posts (e.g., 2 -> 12.30). Use 0 for whole numbers.
+try:
+    PRICE_DECIMALS = int((os.environ.get("PRICE_DECIMALS", "2") or "2").strip())
+except Exception:
+    PRICE_DECIMALS = 2
+PRICE_DECIMALS = max(0, min(4, PRICE_DECIMALS))  # safety cap
+
+# De-duplication across refills / restarts (best effort; for persistence across restarts on Railway add a Volume).
+AE_DEDUP_KEY_MODE = (os.environ.get("AE_DEDUP_KEY_MODE", "itemid") or "itemid").strip().lower()
+AE_DEDUP_SCOPE = (os.environ.get("AE_DEDUP_SCOPE", "both") or "both").strip().lower()  # queue / posted / both
+try:
+    AE_DEDUP_MAX_DAYS = int((os.environ.get("AE_DEDUP_MAX_DAYS", "365") or "365").strip())
+except Exception:
+    AE_DEDUP_MAX_DAYS = 365
+try:
+    AE_DEDUP_MAX_ITEMS = int((os.environ.get("AE_DEDUP_MAX_ITEMS", "20000") or "20000").strip())
+except Exception:
+    AE_DEDUP_MAX_ITEMS = 20000
+AE_DEDUP_MAX_DAYS = max(1, AE_DEDUP_MAX_DAYS)
+AE_DEDUP_MAX_ITEMS = max(100, AE_DEDUP_MAX_ITEMS)
+
+def _env_bool(name: str, default: bool=False) -> bool:
+    v = os.environ.get(name, "")
+    if v is None or v == "":
+        return default
+    return str(v).strip().lower() in ("1","true","yes","y","on")
+
+AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND = _env_bool("AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND", True)
+
+POSTED_KEYS_PATH = os.path.join(LOG_DIR, "posted_keys.json")
 
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
@@ -273,9 +308,6 @@ AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip(
 
 # target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח.
 AE_TARGET_CURRENCY = "USD"
-
-# Prefer app_sale_price (in-app price) when available. Set AE_USE_APP_PRICE=1 to enable.
-AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1","true","yes","on")
 
 AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_REFILL_INTERVAL_SECONDS = int(os.environ.get("AE_REFILL_INTERVAL_SECONDS", "900") or "900")  # 15 דקות
@@ -489,28 +521,23 @@ def _extract_float(s: str):
     return float(m.group(1).replace(",", "."))
 
 def usd_to_ils(price_text: str, rate: float) -> str:
-    """Convert a USD price text to ILS string with configurable decimals.
-
-    By default we keep 2 decimals (PRICE_DECIMALS=2).
-    Set PRICE_DECIMALS=0 in Railway if you *want* whole-number ILS.
+    """Convert a USD-like text/number into an ILS string with PRICE_DECIMALS digits.
+    Returns "" for missing/invalid input.
     """
     num = _extract_float(price_text)
     if num is None:
         return ""
     try:
-        dec = int(PRICE_DECIMALS)
+        d = Decimal(str(num)) * Decimal(str(rate))
+        q = Decimal("1") if PRICE_DECIMALS == 0 else Decimal("1." + ("0" * PRICE_DECIMALS))
+        d = d.quantize(q, rounding=ROUND_HALF_UP)
+        return format(d, "f")  # keep fixed decimals (e.g., 12.30)
     except Exception:
-        dec = 2
-    dec = max(0, min(4, dec))  # sanity cap
-    # Use Decimal to avoid float rounding surprises
-    d = Decimal(str(num)) * Decimal(str(rate))
-    if dec == 0:
-        q = Decimal("1")
-    else:
-        q = Decimal("1." + ("0" * dec))
-    d = d.quantize(q, rounding=ROUND_HALF_UP)
-    # Always return with the requested decimals (e.g. 49.90)
-    return format(d, "f")
+        try:
+            val = float(num) * float(rate)
+            return f"{val:.{PRICE_DECIMALS}f}" if PRICE_DECIMALS > 0 else str(int(round(val)))
+        except Exception:
+            return ""
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -1013,6 +1040,8 @@ def send_next_locked(source: str = "loop") -> bool:
                 log_exc(f"{source}: write FAILED permanently: {e2}")
                 return False
 
+        _mark_posted(item) if AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND else None
+
         log_info(f"{source}: sent & advanced queue (ItemId={item_id})")
         return True
 
@@ -1271,7 +1300,6 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "page_no": str(page_no),
         "page_size": str(page_size),
         "sort": AE_REFILL_SORT,
-        "target_currency": AE_TARGET_CURRENCY,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "target_language": AE_TARGET_LANGUAGE,
         "fields": fields,
@@ -1295,77 +1323,16 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     return products, resp_code, resp_msg
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
-    """
-    Normalize an Affiliate/TOP product object into our CSV row schema.
+    # בחירה חכמה של מחיר מבצע: app_sale_price אם קיים, אחרת sale_price
+    sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
+    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
 
-    Fixes the "price off by thousands of percent" issue by:
-    1) ensuring affiliate.product.query requests target_currency=USD (so prices are in USD),
-    2) converting USD->ILS with USD_TO_ILS_RATE_DEFAULT,
-    3) handling a known edge case where app_sale_price is ~100x sale_price (cents-without-dot).
-    """
-    def _parse_price_usd(raw) -> float | None:
-        if raw is None:
-            return None
-        s = str(raw).strip()
-        if not s:
-            return None
-        s = clean_price_text(s)
-        if not s:
-            return None
-        return _extract_float(s)
-
-    def _maybe_fix_cents(app_v: float | None, std_v: float | None) -> float | None:
-        # If app price is ~100x the regular price, it's likely "cents without a dot" -> divide by 100.
-        if app_v is None or std_v is None:
-            return app_v
-        try:
-            if std_v > 0:
-                ratio = app_v / std_v
-                if 80.0 <= ratio <= 120.0:
-                    return app_v / 100.0
-        except Exception:
-            pass
-        return app_v
-
-    # Parse both variants if present (prefer target_* if available)
-    std_sale_usd = _parse_price_usd(p.get("target_sale_price") or p.get("sale_price"))
-    app_sale_usd = _parse_price_usd(p.get("target_app_sale_price") or p.get("app_sale_price"))
-    app_sale_usd = _maybe_fix_cents(app_sale_usd, std_sale_usd)
-
-    # Choose based on flag, with safe fallback
-    chosen_sale_usd = (app_sale_usd if AE_USE_APP_PRICE else std_sale_usd) or (std_sale_usd or app_sale_usd)
-
-    orig_usd = _parse_price_usd(p.get("target_original_price") or p.get("original_price"))
-
-    def _usd_to_ils_str(v: float | None) -> str:
-        """USD->ILS formatting for affiliate refill, respecting PRICE_DECIMALS."""
-        if v is None:
-            return ""
-        try:
-            # Sanity cap to avoid absurd precision
-            try:
-                dec = int(PRICE_DECIMALS)
-            except Exception:
-                dec = 2
-            dec = max(0, min(4, dec))
-
-            d = Decimal(str(v)) * Decimal(str(USD_TO_ILS_RATE_DEFAULT))
-            if dec == 0:
-                q = Decimal("1")
-            else:
-                q = Decimal("1." + ("0" * dec))
-            d = d.quantize(q, rounding=ROUND_HALF_UP)
-            # Keep trailing zeros (e.g. 49.90)
-            return format(d, "f")
-        except Exception:
-            return ""
-
-    sale_ils = _usd_to_ils_str(chosen_sale_usd)
-    orig_ils = _usd_to_ils_str(orig_usd)
+    sale_ils = usd_to_ils(str(sale_raw), USD_TO_ILS_RATE_DEFAULT)
+    orig_ils = usd_to_ils(str(orig_raw), USD_TO_ILS_RATE_DEFAULT)
 
     product_id = str(p.get("product_id", "")).strip()
 
-    # Sometimes TOP returns promotion_link empty if tracking_id isn't valid/linked.
+    # לפעמים TOP מחזיר promotion_link ריק אם tracking_id לא תקין/לא משויך.
     detail_url = (p.get("product_detail_url") or p.get("product_url") or "").strip()
     if not detail_url and product_id:
         detail_url = f"https://www.aliexpress.com/item/{product_id}.html"
@@ -1390,6 +1357,79 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Video Url": (p.get("product_video_url") or "").strip(),
     })
 
+
+
+
+# --------- De-dup store (posted history) ----------
+def _dedup_key_of_row(r: dict) -> str:
+    """Build a stable de-dup key according to AE_DEDUP_KEY_MODE."""
+    item_id = str((r.get("ItemId") or r.get("product_id") or "")).strip()
+    buy = str((r.get("BuyLink") or "")).strip()
+    title = str((r.get("Title") or "")).strip()
+    mode = (AE_DEDUP_KEY_MODE or "itemid").strip().lower()
+    if mode in ("buy", "buy_link", "promotion_link", "link"):
+        return buy or item_id or title
+    if mode in ("itemid_buy", "itemid+buy", "both"):
+        return f"{item_id}|{buy}" if (item_id or buy) else title
+    if mode in ("title", "name"):
+        return title or item_id or buy
+    return item_id or buy or title
+
+def _load_posted_keys() -> dict:
+    try:
+        if not os.path.exists(POSTED_KEYS_PATH):
+            return {}
+        with open(POSTED_KEYS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        if isinstance(data, list):
+            return {str(k): time.time() for k in data}
+        if isinstance(data, dict):
+            return {str(k): float(v) for k, v in data.items() if k}
+        return {}
+    except Exception:
+        return {}
+
+def _save_posted_keys(store: dict):
+    try:
+        tmp = POSTED_KEYS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store or {}, f, ensure_ascii=False)
+        os.replace(tmp, POSTED_KEYS_PATH)
+    except Exception:
+        pass
+
+def _prune_posted_keys(store: dict) -> dict:
+    try:
+        now = time.time()
+        max_age = AE_DEDUP_MAX_DAYS * 24 * 3600
+        pruned = {k: v for k, v in (store or {}).items() if (now - float(v)) <= max_age}
+        if len(pruned) > AE_DEDUP_MAX_ITEMS:
+            items = sorted(pruned.items(), key=lambda kv: float(kv[1]), reverse=True)[:AE_DEDUP_MAX_ITEMS]
+            pruned = dict(items)
+        return pruned
+    except Exception:
+        return store or {}
+
+def _get_posted_keyset() -> set:
+    store = _prune_posted_keys(_load_posted_keys())
+    try:
+        _save_posted_keys(store)  # persist pruning
+    except Exception:
+        pass
+    return set(store.keys())
+
+def _mark_posted(row: dict):
+    try:
+        k = _dedup_key_of_row(row)
+        if not k:
+            return
+        store = _load_posted_keys()
+        store[str(k)] = time.time()
+        store = _prune_posted_keys(store)
+        _save_posted_keys(store)
+    except Exception:
+        pass
+
 def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | None]:
     """
     מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
@@ -1399,7 +1439,9 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
 
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
-        existing_keys = {_key_of_row(r) for r in pending_rows}
+        existing_keys = {_dedup_key_of_row(r) for r in pending_rows}
+        if AE_DEDUP_SCOPE in ('posted','both','all'):
+            existing_keys |= _get_posted_keyset()
 
     added = 0
     dup = 0
@@ -1471,7 +1513,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                             skipped_no_link += 1
                             continue
 
-                        k = _key_of_row(row)
+                        k = _dedup_key_of_row(row)
                         if k in existing_keys:
                             dup += 1
                             continue
@@ -1542,7 +1584,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                         skipped_no_link += 1
                         continue
 
-                    k = _key_of_row(row)
+                    k = _dedup_key_of_row(row)
                     if k in existing_keys:
                         dup += 1
                         continue
@@ -2495,6 +2537,7 @@ if __name__ == "__main__":
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
     log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
+    log_info(f"[CFG] PRICE_DECIMALS={PRICE_DECIMALS} | USD_TO_ILS_RATE={USD_TO_ILS_RATE_DEFAULT:g} | DEDUP_SCOPE={AE_DEDUP_SCOPE} | DEDUP_KEY_MODE={AE_DEDUP_KEY_MODE} | DEDUP_MAX_DAYS={AE_DEDUP_MAX_DAYS} | DEDUP_MAX_ITEMS={AE_DEDUP_MAX_ITEMS} | DEDUP_ON_SEND={AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
