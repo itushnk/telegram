@@ -10,7 +10,6 @@ Changes vs previous:
 """
 
 import os, sys
-import unicodedata
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -19,7 +18,6 @@ except Exception:
 
 import logging
 import hashlib
-from decimal import Decimal, ROUND_HALF_UP
 import random
 from logging.handlers import RotatingFileHandler
 
@@ -173,10 +171,6 @@ def log_info(msg: str):
         _logger.info(msg)
     except Exception:
         print(msg, flush=True)
-def log_error(msg: str):
-    # Backward compatible alias
-    log_exc(msg)
-
 
 def log_exc(msg: str):
     try:
@@ -236,20 +230,9 @@ AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
+
 PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
-# ========= CONFIG (OpenAI / AI copywriting) =========
-GPT_ENABLED = (os.environ.get("GPT_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
-OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY", "") or "").strip()  # לשים ב-Railway
-OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
-GPT_BATCH_SIZE = int(os.environ.get("GPT_BATCH_SIZE", "10") or "10")
-GPT_TIMEOUT_SECONDS = float(os.environ.get("GPT_TIMEOUT_SECONDS", "45") or "45")
-GPT_MAX_RETRIES = int(os.environ.get("GPT_MAX_RETRIES", "2") or "2")
-GPT_OVERWRITE = (os.environ.get("GPT_OVERWRITE", "1") or "1").strip().lower() in ("1","true","yes","on")
-GPT_ON_REFILL = (os.environ.get("GPT_ON_REFILL", "1") or "1").strip().lower() in ("1","true","yes","on")
-GPT_ON_UPLOAD = (os.environ.get("GPT_ON_UPLOAD", "1") or "1").strip().lower() in ("1","true","yes","on")
-GPT_ON_SEND_FALLBACK = (os.environ.get("GPT_ON_SEND_FALLBACK", "1") or "1").strip().lower() in ("1","true","yes","on")
-
-
+AE_KEYWORDS = (os.environ.get("AE_KEYWORDS", "") or "").strip()
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
@@ -290,10 +273,6 @@ AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip(
 
 # target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח.
 AE_TARGET_CURRENCY = "USD"
-
-# Prefer app_sale_price (in-app price) when available. Set AE_USE_APP_PRICE=1 to enable.
-AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1","true","yes","on")
-AE_PRICE_INT_IS_CENTS = (os.environ.get("AE_PRICE_INT_IS_CENTS", "1") or "1").strip().lower() in ("1","true","yes","on")
 
 AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_REFILL_INTERVAL_SECONDS = int(os.environ.get("AE_REFILL_INTERVAL_SECONDS", "900") or "900")  # 15 דקות
@@ -381,7 +360,6 @@ if not BOT_TOKEN:
     print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יתחבר לטלגרם עד שתגדיר ENV.", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-SEND_LOCK = threading.Lock()
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -479,6 +457,11 @@ def safe_int(value, default=0):
     except Exception:
         return default
 
+def _to_str(x) -> str:
+    """Safe string cast used in logs/UI."""
+    return "" if x is None else str(x)
+
+
 def norm_percent(value, decimals=1, empty_fallback=""):
     s = str(value).strip() if value is not None else ""
     if not s:
@@ -507,12 +490,55 @@ def _extract_float(s: str):
         return None
     return float(m.group(1).replace(",", "."))
 
+def _format_money(num: float, decimals: int) -> str:
+    """Format number with fixed decimals (Excel/Telegram friendly)."""
+    try:
+        decimals = int(decimals)
+    except Exception:
+        decimals = 2
+    if decimals <= 0:
+        return str(int(round(num)))
+    return f"{num:.{decimals}f}"
+
 def usd_to_ils(price_text: str, rate: float) -> str:
-    num = _extract_float(price_text)
+    """Convert a USD price string to ILS string, preserving decimals.
+
+    Notes:
+    - If the raw string already looks like ILS (₪/ILS/NIS), we DO NOT convert again.
+    - If the API returns cents as an integer string (e.g. '1290' meaning $12.90), we normalize.
+    """
+    if price_text is None:
+        return ""
+    raw_original = str(price_text)
+    raw_clean = clean_price_text(raw_original)
+    num = _extract_float(raw_clean)
     if num is None:
         return ""
-    ils = round(num * rate)
-    return str(int(ils))
+
+    # Heuristic: cents-as-integer (common in some affiliate fields)
+    if raw_clean and raw_clean.isdigit():
+        try:
+            ival = int(raw_clean)
+            if ival >= 1000 and ival <= 10000000:
+                num = ival / 100.0
+        except Exception:
+            pass
+
+    # If already ILS -> don't convert again
+    up = raw_original.upper()
+    if ("₪" in raw_original) or ("ILS" in up) or ("NIS" in up):
+        ils = float(num)
+    else:
+        ils = float(num) * float(rate)
+
+    # Apply decimals
+    dec = PRICE_DECIMALS
+    try:
+        dec = int(dec)
+    except Exception:
+        dec = 2
+    return _format_money(round(ils, dec), dec)
+
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -601,188 +627,6 @@ def normalize_row_keys(row):
     out["Strengths"] = out.get("Strengths", "") or ""
 
     return out
-
-# ========= AI COPYWRITING (ChatGPT via OpenAI API) =========
-_OPENAI_CLIENT = None
-
-def _nfc_clean(s: str) -> str:
-    s = "" if s is None else str(s)
-    # Unicode normalize (helps prevent weird '�' / broken emoji)
-    s = unicodedata.normalize("NFC", s)
-    return s.replace("\uFFFD", "").replace("�", "").strip()
-
-def _openai_get_client():
-    global _OPENAI_CLIENT
-    if _OPENAI_CLIENT is not None:
-        return _OPENAI_CLIENT
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        from openai import OpenAI
-        _OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
-        return _OPENAI_CLIENT
-    except Exception as e:
-        log_error(f"[AI] OpenAI client init failed: {e}")
-        return None
-
-def _ai_should_process_row(row: dict) -> bool:
-    if not GPT_ENABLED:
-        return False
-    if GPT_OVERWRITE:
-        return True
-    # only fill if missing something
-    return not (_to_str(row.get("Opening")) and _to_str(row.get("Title")) and _to_str(row.get("Strengths")))
-
-def _ai_build_input_payload(rows: list[dict]) -> str:
-    # Keep it compact to control tokens
-    items = []
-    for r in rows:
-        item_id = _to_str(r.get("ItemId") or r.get("ProductId") or r.get("item_id"))
-        title = _to_str(r.get("Title") or r.get("Product Desc") or r.get("ProductDesc") or r.get("ProductDesc".lower()))
-        if not item_id:
-            continue
-        if not title:
-            title = "מוצר כללי ללא כותרת"
-        items.append({"item_id": item_id, "title": title})
-    return json.dumps({"items": items}, ensure_ascii=False)
-
-def _ai_call_openai(rows: list[dict]) -> dict:
-    """
-    Returns: { item_id: {"opening": str, "description": str, "strengths": [str,str,str]} }
-    """
-    client = _openai_get_client()
-    if client is None:
-        return {}
-    payload = _ai_build_input_payload(rows)
-    schema = {
-        "name": "marketing_copy",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "item_id": {"type": "string"},
-                            "opening": {"type": "string"},
-                            "description": {"type": "string"},
-                            "strengths": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "minItems": 3,
-                                "maxItems": 3
-                            }
-                        },
-                        "required": ["item_id","opening","description","strengths"],
-                        "additionalProperties": False
-                    }
-                }
-            },
-            "required": ["items"],
-            "additionalProperties": False
-        }
-    }
-
-    system_msg = (
-        "אתה קופירייטר ישראלי לטלגרם. לכל מוצר תכתוב בעברית שיווקית ולא גנרית: "
-        "1) opening = משפט פתיחה שנון ורלוונטי (לא כשאלה), "
-        "2) description = תיאור קצר וברור (שורה אחת-שתיים), "
-        "3) strengths = בדיוק 3 שורות חוזקה, כל שורה מתחילה באימוג'י מתאים. "
-        "אל תמציא מפרט שלא מופיע בכותרת. אל תזכיר מחירים/הנחות/משלוח."
-    )
-
-    # Retry a couple of times in case of transient network errors
-    last_err = None
-    for attempt in range(max(1, GPT_MAX_RETRIES + 1)):
-        try:
-            resp = client.responses.create(
-                model=OPENAI_MODEL,
-                input=[
-                    {"role":"system","content":system_msg},
-                    {"role":"user","content": payload}
-                ],
-                text={"format": {"type":"json_schema", "json_schema": schema}},
-                timeout=GPT_TIMEOUT_SECONDS,
-            )
-
-            # Extract JSON text robustly
-            out_text = getattr(resp, "output_text", None)
-            if not out_text:
-                try:
-                    out_text = resp.output[0].content[0].text
-                except Exception:
-                    out_text = None
-            if not out_text:
-                raise RuntimeError("No output_text from OpenAI response")
-
-            data = json.loads(out_text)
-            out = {}
-            for it in (data.get("items") or []):
-                iid = _to_str(it.get("item_id"))
-                if not iid:
-                    continue
-                out[iid] = {
-                    "opening": _nfc_clean(it.get("opening")),
-                    "description": _nfc_clean(it.get("description")),
-                    "strengths": [_nfc_clean(x) for x in (it.get("strengths") or [])][:3],
-                }
-            return out
-        except Exception as e:
-            last_err = e
-            log_error(f"[AI] OpenAI call failed (attempt {attempt}/{max(1, GPT_MAX_RETRIES + 1)}): {e}")
-            time.sleep(1.5)
-
-    log_error(f"[AI] OpenAI call ultimately failed: {last_err}")
-    return {}
-
-def ai_enrich_rows_inplace(rows: list[dict]) -> int:
-    """
-    Enrich rows with Opening/Title/Strengths (in-place). Works in batches of GPT_BATCH_SIZE.
-    Returns count of rows enriched.
-    """
-    if not (GPT_ENABLED and OPENAI_API_KEY):
-        return 0
-    if not rows:
-        return 0
-
-    enriched = 0
-    batch_size = max(1, int(GPT_BATCH_SIZE or 10))
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i+batch_size]
-        todo = [r for r in batch if _ai_should_process_row(r)]
-        if not todo:
-            continue
-        res = _ai_call_openai(todo)
-        if not res:
-            continue
-        for r in todo:
-            iid = _to_str(r.get("ItemId") or r.get("ProductId") or r.get("item_id"))
-            rr = res.get(iid)
-            if not rr:
-                continue
-            r["Opening"] = rr["opening"]
-            # Use Title field as the "description" line shown in the post
-            r["Title"] = rr["description"]
-            r["Strengths"] = "\n".join(rr["strengths"])
-            enriched += 1
-    return enriched
-
-def maybe_ai_enrich_product(product: dict) -> dict:
-    """
-    Lightweight fallback: before sending, ensure the product has AI fields.
-    """
-    try:
-        if not (GPT_ENABLED and GPT_ON_SEND_FALLBACK and OPENAI_API_KEY):
-            return product
-        if not _ai_should_process_row(product):
-            return product
-        ai_enrich_rows_inplace([product])
-        return product
-    except Exception as e:
-        log_error(f"[AI] fallback enrich failed: {e}")
-        return product
 
 def read_products(path):
     if not os.path.exists(path):
@@ -915,37 +759,54 @@ def is_quiet_now(now: datetime | None = None) -> bool:
 
 # ========= SAFE EDIT =========
 def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
-    try:
-        curr_text = (message.text or message.caption or "")
-        if curr_text == (new_text or ""):
-            try:
-                if reply_markup is not None:
-                    bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-                if cb_id:
-                    bot.answer_callback_query(cb_id)
-                return
-            except Exception as e_rm:
-                if "message is not modified" in str(e_rm):
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-        bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        if cb_id:
-            bot.answer_callback_query(cb_id)
-    except Exception as e:
-        if "message is not modified" in str(e):
-            if cb_id:
-                bot.answer_callback_query(cb_id)
-            return
-        if cb_id and cb_info:
-            bot.answer_callback_query(cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
-        else:
-            raise
+    """Safely edit an existing message and (optionally) answer callback queries.
 
-# ========= POSTING =========
+    Telegram can return:
+    - 400: query is too old / message not modified
+    - 409: conflicts (handled elsewhere)
+    This helper should NEVER crash the bot.
+    """
+    try:
+        curr_text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        # If text unchanged, just update markup (if provided) and answer callback
+        if curr_text == (new_text or ""):
+            if reply_markup is not None:
+                try:
+                    bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
+                except Exception:
+                    pass
+            if cb_id:
+                try:
+                    bot.answer_callback_query(cb_id)
+                except Exception:
+                    pass
+            return
+
+        try:
+            bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception:
+            # Try caption edit (for media messages)
+            try:
+                bot.edit_message_caption(chat_id=chat_id, message_id=message.message_id, caption=new_text, reply_markup=reply_markup, parse_mode=parse_mode)
+            except Exception:
+                pass
+
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log_error(f"safe_edit_message failed: {e} | {cb_info or ''}")
+        except Exception:
+            pass
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id)
+            except Exception:
+                pass
+
 def format_post(product):
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
@@ -986,8 +847,7 @@ def format_post(product):
             if part:
                 lines.append(part)
         lines.append("")
-
-    price_label = 'מחיר החל מ' if (product.get('PriceIsFrom') or '').strip() else 'מחיר מבצע'
+    price_label = "מחיר החל מ" if (product.get("PriceIsFrom") or "").strip() else "מחיר מבצע"
     price_line = f'💰 {price_label}: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
     lines += [
         price_line,
@@ -1105,9 +965,7 @@ def post_to_channel(product) -> bool:
     """Send a single media message (photo/video) with HTML caption when possible.
     Returns True on success, False on failure (so queue won't advance on failures).
     """
-    SEND_LOCK.acquire()
     try:
-        maybe_ai_enrich_product(product)
         post_text, image_url = format_post(product)
         video_url = (product.get('Video Url') or product.get('VideoURL') or product.get('VideoURL'.lower()) or "").strip()
         target = resolve_target(CURRENT_TARGET)
@@ -1168,9 +1026,6 @@ def post_to_channel(product) -> bool:
     except Exception as e:
         log_exc(f"POST failed item={product.get('ItemId','')} err={e}")
         return False
-
-    finally:
-        SEND_LOCK.release()
 
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
@@ -1430,6 +1285,7 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
         "sort": AE_REFILL_SORT,
         "target_currency": AE_TARGET_CURRENCY,
         "target_language": AE_TARGET_LANGUAGE,
+        "target_currency": AE_TARGET_CURRENCY,
         "tracking_id": AE_TRACKING_ID,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "fields": "product_id,product_title,product_main_image_url,promotion_link,sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url",
@@ -1461,14 +1317,20 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "page_no": str(page_no),
         "page_size": str(page_size),
         "sort": AE_REFILL_SORT,
-        "target_currency": AE_TARGET_CURRENCY,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
+        "target_currency": AE_TARGET_CURRENCY,
         "target_language": AE_TARGET_LANGUAGE,
         "fields": fields,
         "platform_product_type": "ALL",
     }
     if category_id:
-        biz["category_ids"] = str(category_id).strip()
+        biz["category_ids"] = str(category_id).strip()()()
+
+    # If AE_KEYWORDS provided, rotate keywords to avoid repetitive results
+    if AE_KEYWORDS:
+        kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS) if k.strip()]
+        if kws and "keywords" not in biz:
+            biz["keywords"] = kws[(page_no - 1) % len(kws)]
     payload = _top_call("aliexpress.affiliate.product.query", biz)
     resp = _extract_resp_result(payload)
     resp_code = resp.get("resp_code")
@@ -1485,76 +1347,31 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     return products, resp_code, resp_msg
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
-    """
-    Normalize an Affiliate/TOP product object into our CSV row schema.
+    # מחיר מבצע / מקורי - טיפול בטווחים ("1.23-4.56") + מניעת המרה כפולה אם המחיר כבר בש"ח
+    sale_raw = (
+        p.get("app_sale_price")
+        if AE_USE_APP_PRICE
+        else (p.get("sale_price") or p.get("app_sale_price"))
+    ) or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
+    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
 
-    Fixes the "price off by thousands of percent" issue by:
-    1) ensuring affiliate.product.query requests target_currency=USD (so prices are in USD),
-    2) converting USD->ILS with USD_TO_ILS_RATE_DEFAULT,
-    3) handling a known edge case where app_sale_price is ~100x sale_price (cents-without-dot).
-    """
-    def _parse_price_usd(raw) -> float | None:
-        if raw is None:
-            return None
-        s = str(raw).strip()
-        if not s:
-            return None
-        s = clean_price_text(s)
-        if not s:
-            return None
-        # Some gateways return cents as an integer string (e.g. '3690' meaning 36.90)
-        if AE_PRICE_INT_IS_CENTS and s.isdigit() and len(s) >= 4:
-            try:
-                return float(int(s)) / 100.0
-            except Exception:
-                pass
-        return _extract_float(s)
+    def _pick_min(raw_val):
+        s = str(raw_val or "").strip()
+        if "-" in s:
+            parts = [x.strip() for x in re.split(r"\s*-\s*", s) if x.strip()]
+            if len(parts) >= 2:
+                return parts[0], True
+        return s, False
 
-    def _maybe_fix_cents(app_v: float | None, std_v: float | None) -> float | None:
-        # If app price is ~100x the regular price, it's likely "cents without a dot" -> divide by 100.
-        if app_v is None or std_v is None:
-            return app_v
-        try:
-            if std_v > 0:
-                ratio = app_v / std_v
-                if 80.0 <= ratio <= 120.0:
-                    return app_v / 100.0
-        except Exception:
-            pass
-        return app_v
+    sale_text, sale_is_from = _pick_min(sale_raw)
+    orig_text, orig_is_from = _pick_min(orig_raw)
 
-    # Parse both variants if present (prefer target_* if available)
-    std_sale_usd = _parse_price_usd(p.get("target_sale_price") or p.get("sale_price"))
-    app_sale_usd = _parse_price_usd(p.get("target_app_sale_price") or p.get("app_sale_price"))
-    raw_sale_text = str(p.get("target_app_sale_price") or p.get("target_sale_price") or p.get("app_sale_price") or p.get("sale_price") or "")
-    price_is_from = "1" if re.search(r"\d\s*-\s*\d", raw_sale_text) else ""
-    app_sale_usd = _maybe_fix_cents(app_sale_usd, std_sale_usd)
-
-    # Choose based on flag, with safe fallback
-    chosen_sale_usd = (app_sale_usd if AE_USE_APP_PRICE else std_sale_usd) or (std_sale_usd or app_sale_usd)
-
-    orig_usd = _parse_price_usd(p.get("target_original_price") or p.get("original_price"))
-
-    def _usd_to_ils_str(v: float | None) -> str:
-        if v is None:
-            return ""
-        try:
-            d = (Decimal(str(v)) * Decimal(str(USD_TO_ILS_RATE_DEFAULT)))
-            if PRICE_DECIMALS <= 0:
-                d = d.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-                return str(int(d))
-            q = Decimal("1") / (Decimal(10) ** PRICE_DECIMALS)
-            d = d.quantize(q, rounding=ROUND_HALF_UP)
-            return f"{d:.{PRICE_DECIMALS}f}"
-        except Exception:
-            return ""
-
-    sale_ils = _usd_to_ils_str(chosen_sale_usd)
-    orig_ils = _usd_to_ils_str(orig_usd)
+    sale_ils = usd_to_ils(sale_text, USD_TO_ILS_RATE_DEFAULT)
+    orig_ils = usd_to_ils(orig_text, USD_TO_ILS_RATE_DEFAULT)
 
     product_id = str(p.get("product_id", "")).strip()
 
-    # Sometimes TOP returns promotion_link empty if tracking_id isn't valid/linked.
+    # לפעמים TOP מחזיר promotion_link ריק אם tracking_id לא תקין/לא משויך.
     detail_url = (p.get("product_detail_url") or p.get("product_url") or "").strip()
     if not detail_url and product_id:
         detail_url = f"https://www.aliexpress.com/item/{product_id}.html"
@@ -1568,8 +1385,9 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "ImageURL": (p.get("product_main_image_url") or "").strip(),
         "Title": (p.get("product_title") or "").strip(),
         "OriginalPrice": orig_ils,
+        "OriginalIsFrom": ("1" if orig_is_from else ""),
         "SalePrice": sale_ils,
-        "PriceIsFrom": price_is_from,
+        "PriceIsFrom": ("1" if sale_is_from else ""),
         "Discount": (p.get("discount") or "").strip(),
         "Rating": (p.get("evaluate_rate") or "").strip(),
         "Orders": str(p.get("lastest_volume") or "").strip(),
@@ -1579,6 +1397,8 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Strengths": "",
         "Video Url": (p.get("product_video_url") or "").strip(),
     })
+
+
 
 def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | None]:
     """
@@ -1672,8 +1492,6 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                             break
 
                     if new_rows:
-                        if GPT_ON_REFILL:
-                            ai_enrich_rows_inplace(new_rows)
                         with FILE_LOCK:
                             pending_rows = read_products(PENDING_CSV)
                             pending_rows.extend(new_rows)
@@ -1696,6 +1514,15 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
             last_page = page_no
             try:
                 products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
+                # Fallback: some accounts/params return empty from hotproduct query.
+                # If AE_KEYWORDS exists, try affiliate.product.query with rotating keywords.
+                if (not products) and AE_KEYWORDS:
+                    try:
+                        products2, rc2, rm2 = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
+                        if products2:
+                            products, resp_code, resp_msg = products2, rc2, rm2
+                    except Exception:
+                        pass
                 last_resp = (resp_code, resp_msg, len(products))
 
                 if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
@@ -1742,8 +1569,6 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                     new_rows.append(row)
 
                 if new_rows:
-                    if GPT_ON_REFILL:
-                        ai_enrich_rows_inplace(new_rows)
                     with FILE_LOCK:
                         pending_rows = read_products(PENDING_CSV)
                         pending_rows.extend(new_rows)
@@ -2460,11 +2285,6 @@ def on_document(msg):
                 pass
 
         rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
-
-        # AI copywriting on upload (batches of GPT_BATCH_SIZE, default 10)
-        if GPT_ON_UPLOAD:
-            ai_enrich_rows_inplace(rows)
-
 
         with FILE_LOCK:
             write_products(DATA_CSV, rows)
