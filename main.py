@@ -22,7 +22,7 @@ import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17m")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17n")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -489,6 +489,26 @@ def usd_to_ils(price_text: str, rate: float) -> str:
         return ""
     ils = round(num * rate)
     return str(int(ils))
+
+def _normalize_top_price_raw(raw) -> str:
+    """TOP/AliExpress affiliate sometimes returns prices as integer cents (e.g. '362' == $3.62).
+    This normalizes to a USD string for usd_to_ils()."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    # Already looks like a normal decimal/currency string
+    if any(ch in s for ch in (".", ",")) or ("$" in s) or ("usd" in s.lower()) or ("us $" in s.lower()):
+        return s
+    # Pure digits: if length>=3 assume cents -> divide by 100
+    if re.fullmatch(r"\d+", s) and len(s) >= 3:
+        try:
+            return f"{int(s) / 100:.2f}"
+        except Exception:
+            return s
+    return s
+
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -1276,8 +1296,8 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
     orig_raw = p.get("original_price") or p.get("target_original_price") or ""
 
-    sale_ils = usd_to_ils(str(sale_raw), USD_TO_ILS_RATE_DEFAULT)
-    orig_ils = usd_to_ils(str(orig_raw), USD_TO_ILS_RATE_DEFAULT)
+    sale_ils = usd_to_ils(_normalize_top_price_raw(sale_raw), USD_TO_ILS_RATE_DEFAULT)
+    orig_ils = usd_to_ils(_normalize_top_price_raw(orig_raw), USD_TO_ILS_RATE_DEFAULT)
 
     product_id = str(p.get("product_id", "")).strip()
 
