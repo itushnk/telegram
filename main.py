@@ -2,7 +2,7 @@
 """
 main.py — Telegram Post Bot + AliExpress Affiliate refill
 
-Version: 2025-12-16h
+Version: 2025-12-17l
 Changes vs previous:
 - Fix TOP timestamp to GMT+8 (per TOP gateway requirement)
 - Raise on TOP error_response (so you finally see the real error instead of '0 products' and None)
@@ -11,7 +11,7 @@ Changes vs previous:
 
 
 # --- Hotfix: ensure price bucket parser exists before any config parsing ---
-print("[EARLY] main.py v2025-12-17i loaded", flush=True)
+print("[EARLY] main.py v2025-12-17l loaded", flush=True)
 def _parse_price_buckets(raw: str):
     """Parse buckets like '1-5,5-10,10-20,20-50,50+' -> [(1,5),(5,10),...,(50,None)]"""
     if not raw:
@@ -64,7 +64,7 @@ import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17i")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17l")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -282,6 +282,17 @@ AE_REFILL_SORT = (os.environ.get("AE_REFILL_SORT", "LAST_VOLUME_DESC") or "LAST_
 AE_PRICE_BUCKETS_RAW_DEFAULT = (os.environ.get("AE_PRICE_BUCKETS", "") or os.environ.get("AE_PRICE_FILTER", "") or "").strip()
 # Allow runtime override via inline buttons (persisted in BOT_STATE)
 AE_PRICE_BUCKETS_RAW = _get_state_str("price_buckets_raw", AE_PRICE_BUCKETS_RAW_DEFAULT)
+
+# Parsed price buckets used by filtering logic (list of tuples (lo, hi_or_None))
+try:
+    AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
+except Exception as e:
+    AE_PRICE_BUCKETS = []
+    try:
+        log_warn(f"[CFG] failed to parse AE_PRICE_BUCKETS_RAW={AE_PRICE_BUCKETS_RAW!r}: {e}")
+    except Exception:
+        print(f"[CFG] failed to parse AE_PRICE_BUCKETS_RAW={AE_PRICE_BUCKETS_RAW!r}: {e}", flush=True)
+
 
 
 
