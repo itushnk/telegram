@@ -244,6 +244,14 @@ except Exception:
     PRICE_DECIMALS = 2
 PRICE_DECIMALS = max(0, min(4, PRICE_DECIMALS))  # safety cap
 
+
+# Price parsing: if API returns a range (e.g., "36.29-2.72"), choose which number to use.
+try:
+    AE_PRICE_PICK_MODE = (os.environ.get("AE_PRICE_PICK_MODE", "min") or "min").strip().lower()
+except Exception:
+    AE_PRICE_PICK_MODE = "min"
+if AE_PRICE_PICK_MODE not in ("min", "max", "first"):
+    AE_PRICE_PICK_MODE = "min"
 # De-duplication across refills / restarts (best effort; for persistence across restarts on Railway add a Volume).
 AE_DEDUP_KEY_MODE = (os.environ.get("AE_DEDUP_KEY_MODE", "itemid") or "itemid").strip().lower()
 AE_DEDUP_SCOPE = (os.environ.get("AE_DEDUP_SCOPE", "both") or "both").strip().lower()  # queue / posted / both
@@ -512,13 +520,47 @@ def clean_price_text(s):
     out = "".join(ch for ch in s if ch.isdigit() or ch == "." or ch == ",")
     return out.strip().replace(",", ".")
 
-def _extract_float(s: str):
+def _extract_numbers(s: str):
+    """Extract all numeric values from a string (supports both 1,234.56 and 1.234,56 styles)."""
     if s is None:
+        return []
+    txt = str(s)
+    out = []
+    # Grab number-like tokens (digits with optional thousands/decimal separators)
+    for token in re.findall(r"[-+]?\d[\d.,]*", txt):
+        t = token.strip().strip(".,")
+        if not t:
+            continue
+        # Normalize separators
+        if "," in t and "." in t:
+            # Decide which is decimal: assume the last separator is the decimal mark.
+            if t.rfind(".") > t.rfind(","):
+                # 1,234.56 -> comma thousands
+                t = t.replace(",", "")
+            else:
+                # 1.234,56 -> dot thousands, comma decimal
+                t = t.replace(".", "").replace(",", ".")
+        else:
+            # Only one of comma/dot present -> treat comma as decimal
+            t = t.replace(",", ".")
+        try:
+            out.append(float(t))
+        except Exception:
+            pass
+    return out
+
+def _extract_float(s: str):
+    """Pick one numeric value from a string according to AE_PRICE_PICK_MODE."""
+    nums = _extract_numbers(s)
+    if not nums:
         return None
-    m = re.search(r"([-+]?\d+(?:[.,]\d+)?)", str(s))
-    if not m:
-        return None
-    return float(m.group(1).replace(",", "."))
+    if AE_PRICE_PICK_MODE == "first":
+        return float(nums[0])
+    if AE_PRICE_PICK_MODE == "max":
+        return float(max(nums))
+    # default: min
+    return float(min(nums))
+
 
 def usd_to_ils(price_text: str, rate: float) -> str:
     """Convert a USD-like text/number into an ILS string with PRICE_DECIMALS digits.
@@ -830,7 +872,8 @@ def format_post(product):
                 lines.append(part)
         lines.append("")
 
-    price_line = f'💰 מחיר מבצע: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
+    price_label = 'מחיר החל מ' if (row.get('PriceIsFrom') or '').strip() else 'מחיר מבצע'
+    price_line = f"💰 {price_label}: {sale_price} ש\"ח (מחיר מקורי: {original_price} ש\"ח)"
     lines += [
         price_line,
         discount_text,
@@ -1327,6 +1370,9 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
     orig_raw = p.get("original_price") or p.get("target_original_price") or ""
 
+    _sale_nums = _extract_numbers(str(sale_raw))
+    price_is_from = (len(_sale_nums) >= 2) or ("-" in str(sale_raw))
+
     sale_ils = usd_to_ils(str(sale_raw), USD_TO_ILS_RATE_DEFAULT)
     orig_ils = usd_to_ils(str(orig_raw), USD_TO_ILS_RATE_DEFAULT)
 
@@ -1347,6 +1393,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Title": (p.get("product_title") or "").strip(),
         "OriginalPrice": orig_ils,
         "SalePrice": sale_ils,
+        "PriceIsFrom": "1" if price_is_from else "",
         "Discount": (p.get("discount") or "").strip(),
         "Rating": (p.get("evaluate_rate") or "").strip(),
         "Orders": str(p.get("lastest_volume") or "").strip(),
