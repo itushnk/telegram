@@ -10,6 +10,7 @@ Changes vs previous:
 """
 
 import os, sys
+from typing import Any, Optional
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -22,7 +23,7 @@ import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17n")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17o")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -475,33 +476,91 @@ def clean_price_text(s):
     out = "".join(ch for ch in s if ch.isdigit() or ch == "." or ch == ",")
     return out.strip().replace(",", ".")
 
-def _extract_float(s: str):
-    if s is None:
-        return None
-    m = re.search(r"([-+]?\d+(?:[.,]\d+)?)", str(s))
-    if not m:
-        return None
-    return float(m.group(1).replace(",", "."))
+# --- Price parsing (robust) --------------------------------------------------
+# AliExpress TOP/affiliate APIs sometimes return prices as:
+# - "US $1.99"
+# - "1.99"
+# - "US $1.99 - 3.49" (ranges)
+# - occasionally digits-only values that can be cents-like for some fields.
+_PRICE_TOKEN_RE = re.compile(r"(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:\.\d+)?")
 
-def usd_to_ils(price_text: str, rate: float) -> str:
-    num = _extract_float(price_text)
-    if num is None:
-        return ""
-    ils = round(num * rate)
-    return str(int(ils))
-
-def _normalize_top_price_raw(raw) -> str:
-    """TOP/AliExpress affiliate sometimes returns prices as integer cents (e.g. '362' == $3.62).
-    This normalizes to a USD string for usd_to_ils()."""
+def _extract_price_candidates(raw: Any) -> list[float]:
+    """Extract one or more numeric price candidates from raw price fields."""
     if raw is None:
-        return ""
+        return []
     s = str(raw).strip()
     if not s:
+        return []
+    tokens = _PRICE_TOKEN_RE.findall(s)
+    out: list[float] = []
+    for t in tokens:
+        t = t.strip().replace(" ", "")
+        # If both comma and dot exist -> commas are thousand separators.
+        if "," in t and "." in t:
+            t2 = t.replace(",", "")
+        # If only comma exists, treat it as thousand separator unless it looks like a decimal comma.
+        elif "," in t and "." not in t:
+            parts = t.split(",")
+            if len(parts) == 2 and 1 <= len(parts[1]) <= 2:
+                t2 = parts[0] + "." + parts[1]
+            else:
+                t2 = "".join(parts)
+        else:
+            t2 = t
+        try:
+            v = float(t2)
+            if v > 0:
+                out.append(v)
+        except Exception:
+            continue
+    return out
+
+def _pick_price_value(raw: Any, *, ref: Optional[float] = None, allow_cents_guess: bool = False) -> Optional[float]:
+    """Pick the most plausible price value (USD) from raw.
+    If ref is provided (e.g., web sale price), prefer candidates close to ref.
+    If allow_cents_guess=True and raw is digits-only, also consider raw/100 as a candidate.
+    """
+    cands = _extract_price_candidates(raw)
+    s = "" if raw is None else str(raw).strip()
+    if allow_cents_guess and s.isdigit():
+        v = float(s)
+        cands = cands + [v / 100.0]
+    if not cands:
+        return None
+
+    # If we have a reference price, select a candidate that is plausible relative to it.
+    if ref is not None and ref > 0:
+        plausible = [x for x in cands if (ref * 0.05) <= x <= (ref * 1.10)]
+        if plausible:
+            return min(plausible, key=lambda x: abs(x - ref))
+        # If nothing plausible, prefer the smallest candidate (ranges, etc.)
+        return min(cands)
+
+    # No ref: for ranges, return the minimum (matches "החל מ").
+    return min(cands)
+
+def _extract_float(s: Any) -> Optional[float]:
+    # Backwards-compatible: return the picked price (min candidate).
+    return _pick_price_value(s)
+
+def usd_to_ils(price: Any, rate: float) -> str:
+    """Convert a USD-ish value (float or string) to ILS integer string."""
+    if price is None:
         return ""
-    # Already looks like a normal decimal/currency string
-    if any(ch in s for ch in (".", ",")) or ("$" in s) or ("usd" in s.lower()) or ("us $" in s.lower()):
-        return s
-    # Pure digits: if length>=3 assume cents -> divide by 100
+    if isinstance(price, (int, float)):
+        usd = float(price)
+    else:
+        usd = _pick_price_value(price)
+        if usd is None:
+            return ""
+    return f"{int(round(usd * float(rate)))}"
+
+def _normalize_top_price_raw(raw: Any) -> str:
+    """Keep raw price text mostly intact (used only for debug/display)."""
+    if raw is None:
+        return ""
+    return str(raw).strip()
+# -----------------------------------------------------------------------------    # Pure digits: if length>=3 assume cents -> divide by 100
     if re.fullmatch(r"\d+", s) and len(s) >= 3:
         try:
             return f"{int(s) / 100:.2f}"
@@ -1240,6 +1299,7 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
         "target_language": AE_TARGET_LANGUAGE,
         "tracking_id": AE_TRACKING_ID,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
+        "country": AE_SHIP_TO_COUNTRY,
         "fields": "product_id,product_title,product_main_image_url,promotion_link,sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url",
         "platform_product_type": "ALL",
     }
@@ -1270,6 +1330,8 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "page_size": str(page_size),
         "sort": AE_REFILL_SORT,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
+        "country": AE_SHIP_TO_COUNTRY,
+        "target_currency": AE_TARGET_CURRENCY,
         "target_language": AE_TARGET_LANGUAGE,
         "fields": fields,
         "platform_product_type": "ALL",
@@ -1292,41 +1354,51 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     return products, resp_code, resp_msg
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
-    # בחירה חכמה של מחיר מבצע: app_sale_price אם קיים, אחרת sale_price
-    sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
-    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
+    # מחיר מדויק יותר:
+    # - קודם משתמשים ב target_sale_price/sale_price (מחיר "רגיל" עקבי יותר).
+    # - את app_sale_price נשתמש רק אם AE_USE_APP_PRICE=1 והוא נראה סביר ביחס למחיר הרגיל.
+    sale_raw = p.get("target_sale_price") or p.get("sale_price") or ""
+    app_raw = p.get("target_app_sale_price") or p.get("app_sale_price") or ""
+    orig_raw = p.get("target_original_price") or p.get("original_price") or ""
 
-    sale_ils = usd_to_ils(_normalize_top_price_raw(sale_raw), USD_TO_ILS_RATE_DEFAULT)
-    orig_ils = usd_to_ils(_normalize_top_price_raw(orig_raw), USD_TO_ILS_RATE_DEFAULT)
+    sale_usd = _pick_price_value(sale_raw)
+    app_usd = _pick_price_value(app_raw, ref=sale_usd, allow_cents_guess=True)
+    use_app = os.getenv("AE_USE_APP_PRICE", "0").strip().lower() in ("1", "true", "yes", "on")
+    chosen_usd = app_usd if (use_app and app_usd is not None) else sale_usd
+    orig_usd = _pick_price_value(orig_raw)
+
+    sale_ils = usd_to_ils(chosen_usd if chosen_usd is not None else sale_raw, USD_TO_ILS_RATE_DEFAULT)
+    orig_ils = usd_to_ils(orig_usd if orig_usd is not None else orig_raw, USD_TO_ILS_RATE_DEFAULT)
+
+    if os.getenv("PRICE_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on"):
+        logger.info(
+            "[PRICE] product_id=%s sale_raw=%r app_raw=%r orig_raw=%r sale_usd=%s app_usd=%s chosen_usd=%s",
+            str(p.get("product_id", "")).strip(),
+            sale_raw, app_raw, orig_raw, sale_usd, app_usd, chosen_usd
+        )
 
     product_id = str(p.get("product_id", "")).strip()
+    title = str(p.get("product_title", "") or p.get("title", "")).strip()
+    promo_url = (
+        str(p.get("promotion_link") or p.get("promotion_url") or p.get("product_detail_url") or "").strip()
+    )
 
-    # לפעמים TOP מחזיר promotion_link ריק אם tracking_id לא תקין/לא משויך.
-    detail_url = (p.get("product_detail_url") or p.get("product_url") or "").strip()
-    if not detail_url and product_id:
-        detail_url = f"https://www.aliexpress.com/item/{product_id}.html"
+    orders = p.get("lastest_volume") or p.get("volume") or p.get("orders") or ""
+    rating = p.get("evaluate_rate") or p.get("evaluate_rating") or p.get("rating") or ""
+    discount = p.get("discount") or ""
 
-    buy_link = (p.get("promotion_link") or p.get("promotion_url") or "").strip()
-    if not buy_link:
-        buy_link = detail_url
-
-    return normalize_row_keys({
-        "ItemId": product_id,
-        "ImageURL": (p.get("product_main_image_url") or "").strip(),
-        "Title": (p.get("product_title") or "").strip(),
-        "OriginalPrice": orig_ils,
-        "SalePrice": sale_ils,
-        "Discount": (p.get("discount") or "").strip(),
-        "Rating": (p.get("evaluate_rate") or "").strip(),
-        "Orders": str(p.get("lastest_volume") or "").strip(),
-        "BuyLink": buy_link,
-        "CouponCode": "",
-        "Opening": "",
-        "Strengths": "",
-        "Video Url": (p.get("product_video_url") or "").strip(),
-    })
-
-
+    return normalize_row_keys(
+        {
+            "ProductId": product_id,
+            "Promotion Url": promo_url,
+            "Origin Price": orig_ils,
+            "Discount Price": sale_ils,
+            "Discount": discount,
+            "Orders": str(orders),
+            "Rating": str(rating),
+            "Title": title,
+        }
+    )
 
 def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | None]:
     """
