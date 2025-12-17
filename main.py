@@ -272,6 +272,9 @@ AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip(
 # target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח.
 AE_TARGET_CURRENCY = "USD"
 
+# Prefer app_sale_price (in-app price) when available. Set AE_USE_APP_PRICE=1 to enable.
+AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1","true","yes","on")
+
 AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_REFILL_INTERVAL_SECONDS = int(os.environ.get("AE_REFILL_INTERVAL_SECONDS", "900") or "900")  # 15 דקות
 AE_REFILL_MIN_QUEUE = int(os.environ.get("AE_REFILL_MIN_QUEUE", "30") or "30")
@@ -1249,6 +1252,7 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "page_no": str(page_no),
         "page_size": str(page_size),
         "sort": AE_REFILL_SORT,
+        "target_currency": AE_TARGET_CURRENCY,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "target_language": AE_TARGET_LANGUAGE,
         "fields": fields,
@@ -1272,16 +1276,62 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     return products, resp_code, resp_msg
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
-    # בחירה חכמה של מחיר מבצע: app_sale_price אם קיים, אחרת sale_price
-    sale_raw = p.get("app_sale_price") or p.get("sale_price") or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
-    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
+    """
+    Normalize an Affiliate/TOP product object into our CSV row schema.
 
-    sale_ils = usd_to_ils(str(sale_raw), USD_TO_ILS_RATE_DEFAULT)
-    orig_ils = usd_to_ils(str(orig_raw), USD_TO_ILS_RATE_DEFAULT)
+    Fixes the "price off by thousands of percent" issue by:
+    1) ensuring affiliate.product.query requests target_currency=USD (so prices are in USD),
+    2) converting USD->ILS with USD_TO_ILS_RATE_DEFAULT,
+    3) handling a known edge case where app_sale_price is ~100x sale_price (cents-without-dot).
+    """
+    def _parse_price_usd(raw) -> float | None:
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        s = clean_price_text(s)
+        if not s:
+            return None
+        return _extract_float(s)
+
+    def _maybe_fix_cents(app_v: float | None, std_v: float | None) -> float | None:
+        # If app price is ~100x the regular price, it's likely "cents without a dot" -> divide by 100.
+        if app_v is None or std_v is None:
+            return app_v
+        try:
+            if std_v > 0:
+                ratio = app_v / std_v
+                if 80.0 <= ratio <= 120.0:
+                    return app_v / 100.0
+        except Exception:
+            pass
+        return app_v
+
+    # Parse both variants if present (prefer target_* if available)
+    std_sale_usd = _parse_price_usd(p.get("target_sale_price") or p.get("sale_price"))
+    app_sale_usd = _parse_price_usd(p.get("target_app_sale_price") or p.get("app_sale_price"))
+    app_sale_usd = _maybe_fix_cents(app_sale_usd, std_sale_usd)
+
+    # Choose based on flag, with safe fallback
+    chosen_sale_usd = (app_sale_usd if AE_USE_APP_PRICE else std_sale_usd) or (std_sale_usd or app_sale_usd)
+
+    orig_usd = _parse_price_usd(p.get("target_original_price") or p.get("original_price"))
+
+    def _usd_to_ils_str(v: float | None) -> str:
+        if v is None:
+            return ""
+        try:
+            return str(int(round(float(v) * float(USD_TO_ILS_RATE_DEFAULT))))
+        except Exception:
+            return ""
+
+    sale_ils = _usd_to_ils_str(chosen_sale_usd)
+    orig_ils = _usd_to_ils_str(orig_usd)
 
     product_id = str(p.get("product_id", "")).strip()
 
-    # לפעמים TOP מחזיר promotion_link ריק אם tracking_id לא תקין/לא משויך.
+    # Sometimes TOP returns promotion_link empty if tracking_id isn't valid/linked.
     detail_url = (p.get("product_detail_url") or p.get("product_url") or "").strip()
     if not detail_url and product_id:
         detail_url = f"https://www.aliexpress.com/item/{product_id}.html"
@@ -1305,8 +1355,6 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Strengths": "",
         "Video Url": (p.get("product_video_url") or "").strip(),
     })
-
-
 
 def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | None]:
     """
