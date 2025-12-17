@@ -2,54 +2,12 @@
 """
 main.py — Telegram Post Bot + AliExpress Affiliate refill
 
-Version: 2025-12-17l
+Version: 2025-12-16h
 Changes vs previous:
 - Fix TOP timestamp to GMT+8 (per TOP gateway requirement)
 - Raise on TOP error_response (so you finally see the real error instead of '0 products' and None)
 - Better refill diagnostics when 0 products returned
 """
-
-
-# --- Hotfix: ensure price bucket parser exists before any config parsing ---
-print("[EARLY] main.py v2025-12-17l loaded", flush=True)
-def _parse_price_buckets(raw: str):
-    """Parse buckets like '1-5,5-10,10-20,20-50,50+' -> [(1,5),(5,10),...,(50,None)]"""
-    if not raw:
-        return []
-    raw = str(raw).strip()
-    if not raw:
-        return []
-    out = []
-    for part in raw.split(","):
-        p = part.strip()
-        if not p:
-            continue
-        if p.endswith("+"):
-            try:
-                lo = float(p[:-1].strip())
-            except Exception:
-                continue
-            out.append((lo, None))
-            continue
-        if "-" in p:
-            a, b = p.split("-", 1)
-            try:
-                lo = float(a.strip())
-                hi = float(b.strip())
-            except Exception:
-                continue
-            if hi < lo:
-                lo, hi = hi, lo
-            out.append((lo, hi))
-            continue
-        try:
-            v = float(p)
-        except Exception:
-            continue
-        out.append((v, v))
-    return out
-
-
 
 import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -64,7 +22,7 @@ import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17l")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17m")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -140,6 +98,50 @@ def _get_state_csv_set(key: str, default_raw: str = "") -> set[str]:
     raw = _get_state_str(key, default_raw)
     parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
     return set(parts)
+
+
+def _parse_price_buckets(raw: str):
+    """Parse bucket spec like: '1-5,5-10,10-20,20-50,50+' into [(1,5),(5,10),(10,20),(20,50),(50,None)].
+    Safe to call early during module import (no dependencies on other helpers).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    def _num(s: str):
+        s = (s or "").strip().replace(",", "")
+        m = re.search(r"[-+]?(?:\d+\.?\d*|\.\d+)", s)
+        if not m:
+            return None
+        try:
+            return float(m.group(0))
+        except Exception:
+            return None
+
+    buckets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.endswith("+"):
+            mn = _num(part[:-1])
+            if mn is not None:
+                buckets.append((mn, None))
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            mn = _num(a)
+            mx = _num(b)
+            if mn is None or mx is None:
+                continue
+            if mx < mn:
+                mn, mx = mx, mn
+            buckets.append((mn, mx))
+            continue
+        # single number => treat as '>= number'
+        mn = _num(part)
+        if mn is not None:
+            buckets.append((mn, None))
+    return buckets
 
 def _set_state_csv_set(key: str, values: set[str]):
     raw = ",".join(sorted({(v or "").strip() for v in (values or set()) if (v or "").strip()}))
@@ -282,19 +284,19 @@ AE_REFILL_SORT = (os.environ.get("AE_REFILL_SORT", "LAST_VOLUME_DESC") or "LAST_
 AE_PRICE_BUCKETS_RAW_DEFAULT = (os.environ.get("AE_PRICE_BUCKETS", "") or os.environ.get("AE_PRICE_FILTER", "") or "").strip()
 # Allow runtime override via inline buttons (persisted in BOT_STATE)
 AE_PRICE_BUCKETS_RAW = _get_state_str("price_buckets_raw", AE_PRICE_BUCKETS_RAW_DEFAULT)
+AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
 
-# Parsed price buckets used by filtering logic (list of tuples (lo, hi_or_None))
-try:
-    AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
-except Exception as e:
-    AE_PRICE_BUCKETS = []
-    try:
-        log_warn(f"[CFG] failed to parse AE_PRICE_BUCKETS_RAW={AE_PRICE_BUCKETS_RAW!r}: {e}")
-    except Exception:
-        print(f"[CFG] failed to parse AE_PRICE_BUCKETS_RAW={AE_PRICE_BUCKETS_RAW!r}: {e}", flush=True)
+# Optional other filters (persisted)
+AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "0") or "0"))
+AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "0") or "0")  # percent (0-100)
+AE_FREE_SHIP_ONLY_DEFAULT = (os.environ.get("AE_FREE_SHIP_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
+AE_FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("AE_FREE_SHIP_THRESHOLD_ILS", "38") or "38")  # heuristic
+AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
 
-
-
+MIN_ORDERS = _get_state_int("min_orders", AE_MIN_ORDERS_DEFAULT)
+MIN_RATING = _get_state_float("min_rating", AE_MIN_RATING_DEFAULT)
+FREE_SHIP_ONLY = _get_state_bool("free_ship_only", AE_FREE_SHIP_ONLY_DEFAULT)
+CATEGORY_IDS_RAW = _get_state_str("category_ids_raw", AE_CATEGORY_IDS_DEFAULT)
 
 def set_min_orders(n: int):
     global MIN_ORDERS
