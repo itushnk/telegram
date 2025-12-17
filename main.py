@@ -229,6 +229,121 @@ CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
+# ========= DEDUP / HISTORY (avoid refetching / reposting same products) =========
+# Goal: prevent items that already appeared in the queue or were already posted from returning again.
+# Storage: a JSON file in BASE_DIR that keeps a map {dedup_key: last_seen_epoch}.
+POSTED_HISTORY_JSON = os.path.join(BASE_DIR, "posted_history.json")
+
+# AE_DEDUP_SCOPE:
+# - "pending_only"         : current behavior (avoid duplicates only inside pending queue)
+# - "pending_and_history"  : avoid duplicates in pending + also avoid items that were posted before (recommended)
+# - "off"                  : do not dedup at all
+AE_DEDUP_SCOPE = (os.environ.get("AE_DEDUP_SCOPE", "pending_and_history") or "pending_and_history").strip().lower()
+
+# AE_DEDUP_KEY_MODE:
+# - "item"       : ItemId only (best to avoid repeats even if buy link changes)
+# - "item_link"  : ItemId + BuyLink (stricter, can allow repeats if link changes)
+# - "link"       : BuyLink only
+AE_DEDUP_KEY_MODE = (os.environ.get("AE_DEDUP_KEY_MODE", "item") or "item").strip().lower()
+
+# Keep history bounded
+AE_DEDUP_MAX_DAYS  = int(float(os.environ.get("AE_DEDUP_MAX_DAYS", "90") or "90"))   # prune older than N days
+AE_DEDUP_MAX_ITEMS = int(float(os.environ.get("AE_DEDUP_MAX_ITEMS", "200000") or "200000"))  # cap total keys
+
+# When history scope is enabled and the next queue item is already "seen", skip it instead of reposting.
+AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND = (os.environ.get("AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND", "1") or "1").strip().lower() in ("1","true","yes","on")
+
+_SEEN_CACHE = None  # dict[str, int]
+
+def _dedup_key_str(row: dict) -> str:
+    """Build a stable key to identify the product for de-duplication."""
+    item_id = str((row.get("ItemId") or "")).strip()
+    buy = str((row.get("BuyLink") or "")).strip()
+    title = str((row.get("Title") or "")).strip()
+
+    mode = AE_DEDUP_KEY_MODE
+    if mode == "link":
+        return buy or item_id or title
+    if mode == "item_link":
+        # keep as JSON to avoid delimiter collisions
+        return json.dumps([item_id or None, buy or None], ensure_ascii=False)
+    # default: "item"
+    return item_id or buy or title
+
+def _load_seen_history() -> dict:
+    try:
+        if not os.path.exists(POSTED_HISTORY_JSON):
+            return {}
+        with open(POSTED_HISTORY_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        if isinstance(data, dict):
+            # normalize values to int epoch
+            out = {}
+            for k, v in data.items():
+                try:
+                    out[str(k)] = int(float(v))
+                except Exception:
+                    continue
+            return out
+        return {}
+    except Exception:
+        return {}
+
+def _save_seen_history(hist: dict) -> None:
+    try:
+        tmp = POSTED_HISTORY_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(hist or {}, f, ensure_ascii=False)
+        os.replace(tmp, POSTED_HISTORY_JSON)
+    except Exception:
+        pass
+
+def _prune_seen_history(hist: dict) -> dict:
+    if not hist:
+        return {}
+    now = int(time.time())
+    # prune by days
+    if AE_DEDUP_MAX_DAYS and AE_DEDUP_MAX_DAYS > 0:
+        cutoff = now - int(AE_DEDUP_MAX_DAYS) * 86400
+        hist = {k: v for k, v in hist.items() if isinstance(v, int) and v >= cutoff}
+    # cap size by keeping newest
+    if AE_DEDUP_MAX_ITEMS and AE_DEDUP_MAX_ITEMS > 0 and len(hist) > AE_DEDUP_MAX_ITEMS:
+        items = sorted(hist.items(), key=lambda kv: kv[1] if isinstance(kv[1], int) else 0, reverse=True)
+        hist = dict(items[:AE_DEDUP_MAX_ITEMS])
+    return hist
+
+def _ensure_seen_loaded() -> dict:
+    global _SEEN_CACHE
+    if _SEEN_CACHE is None:
+        _SEEN_CACHE = _prune_seen_history(_load_seen_history())
+        _save_seen_history(_SEEN_CACHE)
+    return _SEEN_CACHE
+
+def _seen_has(key: str) -> bool:
+    if AE_DEDUP_SCOPE not in ("pending_and_history",):
+        return False
+    hist = _ensure_seen_loaded()
+    return key in hist
+
+def _seen_mark(key: str) -> None:
+    if AE_DEDUP_SCOPE not in ("pending_and_history",):
+        return
+    hist = _ensure_seen_loaded()
+    hist[key] = int(time.time())
+    # light prune periodically
+    if len(hist) > max(1000, AE_DEDUP_MAX_ITEMS):
+        hist = _prune_seen_history(hist)
+        # update global ref
+        globals()["_SEEN_CACHE"] = hist
+    _save_seen_history(hist)
+
+def _seen_reset() -> None:
+    global _SEEN_CACHE
+    _SEEN_CACHE = {}
+    _save_seen_history(_SEEN_CACHE)
+
+
+
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
 
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
@@ -975,6 +1090,18 @@ def send_next_locked(source: str = "loop") -> bool:
         item = pending[0]
         item_id = (item.get("ItemId") or "").strip()
         title = (item.get("Title") or "").strip()[:120]
+        dedup_key = _dedup_key_str(item)
+
+        # If this item was already posted before (history), skip it safely (avoid re-post).
+        if AE_DEDUP_SCOPE == "pending_and_history" and AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND and _seen_has(dedup_key):
+            try:
+                write_products(PENDING_CSV, pending[1:])
+                log_info(f"{source}: SKIP already-posted item and advanced queue (ItemId={item_id})")
+                return True
+            except Exception as e_skip:
+                log_info(f"{source}: SKIP write failed: {e_skip}")
+                return False
+
         log_info(f"{source}: sending ItemId={item_id} | Title={title}")
 
         ok = post_to_channel(item)
@@ -982,6 +1109,13 @@ def send_next_locked(source: str = "loop") -> bool:
             # IMPORTANT: do NOT advance queue on failures
             log_info(f"{source}: send FAILED, queue NOT advanced (ItemId={item_id})")
             return False
+
+        # Mark as seen immediately after a successful post (so even if queue write fails, we won't repost).
+        try:
+            if AE_DEDUP_SCOPE == "pending_and_history":
+                _seen_mark(dedup_key)
+        except Exception:
+            pass
 
         try:
             write_products(PENDING_CSV, pending[1:])
@@ -992,6 +1126,8 @@ def send_next_locked(source: str = "loop") -> bool:
                 write_products(PENDING_CSV, pending[1:])
             except Exception as e2:
                 log_exc(f"{source}: write FAILED permanently: {e2}")
+                # At this point, item was posted but the queue failed to advance.
+                # Next run will SKIP it thanks to _seen_mark() above.
                 return False
 
         log_info(f"{source}: sent & advanced queue (ItemId={item_id})")
@@ -1061,12 +1197,17 @@ def merge_from_data_into_pending():
     data_rows = read_products(DATA_CSV)
     pending_rows = read_products(PENDING_CSV)
 
-    existing_keys = {_key_of_row(r) for r in pending_rows}
+    existing_keys = {_dedup_key_str(r) for r in pending_rows}
+    if AE_DEDUP_SCOPE == "pending_and_history":
+        try:
+            existing_keys.update(_ensure_seen_loaded().keys())
+        except Exception:
+            pass
     added = 0
     already = 0
 
     for r in data_rows:
-        k = _key_of_row(r)
+        k = _dedup_key_str(r)
         if k in existing_keys:
             already += 1
             continue
@@ -1365,7 +1506,12 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
 
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
-        existing_keys = {_key_of_row(r) for r in pending_rows}
+        existing_keys = {_dedup_key_str(r) for r in pending_rows}
+        if AE_DEDUP_SCOPE == "pending_and_history":
+            try:
+                existing_keys.update(_ensure_seen_loaded().keys())
+            except Exception:
+                pass
 
     added = 0
     dup = 0
@@ -1437,7 +1583,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                             skipped_no_link += 1
                             continue
 
-                        k = _key_of_row(row)
+                        k = _dedup_key_str(row)
                         if k in existing_keys:
                             dup += 1
                             continue
@@ -1508,7 +1654,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                         skipped_no_link += 1
                         continue
 
-                    k = _key_of_row(row)
+                    k = _dedup_key_str(row)
                     if k in existing_keys:
                         dup += 1
                         continue
@@ -2349,6 +2495,35 @@ def cmd_tail(msg):
     except Exception as e:
         log_exc(f"tail logs failed: {e}")
         bot.reply_to(msg, f"שגיאה בקריאת לוג: {e}")
+
+
+@bot.message_handler(commands=['dedup_status'])
+def cmd_dedup_status(message):
+    if not _is_admin(message):
+        bot.reply_to(message, "⛔ אין הרשאה.")
+        return
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        hist = _ensure_seen_loaded() if AE_DEDUP_SCOPE == "pending_and_history" else {}
+        text = (
+            "🧠 מצב כפילויות / היסטוריה\n"
+            f"• AE_DEDUP_SCOPE: {AE_DEDUP_SCOPE}\n"
+            f"• AE_DEDUP_KEY_MODE: {AE_DEDUP_KEY_MODE}\n"
+            f"• pending כרגע: {len(pending)}\n"
+            f"• history שמור: {len(hist)}\n"
+            f"• קובץ: {POSTED_HISTORY_JSON}"
+        )
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=['dedup_reset'])
+def cmd_dedup_reset(message):
+    if not _is_admin(message):
+        bot.reply_to(message, "⛔ אין הרשאה.")
+        return
+    with FILE_LOCK:
+        _seen_reset()
+    bot.reply_to(message, "✅ אופס: ההיסטוריה נוקתה. פריטים יכולים להופיע שוב בשליפות עתידיות.")
+
 
 @bot.message_handler(commands=['refill_now'])
 def cmd_refill_now(msg):
