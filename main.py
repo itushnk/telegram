@@ -325,21 +325,8 @@ except Exception:
 
 _openai_client = None
 
-AI_RUNTIME_OK = True
-AI_LAST_ERROR = None
-AI_LAST_ERROR_AT = None
-
-def _set_ai_error(err: str | None):
-    global AI_LAST_ERROR, AI_LAST_ERROR_AT, AI_RUNTIME_OK
-    AI_LAST_ERROR = err
-    if err:
-        AI_LAST_ERROR_AT = datetime.datetime.now().isoformat(timespec="seconds")
-        # אם זו בעיית הרשאה/מודל – נשבית זמנית כדי לא להציף לוגים
-        if "does not have access to model" in err or "model_not_found" in err:
-            AI_RUNTIME_OK = False
-
 def _ai_enabled() -> bool:
-    return bool(GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None and AI_RUNTIME_OK)
+    return bool(GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None)
 
 def _get_openai_client():
     global _openai_client
@@ -349,48 +336,24 @@ def _get_openai_client():
 
 
 def _resolve_model_effective(client):
-    """בחר מודל שעובד בפועל בפרויקט (לפי models.list), כדי למנוע 403 model_not_found.
+    """בחר מודל שעובד בפועל בפרויקט (לפי models.list), כדי למנוע 403 model_not_found."""
+    global OPENAI_MODEL_EFFECTIVE
 
-    תומך גם בשמות "alias" (למשל gpt-4o-mini) כאשר ברשימת המודלים מופיעים IDs עם suffix תאריך
-    (למשל gpt-4o-mini-2024-07-18).
-    """
-    global OPENAI_MODEL_EFFECTIVE, AI_RUNTIME_OK
-
-    # אם AI כבוי/חסר – לא משנים
-    if not (GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None):
+    if not _ai_enabled():
         OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
         return OPENAI_MODEL_EFFECTIVE, []
 
-    available: list[str] = []
+    available = []
     try:
         ms = client.models.list()
-        available = [m.id for m in getattr(ms, "data", [])] or []
+        available = [m.id for m in getattr(ms, "data", [])]
     except Exception as e:
         logging.warning(f"[AI] models.list failed: {e}")
         OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
         return OPENAI_MODEL_EFFECTIVE, []
 
-    def best_match(name: str) -> str | None:
-        name = (name or "").strip()
-        if not name:
-            return None
-        if name in available:
-            return name
-        # Alias match: pick the latest-ish suffix by lexicographic sort
-        pref = [mid for mid in available if mid.startswith(name + "-")]
-        if pref:
-            return sorted(pref)[-1]
-        # Some accounts may expose variants like gpt-4o-mini-latest
-        pref3 = [mid for mid in available if mid.startswith(name + "-latest")]
-        if pref3:
-            return sorted(pref3)[-1]
-        return None
-
-    picked = best_match(OPENAI_MODEL)
-    if picked:
-        OPENAI_MODEL_EFFECTIVE = picked
-        AI_RUNTIME_OK = True
-        _set_ai_error(None)
+    if OPENAI_MODEL in available:
+        OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
         return OPENAI_MODEL_EFFECTIVE, available
 
     # נסה לבחור מודל מועדף שקיים
@@ -404,17 +367,15 @@ def _resolve_model_effective(client):
         "gpt-3.5-turbo",
     ]
     for cand in preferred:
-        picked = best_match(cand)
-        if picked:
-            OPENAI_MODEL_EFFECTIVE = picked
-            AI_RUNTIME_OK = True
-            _set_ai_error(None)
-            logging.warning(f"[AI] OPENAI_MODEL='{OPENAI_MODEL}' not available. Using '{OPENAI_MODEL_EFFECTIVE}' instead.")
+        if cand in available:
+            logging.warning(f"[AI] OPENAI_MODEL='{OPENAI_MODEL}' not available. Auto-selected '{cand}'.")
+            OPENAI_MODEL_EFFECTIVE = cand
             return OPENAI_MODEL_EFFECTIVE, available
 
     logging.warning(f"[AI] OPENAI_MODEL='{OPENAI_MODEL}' not available and no preferred model found. Leaving as-is.")
     OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
     return OPENAI_MODEL_EFFECTIVE, available
+
 
 def ai_diagnostics_startup():
     """בדיקות AI בתחילת ריצה: KEY, models.list, בחירת מודל אפקטיבי."""
@@ -461,6 +422,7 @@ AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "0") or "0"))
 AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "0") or "0")  # percent (0-100)
 AE_FREE_SHIP_ONLY_DEFAULT = (os.environ.get("AE_FREE_SHIP_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
 AE_FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("AE_FREE_SHIP_THRESHOLD_ILS", "38") or "38")  # heuristic
+FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("FREE_SHIP_THRESHOLD_ILS", str(AE_FREE_SHIP_THRESHOLD_ILS)) or str(AE_FREE_SHIP_THRESHOLD_ILS))
 AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
 
 MIN_ORDERS = _get_state_int("min_orders", AE_MIN_ORDERS_DEFAULT)
@@ -885,19 +847,15 @@ def ai_enrich_rows(rows: list[dict], reason: str = "") -> tuple[int, str | None]
     """
     if not rows:
         return 0, None
-    if not GPT_ENABLED:
+    if not _ai_enabled():
+        # לא עוצרים את הבוט אם אין AI – פשוט מדלגים
+        if GPT_ENABLED and OpenAI is None:
+            return 0, "GPT_ENABLED=1 אבל חסר dependency: openai (pip install openai)"
+        if GPT_ENABLED and not OPENAI_API_KEY:
+            return 0, "GPT_ENABLED=1 אבל OPENAI_API_KEY חסר"
         return 0, None
-    if OpenAI is None:
-        return 0, "GPT_ENABLED=1 אבל חסר dependency: openai (pip install openai)"
-    if not OPENAI_API_KEY:
-        return 0, "GPT_ENABLED=1 אבל OPENAI_API_KEY חסר"
 
     client = _get_openai_client()
-    # פתרון מודל אפקטיבי גם אם בעבר כשל (למשל אחרי החלפת API KEY/מודל)
-    try:
-        _resolve_model_effective(client)
-    except Exception as e:
-        logging.warning(f"[AI] resolve_model_effective failed: {e}")
     updated = 0
     last_err = None
 
@@ -937,7 +895,6 @@ def ai_enrich_rows(rows: list[dict], reason: str = "") -> tuple[int, str | None]
         try:
             # Prefer Responses API, fallback to Chat Completions automatically
             data = _openai_structured_items(client, prompt)
-            _set_ai_error(None)
             items = data.get("items", []) if isinstance(data, dict) else []
             by_id = {str(it.get("item_id","")).strip(): it for it in items if isinstance(it, dict)}
 
@@ -958,7 +915,6 @@ def ai_enrich_rows(rows: list[dict], reason: str = "") -> tuple[int, str | None]
 
         except Exception as e:
             last_err = str(e)
-            _set_ai_error(last_err)
 
     return updated, last_err
 
@@ -1680,7 +1636,7 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "platform_product_type": "ALL",
     }
     if category_id:
-        biz["category_ids"] = str(category_id).strip()
+        biz["category_ids"] = str(category_id).strip()()()
 
     # If AE_KEYWORDS provided, rotate keywords to avoid repetitive results
     if AE_KEYWORDS:
@@ -2775,60 +2731,6 @@ def cmd_version(msg):
         parse_mode="HTML",
     )
 
-
-
-@bot.message_handler(commands=['ai'])
-def cmd_ai(message):
-    """אדמין: סטטוס AI + מודלים זמינים (דגימה) + שגיאה אחרונה."""
-    if not _is_admin(message.from_user.id):
-        return
-    parts = (message.text or '').strip().split()
-    do_test = len(parts) > 1 and parts[1].lower() in ('test','check','ping')
-
-    status = []
-    status.append(f"GPT_ENABLED={int(bool(GPT_ENABLED))}")
-    status.append(f"OPENAI_API_KEY={'set' if bool(OPENAI_API_KEY) else 'missing'}")
-    status.append(f"OPENAI_MODEL={OPENAI_MODEL}")
-    status.append(f"OPENAI_MODEL_EFFECTIVE={OPENAI_MODEL_EFFECTIVE}")
-    status.append(f"AI_RUNTIME_OK={int(bool(AI_RUNTIME_OK))}")
-    if AI_LAST_ERROR:
-        status.append(f"LAST_ERROR_AT={AI_LAST_ERROR_AT}")
-        status.append(f"LAST_ERROR={AI_LAST_ERROR}")
-
-    # models.list (אם אפשר)
-    models_sample = None
-    if GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None:
-        try:
-            client = _get_openai_client()
-            eff, available = _resolve_model_effective(client)
-            gpts = [m for m in available if m.startswith('gpt-')][:40]
-            models_sample = gpts
-            status.append(f"RESOLVED_EFFECTIVE={eff}")
-        except Exception as e:
-            status.append(f"models.list failed: {e}")
-
-    # smoke test
-    if do_test and GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None:
-        try:
-            client = _get_openai_client()
-            eff, _ = _resolve_model_effective(client)
-            # הכי קטן כדי לוודא הרשאות
-            r = client.chat.completions.create(
-                model=eff,
-                messages=[{'role':'user','content':'ping'}],
-                max_tokens=1,
-                temperature=0
-            )
-            status.append("SMOKE_TEST=OK")
-        except Exception as e:
-            status.append(f"SMOKE_TEST=FAIL: {e}")
-            _set_ai_error(str(e))
-
-    txt = "🧠 סטטוס AI\n" + "\n".join(status)
-    if models_sample is not None:
-        txt += "\n\n📌 models.list (sample):\n" + "\n".join(models_sample)
-
-    bot.reply_to(message, txt)
 @bot.message_handler(commands=['tail', 'logs'])
 def cmd_tail(msg):
     if not _is_admin(msg):
@@ -2942,7 +2844,7 @@ def refill_daemon():
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    log_info(f"[BOOT] main.py {CODE_VERSION} fp={_code_fingerprint()} commit={os.environ.get('RAILWAY_GIT_COMMIT_SHA') or os.environ.get('GIT_COMMIT') or 'n/a'}")
+    log_info(f"[BOOT] main.py {CODE_VERSION} fp={_code_fingerprint()} commit={os.environ.get('RAILWAY_GIT_COMMIT_SHA') or os.environ.get('RAILWAY_COMMIT_SHA') or os.environ.get('GIT_COMMIT') or 'n/a'}")
     log_info(f"Instance: {socket.gethostname()}")
 
     # הדפסה קצרה של קונפיג (מסכות)
@@ -2956,40 +2858,31 @@ if __name__ == "__main__":
     except Exception as e:
         print("getMe failed:", e, flush=True)
 
+
     # Extra runtime diagnostics (safe)
     log_info(f"[CFG] PUBLIC_CHANNEL={os.environ.get('PUBLIC_CHANNEL', '')} | CURRENT_TARGET={CURRENT_TARGET}")
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
-    log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={int(MIN_RATING*100)}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
+    log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
 
-    # AI config snapshot + diagnostics
-    try:
-        ai_state = "ON" if (GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None) else "OFF"
-        ai_note = ""
-        if GPT_ENABLED and not OPENAI_API_KEY:
-            ai_note = " (missing OPENAI_API_KEY)"
-        elif GPT_ENABLED and OpenAI is None:
-            ai_note = " (missing 'openai' package)"
-        elif GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None and not AI_RUNTIME_OK:
-            ai_note = f" (runtime disabled: {AI_LAST_ERROR})"
-        log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} (effective={OPENAI_MODEL_EFFECTIVE}) | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
-    except Exception as e:
-        log_error(f"[CFG] AI diagnostics failed: {e}")
 
-    # Resolve model list / effective model (and print models sample)
-    try:
-        ai_diagnostics_startup()
-    except Exception as e:
-        log_error(f"[AI] diagnostics failed: {e}")
-
-    # Local single-instance lock (prevents double start inside same container)
+# AI diagnostics
+try:
+    ai_state = "ON" if _ai_enabled() else "OFF"
+    ai_note = ""
+    if GPT_ENABLED and not OPENAI_API_KEY:
+        ai_note = " (missing OPENAI_API_KEY)"
+    elif GPT_ENABLED and OpenAI is None:
+        ai_note = " (missing 'openai' package)"
+    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} (effective={OPENAI_MODEL_EFFECTIVE}) | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
+except Exception:
+    pass
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
         print("Another instance is running (lock failed). Exiting.", flush=True)
         sys.exit(1)
 
-    # Telegram webhook cleanup
     print_webhook_info()
     try:
         force_delete_webhook()
@@ -2998,22 +2891,63 @@ if __name__ == "__main__":
         try:
             bot.remove_webhook()
         except Exception as e2:
-            log_error(f"remove_webhook failed: {e2}")
+            print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+    print_webhook_info()
 
-    # Workers
+    if not os.path.exists(AUTO_FLAG_FILE):
+        write_auto_flag("on")
+
     t1 = threading.Thread(target=auto_post_loop, daemon=True)
     t1.start()
+# AI diagnostics (show clearly if AI is really enabled)
+try:
+    try:
+        import openai as _openai_pkg
+        log_info(f"[CFG] OPENAI_SDK_VERSION={getattr(_openai_pkg, '__version__', 'unknown')}")
+    except Exception:
+        pass
 
-    if AE_REFILL_ENABLED:
-        t2 = threading.Thread(target=refill_daemon, daemon=True)
-        t2.start()
+    ai_state = "ON" if _ai_enabled() else "OFF"
+    ai_note = ""
+    if GPT_ENABLED and not OPENAI_API_KEY:
+        ai_note = " (missing OPENAI_API_KEY)"
+    elif GPT_ENABLED and OpenAI is None:
+        ai_note = " (missing 'openai' package)"
+    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} (effective={OPENAI_MODEL_EFFECTIVE}) | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
+except Exception as e:
+    log_error(f"[CFG] AI diagnostics failed: {e}")
 
-    # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception as e:
-            msg = str(e)
-            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-            log_error(f"Polling error: {e}. Retrying in {wait}s...")
-            time.sleep(wait)
+_lock_handle = acquire_single_instance_lock(LOCK_PATH)
+if _lock_handle is None:
+    print("Another instance is running (lock failed). Exiting.", flush=True)
+    sys.exit(1)
+
+print_webhook_info()
+try:
+    force_delete_webhook()
+    bot.delete_webhook(drop_pending_updates=True)
+except Exception:
+    try:
+        bot.remove_webhook()
+    except Exception as e2:
+        print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+print_webhook_info()
+
+if not os.path.exists(AUTO_FLAG_FILE):
+    write_auto_flag("on")
+
+t1 = threading.Thread(target=auto_post_loop, daemon=True)
+t1.start()
+
+t2 = threading.Thread(target=refill_daemon, daemon=True)
+t2.start()
+
+# Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
+while True:
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+    except Exception as e:
+        msg = str(e)
+        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+        log_error(f"Polling error: {e}. Retrying in {wait}s...")
+        time.sleep(wait)
