@@ -172,15 +172,20 @@ def log_info(msg: str):
     except Exception:
         print(msg, flush=True)
 
+
+def log_error(msg: str):
+    """Backwards-compat alias: some places call log_error()."""
+    try:
+        log_exc(msg)
+    except Exception:
+        try:
+            print(f"[ERROR] {msg}", flush=True)
+        except Exception:
+            pass
+
 def log_exc(msg: str):
     try:
         _logger.exception(msg)
-    except Exception:
-        print(msg, flush=True)
-
-def log_error(msg: str):
-    try:
-        _logger.error(msg)
     except Exception:
         print(msg, flush=True)
 
@@ -223,10 +228,6 @@ if not JOIN_URL:
 ADMIN_USER_IDS_RAW = (os.environ.get("ADMIN_USER_IDS", "") or "").strip()  # "123,456"
 ADMIN_USER_IDS = set(int(x) for x in ADMIN_USER_IDS_RAW.split(",") if x.strip().isdigit()) if ADMIN_USER_IDS_RAW else set()
 
-AE_KEYWORDS_RAW = (os.environ.get("AE_KEYWORDS", "") or "").strip()
-AE_KEYWORDS_LIST = [k.strip() for k in AE_KEYWORDS_RAW.split(",") if k.strip()] if AE_KEYWORDS_RAW else []
-KEYWORD_INDEX_FILE = os.path.join(BASE_DIR, "keyword_index.txt")
-
 # קבצים (בתיקיית DATA המתמשכת)
 DATA_CSV    = os.path.join(BASE_DIR, "workfile.csv")        # קובץ המקור האחרון שהועלה
 PENDING_CSV = os.path.join(BASE_DIR, "pending.csv")         # תור הפוסטים
@@ -241,26 +242,14 @@ ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשי�
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = (os.environ.get(name, "") or "").strip().lower()
-    if v in ("1", "true", "yes", "y", "on", "enable", "enabled"):
-        return True
-    if v in ("0", "false", "no", "n", "off", "disable", "disabled"):
-        return False
-    return default
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int((os.environ.get(name, "") or "").strip() or default)
-    except Exception:
-        return default
-
-PRICE_DECIMALS = max(0, min(2, _env_int("PRICE_DECIMALS", 2)))
-AE_PRICE_INT_IS_CENTS = _env_bool("AE_PRICE_INT_IS_CENTS", True)
-AE_USE_APP_PRICE = _env_bool("AE_USE_APP_PRICE", True)
+PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
+AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+# If TOP returns integer-like prices that are actually cents (e.g. 3690 instead of 36.90), enable this.
+AE_PRICE_INT_IS_CENTS = (os.environ.get("AE_PRICE_INT_IS_CENTS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+# When price is a range like "1.23-4.56": choose "min" or "max" or "mid"
 AE_PRICE_PICK_MODE = (os.environ.get("AE_PRICE_PICK_MODE", "min") or "min").strip().lower()
 
-
+AE_KEYWORDS = (os.environ.get("AE_KEYWORDS", "") or "").strip()
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
@@ -274,7 +263,7 @@ _default_candidates = [
     "https://api-sg.aliexpress.com/sync",       # Newer AliExpress gateway (/sync)
     "https://api.taobao.com/router/rest",        # Overseas (US)
     "https://gw.api.taobao.com/router/rest",     # Legacy gateway
-    # "https://eco.taobao.com/router/rest",        # Alt/legacy (often invalid appkey)
+    "https://eco.taobao.com/router/rest",        # Alt/legacy
     # "https://de-api.aliexpress.com/router/rest", # EU gateway (often returns isv.appkey-not-exists)
 ]
 
@@ -485,6 +474,11 @@ def safe_int(value, default=0):
     except Exception:
         return default
 
+def _to_str(x) -> str:
+    """Safe string cast used in logs/UI."""
+    return "" if x is None else str(x)
+
+
 def norm_percent(value, decimals=1, empty_fallback=""):
     s = str(value).strip() if value is not None else ""
     if not s:
@@ -513,51 +507,54 @@ def _extract_float(s: str):
         return None
     return float(m.group(1).replace(",", "."))
 
-from decimal import Decimal, ROUND_HALF_UP
-
-def _extract_all_numbers(s: str) -> list[float]:
-    if s is None:
-        return []
-    s = str(s)
-    nums = re.findall(r"([-+]?\d+(?:[.,]\d+)?)", s)
-    out = []
-    for n in nums:
-        try:
-            out.append(float(n.replace(",", ".")))
-        except Exception:
-            continue
-    return out
-
-def _normalize_price_number(raw_text: str, num: float) -> float:
-    # Sometimes API returns cents as integer-like string (e.g., "3690" meaning 36.90)
-    if not AE_PRICE_INT_IS_CENTS:
-        return num
-    t = (raw_text or "").strip()
-    if re.fullmatch(r"\d+", t) and num >= 1000:
-        return num / 100.0
-    return num
+def _format_money(num: float, decimals: int) -> str:
+    """Format number with fixed decimals (Excel/Telegram friendly)."""
+    try:
+        decimals = int(decimals)
+    except Exception:
+        decimals = 2
+    if decimals <= 0:
+        return str(int(round(num)))
+    return f"{num:.{decimals}f}"
 
 def usd_to_ils(price_text: str, rate: float) -> str:
-    raw = "" if price_text is None else str(price_text).strip()
-    nums = _extract_all_numbers(raw)
-    if not nums:
+    """Convert a USD price string to ILS string, preserving decimals.
+
+    Notes:
+    - If the raw string already looks like ILS (₪/ILS/NIS), we DO NOT convert again.
+    - If the API returns cents as an integer string (e.g. '1290' meaning $12.90), we normalize.
+    """
+    if price_text is None:
         return ""
-    # price ranges: pick min/max/first
-    if AE_PRICE_PICK_MODE == "max":
-        num = max(nums)
-    elif AE_PRICE_PICK_MODE == "first":
-        num = nums[0]
+    raw_original = str(price_text)
+    raw_clean = clean_price_text(raw_original)
+    num = _extract_float(raw_clean)
+    if num is None:
+        return ""
+
+    # Heuristic: cents-as-integer (common in some affiliate fields)
+    if AE_PRICE_INT_IS_CENTS and raw_clean and raw_clean.isdigit():
+        try:
+            ival = int(raw_clean)
+            if ival >= 1000 and ival <= 10000000:
+                num = ival / 100.0
+        except Exception:
+            pass
+
+    # If already ILS -> don't convert again
+    up = raw_original.upper()
+    if ("₪" in raw_original) or ("ILS" in up) or ("NIS" in up):
+        ils = float(num)
     else:
-        num = min(nums)
+        ils = float(num) * float(rate)
 
-    num = _normalize_price_number(raw, num)
-
-    # Convert USD -> ILS and keep decimals as configured
-    q = Decimal("1") if PRICE_DECIMALS == 0 else Decimal("0.01")
-    ils = (Decimal(str(num)) * Decimal(str(rate))).quantize(q, rounding=ROUND_HALF_UP)
-    if PRICE_DECIMALS == 0:
-        return str(int(ils))
-    return f"{ils:.2f}"
+    # Apply decimals
+    dec = PRICE_DECIMALS
+    try:
+        dec = int(dec)
+    except Exception:
+        dec = 2
+    return _format_money(round(ils, dec), dec)
 
 
 def _parse_price_buckets(raw: str):
@@ -779,37 +776,54 @@ def is_quiet_now(now: datetime | None = None) -> bool:
 
 # ========= SAFE EDIT =========
 def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
-    try:
-        curr_text = (message.text or message.caption or "")
-        if curr_text == (new_text or ""):
-            try:
-                if reply_markup is not None:
-                    bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-                if cb_id:
-                    bot.answer_callback_query(cb_id)
-                return
-            except Exception as e_rm:
-                if "message is not modified" in str(e_rm):
-                    if cb_id:
-                        bot.answer_callback_query(cb_id)
-                    return
-        bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        if cb_id:
-            bot.answer_callback_query(cb_id)
-    except Exception as e:
-        if "message is not modified" in str(e):
-            if cb_id:
-                bot.answer_callback_query(cb_id)
-            return
-        if cb_id and cb_info:
-            bot.answer_callback_query(cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
-        else:
-            raise
+    """Safely edit an existing message and (optionally) answer callback queries.
 
-# ========= POSTING =========
+    Telegram can return:
+    - 400: query is too old / message not modified
+    - 409: conflicts (handled elsewhere)
+    This helper should NEVER crash the bot.
+    """
+    try:
+        curr_text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        # If text unchanged, just update markup (if provided) and answer callback
+        if curr_text == (new_text or ""):
+            if reply_markup is not None:
+                try:
+                    bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
+                except Exception:
+                    pass
+            if cb_id:
+                try:
+                    bot.answer_callback_query(cb_id)
+                except Exception:
+                    pass
+            return
+
+        try:
+            bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception:
+            # Try caption edit (for media messages)
+            try:
+                bot.edit_message_caption(chat_id=chat_id, message_id=message.message_id, caption=new_text, reply_markup=reply_markup, parse_mode=parse_mode)
+            except Exception:
+                pass
+
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log_error(f"safe_edit_message failed: {e} | {cb_info or ''}")
+        except Exception:
+            pass
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id)
+            except Exception:
+                pass
+
 def format_post(product):
     item_id = product.get('ItemId', 'ללא מספר')
     image_url = product.get('ImageURL', '')
@@ -850,8 +864,8 @@ def format_post(product):
             if part:
                 lines.append(part)
         lines.append("")
-
-    price_line = f'💰 מחיר מבצע: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
+    price_label = "מחיר החל מ" if (product.get("PriceIsFrom") or "").strip() else "מחיר מבצע"
+    price_line = f'💰 {price_label}: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
     lines += [
         price_line,
         discount_text,
@@ -1198,22 +1212,6 @@ def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
         out.append(normalize_row_keys(rr))
     return out
 
-def _next_keyword() -> str:
-    if not AE_KEYWORDS_LIST:
-        return ""
-    try:
-        idx = 0
-        if os.path.exists(KEYWORD_INDEX_FILE):
-            with open(KEYWORD_INDEX_FILE, "r", encoding="utf-8") as f:
-                idx = int((f.read() or "0").strip() or "0")
-        kw = AE_KEYWORDS_LIST[idx % len(AE_KEYWORDS_LIST)]
-        with open(KEYWORD_INDEX_FILE, "w", encoding="utf-8") as f:
-            f.write(str((idx + 1) % (10_000_000)))
-        return kw
-    except Exception:
-        # fallback: pseudo-rotation
-        return AE_KEYWORDS_LIST[int(time.time()) % len(AE_KEYWORDS_LIST)]
-
 # ========= AliExpress Affiliate (TOP) =========
 def _top_sign_md5(params: dict, secret: str) -> str:
     # Taobao TOP MD5 sign: md5(secret + concat(k+v sorted) + secret).upper()
@@ -1304,6 +1302,7 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
         "sort": AE_REFILL_SORT,
         "target_currency": AE_TARGET_CURRENCY,
         "target_language": AE_TARGET_LANGUAGE,
+        "target_currency": AE_TARGET_CURRENCY,
         "tracking_id": AE_TRACKING_ID,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "fields": "product_id,product_title,product_main_image_url,promotion_link,sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url",
@@ -1327,7 +1326,7 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     return products, resp_code, resp_msg
 
 
-def affiliate_product_query(page_no: int, page_size: int, category_id: str | None = None, keywords: str | None = None) -> tuple[list[dict], int | None, str | None]:
+def affiliate_product_query(page_no: int, page_size: int, category_id: str | None = None) -> tuple[list[dict], int | None, str | None]:
     """Affiliate product query with optional category filter."""
     fields = "product_id,product_title,product_main_image_url,promotion_link,promotion_url,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
     biz = {
@@ -1336,14 +1335,19 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "page_size": str(page_size),
         "sort": AE_REFILL_SORT,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
+        "target_currency": AE_TARGET_CURRENCY,
         "target_language": AE_TARGET_LANGUAGE,
         "fields": fields,
         "platform_product_type": "ALL",
     }
     if category_id:
-        biz["category_ids"] = str(category_id).strip()
-    if keywords:
-        biz["keywords"] = str(keywords).strip()
+        biz["category_ids"] = str(category_id).strip()()()
+
+    # If AE_KEYWORDS provided, rotate keywords to avoid repetitive results
+    if AE_KEYWORDS:
+        kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS) if k.strip()]
+        if kws and "keywords" not in biz:
+            biz["keywords"] = kws[(page_no - 1) % len(kws)]
     payload = _top_call("aliexpress.affiliate.product.query", biz)
     resp = _extract_resp_result(payload)
     resp_code = resp.get("resp_code")
@@ -1360,18 +1364,45 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     return products, resp_code, resp_msg
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
-    # בחירה חכמה של מחיר מבצע: app_sale_price אם קיים, אחרת sale_price
-    # choose sale price source
-    if AE_USE_APP_PRICE:
-        sale_raw = p.get("app_sale_price") or p.get("target_app_sale_price") or p.get("sale_price") or p.get("target_sale_price") or ""
-    else:
-        sale_raw = p.get("sale_price") or p.get("target_sale_price") or p.get("app_sale_price") or p.get("target_app_sale_price") or ""
+    # מחיר מבצע / מקורי - טיפול בטווחים ("1.23-4.56") + מניעת המרה כפולה אם המחיר כבר בש"ח
+    sale_raw = (
+        p.get("app_sale_price")
+        if AE_USE_APP_PRICE
+        else (p.get("sale_price") or p.get("app_sale_price"))
+    ) or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
     orig_raw = p.get("original_price") or p.get("target_original_price") or ""
-    _nums = _extract_all_numbers(str(sale_raw))
-    price_is_from = (len(_nums) >= 2) and (min(_nums) != max(_nums))
 
-    sale_ils = usd_to_ils(str(sale_raw), USD_TO_ILS_RATE_DEFAULT)
-    orig_ils = usd_to_ils(str(orig_raw), USD_TO_ILS_RATE_DEFAULT)
+    def _pick_value(raw_val):
+        s = str(raw_val or "").strip()
+        if "-" in s:
+            parts = [x.strip() for x in re.split(r"\s*-\s*", s) if x.strip()]
+            if len(parts) >= 2:
+                # Range price: choose min/max/mid by AE_PRICE_PICK_MODE, and mark as "from" for labeling
+                a = _extract_float(clean_price_text(parts[0]))
+                b = _extract_float(clean_price_text(parts[1]))
+                if a is None and b is None:
+                    return parts[0], True
+                if a is None:
+                    return parts[1], True
+                if b is None:
+                    return parts[0], True
+                lo = min(float(a), float(b))
+                hi = max(float(a), float(b))
+                mode = (AE_PRICE_PICK_MODE or "min").lower()
+                if mode == "max":
+                    chosen = hi
+                elif mode in ("mid", "avg", "mean"):
+                    chosen = (lo + hi) / 2.0
+                else:
+                    chosen = lo
+                return str(chosen), True
+        return s, False
+
+    sale_text, sale_is_from = _pick_value(sale_raw)
+    orig_text, orig_is_from = _pick_value(orig_raw)
+
+    sale_ils = usd_to_ils(sale_text, USD_TO_ILS_RATE_DEFAULT)
+    orig_ils = usd_to_ils(orig_text, USD_TO_ILS_RATE_DEFAULT)
 
     product_id = str(p.get("product_id", "")).strip()
 
@@ -1389,7 +1420,9 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "ImageURL": (p.get("product_main_image_url") or "").strip(),
         "Title": (p.get("product_title") or "").strip(),
         "OriginalPrice": orig_ils,
+        "OriginalIsFrom": ("1" if orig_is_from else ""),
         "SalePrice": sale_ils,
+        "PriceIsFrom": ("1" if sale_is_from else ""),
         "Discount": (p.get("discount") or "").strip(),
         "Rating": (p.get("evaluate_rate") or "").strip(),
         "Orders": str(p.get("lastest_volume") or "").strip(),
@@ -1398,7 +1431,6 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Opening": "",
         "Strengths": "",
         "Video Url": (p.get("product_video_url") or "").strip(),
-        "PriceIsFrom": "1" if price_is_from else "",
     })
 
 
@@ -1413,7 +1445,6 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
         existing_keys = {_key_of_row(r) for r in pending_rows}
-        kw = _next_keyword()  # rotate keywords each refill
 
     added = 0
     dup = 0
@@ -1445,7 +1476,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
             for page_no in range(1, max_pages_per_cat + 1):
                 last_page = page_no
                 try:
-                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id, keywords=kw)
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id)
                     last_resp = (resp_code, resp_msg, len(products))
 
                     if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
@@ -1518,6 +1549,15 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
             last_page = page_no
             try:
                 products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
+                # Fallback: some accounts/params return empty from hotproduct query.
+                # If AE_KEYWORDS exists, try affiliate.product.query with rotating keywords.
+                if (not products) and AE_KEYWORDS:
+                    try:
+                        products2, rc2, rm2 = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
+                        if products2:
+                            products, resp_code, resp_msg = products2, rc2, rm2
+                    except Exception:
+                        pass
                 last_resp = (resp_code, resp_msg, len(products))
 
                 if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
@@ -2509,7 +2549,6 @@ if __name__ == "__main__":
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
     log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
-    log_info(f"[CFG] PRICE_DECIMALS={PRICE_DECIMALS} | USD_TO_ILS_RATE={USD_TO_ILS_RATE_DEFAULT:g} | AE_USE_APP_PRICE={AE_USE_APP_PRICE} | AE_PRICE_PICK_MODE={AE_PRICE_PICK_MODE} | AE_PRICE_INT_IS_CENTS={AE_PRICE_INT_IS_CENTS}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
