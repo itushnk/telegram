@@ -22,7 +22,7 @@ import random
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-18a")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-17m")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -713,6 +713,53 @@ _AI_SCHEMA = {
     "additionalProperties": False
 }
 
+def _openai_structured_items(client, prompt: str) -> dict:
+    """Return parsed JSON dict in the schema {items:[...]}.
+
+    - Tries the newer Responses API first (client.responses.create)
+    - Falls back to Chat Completions (client.chat.completions.create)
+    """
+    # Prefer Responses API if available
+    # NOTE: In the Responses API, Structured Outputs uses text.format (not response_format).
+    # See OpenAI migration docs: "Instead of response_format, use text.format in Responses".
+    if hasattr(client, "responses") and hasattr(client.responses, "create"):
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                input=prompt,
+                timeout=GPT_TIMEOUT_SECONDS,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "product_copy",
+                        "schema": _AI_SCHEMA,
+                        "strict": True,
+                    }
+                },
+            )
+            text_out = getattr(resp, "output_text", None) or ""
+            return json.loads(text_out)
+        except TypeError as e:
+            # SDK/model mismatch; fall back to Chat Completions.
+            logging.warning(f"[AI] Responses.create() TypeError -> fallback to chat.completions: {e}")
+
+    # Fallback: Chat Completions
+    system = (
+        "אתה מחזיר אך ורק JSON תקין (ללא טקסט מסביב). "
+        "ה-JSON חייב להתאים בדיוק לסכימה: {'items':[{'item_id':str,'opening':str,'title':str,'strengths':[str,str,str]}]}."
+    )
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        timeout=GPT_TIMEOUT_SECONDS,
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    return json.loads(content)
+
 def _needs_ai(row: dict) -> bool:
     if GPT_OVERWRITE:
         return True
@@ -771,23 +818,8 @@ def ai_enrich_rows(rows: list[dict], reason: str = "") -> tuple[int, str | None]
         )
 
         try:
-            resp = client.responses.create(
-                model=OPENAI_MODEL,
-                input=prompt,
-                timeout=GPT_TIMEOUT_SECONDS,
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "product_copy",
-                        "schema": _AI_SCHEMA,
-                        "strict": True
-                    }
-                }
-                }
-            )
-            # resp.output_text אמור להיות JSON, אבל נלך בטוח:
-            text = getattr(resp, "output_text", None) or ""
-            data = json.loads(text)
+            # Prefer Responses API, fallback to Chat Completions automatically
+            data = _openai_structured_items(client, prompt)
             items = data.get("items", []) if isinstance(data, dict) else []
             by_id = {str(it.get("item_id","")).strip(): it for it in items if isinstance(it, dict)}
 
@@ -1306,27 +1338,31 @@ def _key_of_row(r: dict):
     return (item_id if item_id else None, title if not item_id else None, buy)
 
 def merge_from_data_into_pending():
-    data_rows = read_products(DATA_CSV)
-    pending_rows = read_products(PENDING_CSV)
+    """Merge rows from DATA_CSV into PENDING_CSV.
 
-    existing_keys = {_key_of_row(r) for r in pending_rows}
+    Returns: (added, already, total_after)
+    """
+    with FILE_LOCK:
+        data_rows = read_products(DATA_CSV)
+        pending_rows = read_products(PENDING_CSV)
+        existing_keys = {_key_of_row(r) for r in pending_rows}
 
+    # Only new candidates (so we don't waste AI calls)
+    new_candidates = [r for r in data_rows if _key_of_row(r) not in existing_keys]
 
-# AI enrichment (optional) — מריצים רק על פריטים חדשים כדי לא לבזבז בקשות
-if GPT_ON_UPLOAD and _ai_enabled():
-    try:
-        new_candidates = [r for r in rows if _key_of_row(r) not in existing_keys]
-        if new_candidates:
+    # AI enrichment (optional) — run only on new candidates
+    if GPT_ON_UPLOAD and new_candidates:
+        try:
             upd, err = ai_enrich_rows(new_candidates, reason="csv_upload")
             if err:
                 logging.warning(f"[AI] enrich warning: {err}")
             elif upd:
                 logging.info(f"[AI] enriched {upd} items on upload")
-    except Exception as _e:
-        logging.warning(f"[AI] enrich failed: {_e}")
+        except Exception as _e:
+            logging.warning(f"[AI] enrich failed: {_e}")
+
     added = 0
     already = 0
-
     for r in data_rows:
         k = _key_of_row(r)
         if k in existing_keys:
@@ -1336,8 +1372,11 @@ if GPT_ON_UPLOAD and _ai_enabled():
         existing_keys.add(k)
         added += 1
 
-    write_products(PENDING_CSV, pending_rows)
-    return added, already, len(pending_rows)
+    with FILE_LOCK:
+        write_products(PENDING_CSV, pending_rows)
+        total_after = len(pending_rows)
+
+    return added, already, total_after
 
 def delete_source_csv_file():
     with FILE_LOCK:
@@ -2785,16 +2824,55 @@ except Exception:
 
     t1 = threading.Thread(target=auto_post_loop, daemon=True)
     t1.start()
+# AI diagnostics (show clearly if AI is really enabled)
+try:
+    try:
+        import openai as _openai_pkg
+        log_info(f"[CFG] OPENAI_SDK_VERSION={getattr(_openai_pkg, '__version__', 'unknown')}")
+    except Exception:
+        pass
 
-    t2 = threading.Thread(target=refill_daemon, daemon=True)
-    t2.start()
+    ai_state = "ON" if _ai_enabled() else "OFF"
+    ai_note = ""
+    if GPT_ENABLED and not OPENAI_API_KEY:
+        ai_note = " (missing OPENAI_API_KEY)"
+    elif GPT_ENABLED and OpenAI is None:
+        ai_note = " (missing 'openai' package)"
+    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
+except Exception as e:
+    log_error(f"[CFG] AI diagnostics failed: {e}")
 
-    # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception as e:
-            msg = str(e)
-            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-            log_error(f"Polling error: {e}. Retrying in {wait}s...")
-            time.sleep(wait)
+_lock_handle = acquire_single_instance_lock(LOCK_PATH)
+if _lock_handle is None:
+    print("Another instance is running (lock failed). Exiting.", flush=True)
+    sys.exit(1)
+
+print_webhook_info()
+try:
+    force_delete_webhook()
+    bot.delete_webhook(drop_pending_updates=True)
+except Exception:
+    try:
+        bot.remove_webhook()
+    except Exception as e2:
+        print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+print_webhook_info()
+
+if not os.path.exists(AUTO_FLAG_FILE):
+    write_auto_flag("on")
+
+t1 = threading.Thread(target=auto_post_loop, daemon=True)
+t1.start()
+
+t2 = threading.Thread(target=refill_daemon, daemon=True)
+t2.start()
+
+# Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
+while True:
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+    except Exception as e:
+        msg = str(e)
+        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+        log_error(f"Polling error: {e}. Retrying in {wait}s...")
+        time.sleep(wait)
