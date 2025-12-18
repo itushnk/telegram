@@ -291,6 +291,44 @@ AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip(
 # target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח.
 AE_TARGET_CURRENCY = "USD"
 
+
+# =================== AI (OpenAI) — “לתת חיים למוצרים” ===================
+# הפעלה/כיבוי:
+GPT_ENABLED = (os.environ.get("GPT_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+
+# כמה מוצרים לשלוח בכל Batch (אתה ביקשת 10)
+GPT_BATCH_SIZE = int(os.environ.get("GPT_BATCH_SIZE", "10") or "10")
+
+# האם לדרוס טקסט קיים (1=כן, 0=לא. אם 0 – משלים רק שדות ריקים)
+GPT_OVERWRITE = (os.environ.get("GPT_OVERWRITE", "1") or "1").strip().lower() in ("1","true","yes","on")
+
+# מתי להריץ AI
+GPT_ON_REFILL = (os.environ.get("GPT_ON_REFILL", "1") or "1").strip().lower() in ("1","true","yes","on")
+GPT_ON_UPLOAD = (os.environ.get("GPT_ON_UPLOAD", "1") or "1").strip().lower() in ("1","true","yes","on")
+
+# יציבות/ביצועים
+GPT_TIMEOUT_SECONDS = int(os.environ.get("GPT_TIMEOUT_SECONDS", "45") or "45")
+GPT_MAX_RETRIES = int(os.environ.get("GPT_MAX_RETRIES", "2") or "2")
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+_openai_client = None
+
+def _ai_enabled() -> bool:
+    return bool(GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None)
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
+
+
 AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_REFILL_INTERVAL_SECONDS = int(os.environ.get("AE_REFILL_INTERVAL_SECONDS", "900") or "900")  # 15 דקות
 AE_REFILL_MIN_QUEUE = int(os.environ.get("AE_REFILL_MIN_QUEUE", "30") or "30")
@@ -644,6 +682,134 @@ def normalize_row_keys(row):
     out["Strengths"] = out.get("Strengths", "") or ""
 
     return out
+
+
+# =================== AI helpers ===================
+
+_AI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string"},
+                    "opening": {"type": "string"},
+                    "title": {"type": "string"},
+                    "strengths": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["item_id", "opening", "title", "strengths"],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": ["items"],
+    "additionalProperties": False
+}
+
+def _needs_ai(row: dict) -> bool:
+    if GPT_OVERWRITE:
+        return True
+    # אם לא דורסים – משלימים רק אם חסר משהו
+    return not (str(row.get("Opening","")).strip() and str(row.get("Title","")).strip() and str(row.get("Strengths","")).strip())
+
+def ai_enrich_rows(rows: list[dict], reason: str = "") -> tuple[int, str | None]:
+    """ממלא Opening/Title/Strengths בעברית שיווקית. עובד בבאצ'ים של GPT_BATCH_SIZE.
+    מחזיר (כמה עודכנו, שגיאה אחרונה או None).
+    """
+    if not rows:
+        return 0, None
+    if not _ai_enabled():
+        # לא עוצרים את הבוט אם אין AI – פשוט מדלגים
+        if GPT_ENABLED and OpenAI is None:
+            return 0, "GPT_ENABLED=1 אבל חסר dependency: openai (pip install openai)"
+        if GPT_ENABLED and not OPENAI_API_KEY:
+            return 0, "GPT_ENABLED=1 אבל OPENAI_API_KEY חסר"
+        return 0, None
+
+    client = _get_openai_client()
+    updated = 0
+    last_err = None
+
+    # עובדים רק על אלה שבאמת צריכים AI
+    todo = [r for r in rows if _needs_ai(r)]
+    if not todo:
+        return 0, None
+
+    # Batch
+    for i in range(0, len(todo), max(1, GPT_BATCH_SIZE)):
+        batch = todo[i:i+max(1, GPT_BATCH_SIZE)]
+        payload_items = []
+        for r in batch:
+            item_id = str(r.get("ItemId","") or "").strip()
+            raw_title = str(r.get("Title","") or r.get("product_title","") or "").strip()
+            # שומרים את המקור כדי לא לאבד מידע
+            if raw_title and not str(r.get("OrigTitle","")).strip():
+                r["OrigTitle"] = raw_title
+            payload_items.append({
+                "item_id": item_id,
+                "raw_title": raw_title
+            })
+
+        # Prompt: בלי המצאות, בלי מחירים, בלי משלוח – רק שכתוב שיווקי על בסיס הכותרת.
+        prompt = (
+            "אתה קופירייטר שיווקי בעברית לטלגרם. "
+            "לכל מוצר תחזיר: opening (משפט פתיחה שנון ורלוונטי, לא כשאלה, עם אימוג׳י אחד), "
+            "title (תיאור קצר עד ~100 תווים, עם אימוג׳י מתאים), "
+            "strengths (בדיוק 3 שורות, כל שורה מתחילה באימוג׳י מתאים ומדגישה יתרון/חומר/שימוש). "
+            "כל מה שאתה כותב חייב להתבסס רק על raw_title. "
+            "אל תמציא מפרטים שלא מופיעים. אל תכתוב מחירים/משלוח/קופונים. "
+            "שמור על עברית טבעית בלי סימני שאלה מיותרים.\n\n"
+            f"סיבה: {reason}\n"
+            f"items: {json.dumps(payload_items, ensure_ascii=False)}"
+        )
+
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                input=prompt,
+                timeout=GPT_TIMEOUT_SECONDS,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "product_copy",
+                        "schema": _AI_SCHEMA,
+                        "strict": True
+                    }
+                }
+            )
+            # resp.output_text אמור להיות JSON, אבל נלך בטוח:
+            text = getattr(resp, "output_text", None) or ""
+            data = json.loads(text)
+            items = data.get("items", []) if isinstance(data, dict) else []
+            by_id = {str(it.get("item_id","")).strip(): it for it in items if isinstance(it, dict)}
+
+            for r in batch:
+                iid = str(r.get("ItemId","") or "").strip()
+                it = by_id.get(iid)
+                if not it:
+                    continue
+                opening = str(it.get("opening","")).strip()
+                title = str(it.get("title","")).strip()
+                strengths = it.get("strengths", [])
+                if not (opening and title and isinstance(strengths, list) and len(strengths)==3):
+                    continue
+                r["Opening"] = opening
+                r["Title"] = title
+                r["Strengths"] = "\n".join([str(s).strip() for s in strengths])
+                updated += 1
+
+        except Exception as e:
+            last_err = str(e)
+
+    return updated, last_err
+
 
 def read_products(path):
     if not os.path.exists(path):
@@ -1143,6 +1309,20 @@ def merge_from_data_into_pending():
     pending_rows = read_products(PENDING_CSV)
 
     existing_keys = {_key_of_row(r) for r in pending_rows}
+
+
+# AI enrichment (optional) — מריצים רק על פריטים חדשים כדי לא לבזבז בקשות
+if GPT_ON_UPLOAD and _ai_enabled():
+    try:
+        new_candidates = [r for r in rows if _key_of_row(r) not in existing_keys]
+        if new_candidates:
+            upd, err = ai_enrich_rows(new_candidates, reason="csv_upload")
+            if err:
+                logging.warning(f"[AI] enrich warning: {err}")
+            elif upd:
+                logging.info(f"[AI] enriched {upd} items on upload")
+    except Exception as _e:
+        logging.warning(f"[AI] enrich failed: {_e}")
     added = 0
     already = 0
 
@@ -1526,6 +1706,16 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                         if got_cat >= need_cat:
                             break
 
+                    # AI enrichment (optional)
+                    if GPT_ON_REFILL and new_rows:
+                        try:
+                            upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
+                            if err:
+                                logging.warning(f"[AI] enrich warning: {err}")
+                            elif upd:
+                                logging.info(f"[AI] enriched {upd} items on refill")
+                        except Exception as _e:
+                            logging.warning(f"[AI] enrich failed: {_e}")
                     if new_rows:
                         with FILE_LOCK:
                             pending_rows = read_products(PENDING_CSV)
@@ -1603,6 +1793,16 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                     existing_keys.add(k)
                     new_rows.append(row)
 
+                # AI enrichment (optional)
+                if GPT_ON_REFILL and new_rows:
+                    try:
+                        upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
+                        if err:
+                            logging.warning(f"[AI] enrich warning: {err}")
+                        elif upd:
+                            logging.info(f"[AI] enriched {upd} items on refill")
+                    except Exception as _e:
+                        logging.warning(f"[AI] enrich failed: {_e}")
                 if new_rows:
                     with FILE_LOCK:
                         pending_rows = read_products(PENDING_CSV)
@@ -2550,6 +2750,19 @@ if __name__ == "__main__":
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
     log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
+
+
+# AI diagnostics
+try:
+    ai_state = "ON" if _ai_enabled() else "OFF"
+    ai_note = ""
+    if GPT_ENABLED and not OPENAI_API_KEY:
+        ai_note = " (missing OPENAI_API_KEY)"
+    elif GPT_ENABLED and OpenAI is None:
+        ai_note = " (missing 'openai' package)"
+    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
+except Exception:
+    pass
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
     if _lock_handle is None:
         print("Another instance is running (lock failed). Exiting.", flush=True)
