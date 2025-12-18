@@ -298,6 +298,12 @@ GPT_ENABLED = (os.environ.get("GPT_ENABLED", "0") or "0").strip().lower() in ("1
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
 OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
 
+# מודל אפקטיבי (יכול להשתנות אוטומטית לפי הרשאות הפרויקט)
+OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
+
+# הדפס מודלים זמינים ובדוק הרשאות בתחילת ריצה (1 מומלץ עד שהכל עובד)
+GPT_DIAG_ON_STARTUP = (os.environ.get("GPT_DIAG_ON_STARTUP", "1") or "1").strip().lower() in ("1","true","yes","on")
+
 # כמה מוצרים לשלוח בכל Batch (אתה ביקשת 10)
 GPT_BATCH_SIZE = int(os.environ.get("GPT_BATCH_SIZE", "10") or "10")
 
@@ -327,6 +333,74 @@ def _get_openai_client():
     if _openai_client is None:
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
+
+
+def _resolve_model_effective(client):
+    """בחר מודל שעובד בפועל בפרויקט (לפי models.list), כדי למנוע 403 model_not_found."""
+    global OPENAI_MODEL_EFFECTIVE
+
+    if not _ai_enabled():
+        OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
+        return OPENAI_MODEL_EFFECTIVE, []
+
+    available = []
+    try:
+        ms = client.models.list()
+        available = [m.id for m in getattr(ms, "data", [])]
+    except Exception as e:
+        logging.warning(f"[AI] models.list failed: {e}")
+        OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
+        return OPENAI_MODEL_EFFECTIVE, []
+
+    if OPENAI_MODEL in available:
+        OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
+        return OPENAI_MODEL_EFFECTIVE, available
+
+    # נסה לבחור מודל מועדף שקיים
+    preferred = [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4.1-mini",
+        "gpt-4.1",
+        "gpt-4-turbo",
+        "gpt-4",
+        "gpt-3.5-turbo",
+    ]
+    for cand in preferred:
+        if cand in available:
+            logging.warning(f"[AI] OPENAI_MODEL='{OPENAI_MODEL}' not available. Auto-selected '{cand}'.")
+            OPENAI_MODEL_EFFECTIVE = cand
+            return OPENAI_MODEL_EFFECTIVE, available
+
+    logging.warning(f"[AI] OPENAI_MODEL='{OPENAI_MODEL}' not available and no preferred model found. Leaving as-is.")
+    OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
+    return OPENAI_MODEL_EFFECTIVE, available
+
+
+def ai_diagnostics_startup():
+    """בדיקות AI בתחילת ריצה: KEY, models.list, בחירת מודל אפקטיבי."""
+    if not GPT_DIAG_ON_STARTUP:
+        return
+    if not GPT_ENABLED:
+        logging.info("[AI] diagnostics: GPT_ENABLED=0 (skipping)")
+        return
+    if not OPENAI_API_KEY:
+        logging.warning("[AI] diagnostics: OPENAI_API_KEY missing")
+        return
+    if OpenAI is None:
+        logging.warning("[AI] diagnostics: openai package missing (pip install openai)")
+        return
+
+    try:
+        client = _get_openai_client()
+        effective, available = _resolve_model_effective(client)
+        if available:
+            # אל תציף לוגים – רק דגימה
+            sample = [m for m in available if m.startswith("gpt-")][:60]
+            logging.info(f"[AI] available models (gpt-* sample): {sample}")
+        logging.info(f"[AI] model effective: {effective}")
+    except Exception as e:
+        logging.warning(f"[AI] diagnostics failed: {e}")
 
 
 AE_REFILL_ENABLED = (os.environ.get("AE_REFILL_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
@@ -725,7 +799,7 @@ def _openai_structured_items(client, prompt: str) -> dict:
     if hasattr(client, "responses") and hasattr(client.responses, "create"):
         try:
             resp = client.responses.create(
-                model=OPENAI_MODEL,
+                model=OPENAI_MODEL_EFFECTIVE,
                 input=prompt,
                 timeout=GPT_TIMEOUT_SECONDS,
                 text={
@@ -749,7 +823,7 @@ def _openai_structured_items(client, prompt: str) -> dict:
         "ה-JSON חייב להתאים בדיוק לסכימה: {'items':[{'item_id':str,'opening':str,'title':str,'strengths':[str,str,str]}]}."
     )
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_EFFECTIVE,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -2800,7 +2874,7 @@ try:
         ai_note = " (missing OPENAI_API_KEY)"
     elif GPT_ENABLED and OpenAI is None:
         ai_note = " (missing 'openai' package)"
-    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
+    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} (effective={OPENAI_MODEL_EFFECTIVE}) | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
 except Exception:
     pass
     _lock_handle = acquire_single_instance_lock(LOCK_PATH)
@@ -2838,7 +2912,7 @@ try:
         ai_note = " (missing OPENAI_API_KEY)"
     elif GPT_ENABLED and OpenAI is None:
         ai_note = " (missing 'openai' package)"
-    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
+    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} (effective={OPENAI_MODEL_EFFECTIVE}) | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
 except Exception as e:
     log_error(f"[CFG] AI diagnostics failed: {e}")
 
