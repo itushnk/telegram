@@ -422,7 +422,10 @@ AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "0") or "0"))
 AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "0") or "0")  # percent (0-100)
 AE_FREE_SHIP_ONLY_DEFAULT = (os.environ.get("AE_FREE_SHIP_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
 AE_FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("AE_FREE_SHIP_THRESHOLD_ILS", "38") or "38")  # heuristic
-FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("FREE_SHIP_THRESHOLD_ILS", str(AE_FREE_SHIP_THRESHOLD_ILS)) or str(AE_FREE_SHIP_THRESHOLD_ILS))
+
+# Backward-compatible alias (some parts/logs may use FREE_SHIP_THRESHOLD_ILS)
+FREE_SHIP_THRESHOLD_ILS = float(os.environ.get('FREE_SHIP_THRESHOLD_ILS', '') or AE_FREE_SHIP_THRESHOLD_ILS)
+
 AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
 
 MIN_ORDERS = _get_state_int("min_orders", AE_MIN_ORDERS_DEFAULT)
@@ -1400,10 +1403,24 @@ def save_delay_seconds(seconds: int) -> None:
 POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
 
 # ========= ADMIN =========
-def _is_admin(msg) -> bool:
+def _user_id_from(obj) -> int | None:
+    try:
+        # Message
+        if hasattr(obj, "from_user") and obj.from_user:
+            return int(obj.from_user.id)
+        # CallbackQuery (sometimes obj.message.from_user is the bot; prefer obj.from_user above)
+        if hasattr(obj, "message") and obj.message and getattr(obj.message, "from_user", None):
+            return int(obj.message.from_user.id)
+    except Exception:
+        pass
+    return None
+
+def _is_admin(obj) -> bool:
+    # If no admins configured, allow all (safer for first-time setup)
     if not ADMIN_USER_IDS:
         return True
-    return msg.from_user and (msg.from_user.id in ADMIN_USER_IDS)
+    uid = _user_id_from(obj)
+    return uid is not None and (uid in ADMIN_USER_IDS)
 
 # ========= MERGE =========
 def _key_of_row(r: dict):
@@ -2331,7 +2348,7 @@ def inline_menu():
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS
 
-    if not _is_admin(c.message):
+    if not _is_admin(c):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
         return
 
@@ -2688,6 +2705,29 @@ def cmd_start(msg):
     _save_admin_chat_id(msg.chat.id)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
+@bot.message_handler(commands=['myid','whoami'])
+def cmd_myid(msg):
+    try:
+        uid = msg.from_user.id if msg.from_user else None
+        chat_id = msg.chat.id if msg.chat else None
+        bot.reply_to(msg, f"🆔 User ID שלך: {uid}\n💬 Chat ID: {chat_id}")
+    except Exception:
+        try:
+            bot.reply_to(msg, "🆔 לא הצלחתי לקרוא את ה-ID מההודעה הזו.")
+        except Exception:
+            pass
+
+@bot.message_handler(commands=['admins'])
+def cmd_admins(msg):
+    # Admin-only: show configured admin ids (count only by default)
+    if not _is_admin(msg):
+        try:
+            uid = _user_id_from(msg)
+            bot.reply_to(msg, f"⛔ אין לך הרשאה. ה-User ID שלך הוא: {uid}\nהוסף אותו ל-ADMIN_USER_IDS ב-Railway (מופרד בפסיקים).")
+        except Exception:
+            pass
+        return
+    bot.reply_to(msg, f"✅ Admin IDs configured: {sorted(list(ADMIN_USER_IDS)) if ADMIN_USER_IDS else '(none - all allowed)'}")
 @bot.message_handler(commands=['pending_status','queue'])
 def pending_status_cmd(msg):
     with FILE_LOCK:
