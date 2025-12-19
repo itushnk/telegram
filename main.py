@@ -2295,6 +2295,7 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
 def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
+        uid = getattr(getattr(c, 'from_user', None), 'id', None) or 0
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -2351,13 +2352,13 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
         if data.startswith("fc_menu_"):
             page = int(data.split("_")[-1])
             CAT_VIEW_MODE[uid] = "top"
-            safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid), cb_id=c.id)
             return True
 
         if data.startswith("fc_all_"):
             page = int(data.split("_")[-1])
             CAT_VIEW_MODE[uid] = "all"
-            safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid), cb_id=c.id)
             return True
 
         if data.startswith("fc_s_"):
@@ -2369,9 +2370,9 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
                 kb = types.InlineKeyboardMarkup(row_width=1)
                 kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-                safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=c.id)
             else:
-                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q), cb_id=c.id)
             return True
 
         if data == "fc_search":
@@ -2380,7 +2381,7 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
             kb = types.InlineKeyboardMarkup(row_width=1)
             kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-            safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=c.id)
             return True
 
         # toggle category selection
@@ -2406,14 +2407,14 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
 
             if mode == "all":
                 CAT_VIEW_MODE[uid] = "all"
-                safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid), cb_id=c.id)
             elif mode == "search":
                 CAT_VIEW_MODE[uid] = "search"
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q), cb_id=c.id)
             else:
                 CAT_VIEW_MODE[uid] = "top"
-                safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid), cb_id=c.id)
             return True
 
         if data == "fc_clear":
@@ -2421,12 +2422,12 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             save_user_state()
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=c.id)
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, f"✅ נוקה! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"✅ נוקה! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=c.id)
             else:
-                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=c.id)
             return True
 
         if data == "fc_random":
@@ -2438,24 +2439,24 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 save_user_state()
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=c.id)
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=c.id)
             else:
-                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=c.id)
             return True
 
         if data == "fc_sync":
             _ = get_categories(force=True)
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=c.id)
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=c.id)
             else:
-                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=c.id)
             return True
 
 
