@@ -19,6 +19,7 @@ except Exception:
 import logging
 import hashlib
 import random
+import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
@@ -1707,7 +1708,7 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "platform_product_type": "ALL",
     }
     if category_id:
-        biz["category_ids"] = str(category_id).strip()()()
+        biz["category_ids"] = str(category_id).strip()
 
     # If AE_KEYWORDS provided, rotate keywords to avoid repetitive results
     if AE_KEYWORDS:
@@ -2180,53 +2181,117 @@ def _rating_filter_menu_kb():
     kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
     return kb
 
-def _categories_menu_kb(page: int = 0, per_page: int = 10):
+
+# --- Category UI state (per admin user) ---
+CAT_VIEW_MODE: dict[int, str] = {}      # uid -> "top" | "all" | "search"
+CAT_LAST_QUERY: dict[int, str] = {}     # uid -> last search query
+CAT_SEARCH_WAIT: dict[int, bool] = {}   # uid -> waiting for text query?
+CAT_SEARCH_CTX: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id)
+
+# Keywords used to shrink the category list in "top" mode (Hebrew+English)
+CATEGORY_TOP_KEYWORDS = [
+    "טלפון", "אייפון", "iphone", "סמסונג", "samsung", "מובייל", "mobile",
+    "שעון", "watch", "apple watch", "גאדג", "gadget",
+    "אוזניות", "headphone", "earbud",
+    "מחשב", "computer", "laptop",
+    "אלקטרוניקה", "electronics",
+    "בית", "home", "מטבח", "kitchen",
+    "כלי", "tool", "עבודה", "work",
+    "רכב", "auto", "car",
+    "ספורט", "sport", "running", "fitness",
+    "אופנה", "fashion", "בגד", "clothing",
+    "יופי", "beauty", "טיפוח", "care",
+    "תינוק", "baby", "ילד", "kids", "צעצוע", "toy",
+]
+
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _filter_categories(cats: list[dict], mode: str, uid: int | None = None, query: str | None = None) -> list[dict]:
+    if not cats:
+        return []
+    mode = (mode or "top").lower()
+
+    if mode == "all":
+        return cats
+
+    if mode == "search":
+        q = _norm(query) or _norm(CAT_LAST_QUERY.get(uid or 0, ""))  # type: ignore
+        if not q:
+            return []
+        tokens = [t for t in re.split(r"\s+", q) if t]
+        def match_all(name: str) -> bool:
+            n = _norm(name)
+            return all(t in n for t in tokens)
+        def match_any(name: str) -> bool:
+            n = _norm(name)
+            return any(t in n for t in tokens)
+        strict = [c for c in cats if match_all(c.get("name",""))]
+        if strict:
+            return strict
+        loose = [c for c in cats if match_any(c.get("name",""))]
+        return loose
+
+    # mode == "top" (default): shrink big tree using keywords.
+    kws = [k for k in CATEGORY_TOP_KEYWORDS if k]
+    out = []
+    for c in cats:
+        n = _norm(c.get("name",""))
+        if any(_norm(k) in n for k in kws):
+            out.append(c)
+
+    # If too small (e.g., language mismatch), fall back to first 80 categories so menu won't be empty.
+    if len(out) < 25:
+        return cats[:80]
+    # Keep it reasonably short
+    return out[:160]
+
+def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", uid: int | None = None, query: str | None = None):
     kb = types.InlineKeyboardMarkup(row_width=2)
     cats = get_categories()
+    view = _filter_categories(cats, mode=mode, uid=uid, query=query)
+
     selected = set(get_selected_category_ids())
-    total = len(cats)
+    total = len(view)
+    pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(page, pages - 1))
 
-    if total == 0:
-        kb.add(types.InlineKeyboardButton("🔄 סנכרן קטגוריות מאליאקספרס", callback_data="fc_sync"))
-        kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
-        return kb
-
-    page = max(0, int(page))
     start = page * per_page
-    end = min(total, start + per_page)
-    slice_cats = cats[start:end]
-
-    btns = []
-    for c in slice_cats:
-        cid = str(c.get("id") or "")
-        name = str(c.get("name") or cid)
+    end = start + per_page
+    for c in view[start:end]:
+        cid = str(c.get("id"))
+        name = c.get("name") or cid
         mark = "✅ " if cid in selected else ""
-        # keep name short in button
-        short = name
-        if len(short) > 22:
-            short = short[:21] + "…"
-        btns.append(types.InlineKeyboardButton(f"{mark}{short}", callback_data=f"fc_t_{cid}_{page}"))
-    if btns:
-        kb.add(*btns)
+        kb.add(types.InlineKeyboardButton(f"{mark}{name}", callback_data=f"fc_t_{cid}_{mode}_{page}"))
 
-    # controls
+    # Navigation
     nav = []
-    if start > 0:
-        nav.append(types.InlineKeyboardButton("⬅️ הקודם", callback_data=f"fc_menu_{page-1}"))
-    if end < total:
-        nav.append(types.InlineKeyboardButton("הבא ➡️", callback_data=f"fc_menu_{page+1}"))
-    if nav:
-        kb.add(*nav)
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("⬅️ קודם", callback_data=f"fc_{'s' if mode=='search' else ('all' if mode=='all' else 'menu')}_{page-1}"))
+    nav.append(types.InlineKeyboardButton(f"עמוד {page+1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(types.InlineKeyboardButton("הבא ➡️", callback_data=f"fc_{'s' if mode=='search' else ('all' if mode=='all' else 'menu')}_{page+1}"))
+    kb.row(*nav)
 
-    kb.add(
-        types.InlineKeyboardButton("🎲 בחר קטגוריה רנדומלית", callback_data="fc_random"),
-        types.InlineKeyboardButton("🧹 נקה קטגוריות", callback_data="fc_clear"),
+    # Mode switching + search
+    switch_row = []
+    if mode != "top":
+        switch_row.append(types.InlineKeyboardButton("⭐ פופולריות", callback_data="fc_menu_0"))
+    if mode != "all":
+        switch_row.append(types.InlineKeyboardButton("📚 כל הקטגוריות", callback_data="fc_all_0"))
+    switch_row.append(types.InlineKeyboardButton("🔎 חיפוש", callback_data="fc_search"))
+    kb.row(*switch_row[:2]) if len(switch_row) == 2 else kb.row(*switch_row)
+
+    # Actions
+    kb.row(
+        types.InlineKeyboardButton("🧹 נקה הכל", callback_data="fc_clear"),
+        types.InlineKeyboardButton("🎲 רנדומלי", callback_data="fc_random"),
     )
-    kb.add(types.InlineKeyboardButton("🔄 סנכרן קטגוריות", callback_data="fc_sync"))
-    kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
-    kb.add(types.InlineKeyboardButton(f"נבחרו: {len(selected)} | עמוד {page+1}/{max(1, (total + per_page - 1)//per_page)}", callback_data="noop_info"))
+    kb.row(
+        types.InlineKeyboardButton("🔄 סנכרן קטגוריות", callback_data="fc_sync"),
+        types.InlineKeyboardButton("⬅️ חזרה לסינונים", callback_data="filters"),
+    )
     return kb
-
 def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
@@ -2281,61 +2346,118 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧰 סינונים\nבחר מה לשנות:", reply_markup=_filters_home_kb(), cb_id=None)
             return True
 
+
         # categories menu
         if data.startswith("fc_menu_"):
             page = int(data.split("_")[-1])
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(page), cb_id=c.id)
+            CAT_VIEW_MODE[uid] = "top"
+            safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
+            return True
+
+        if data.startswith("fc_all_"):
+            page = int(data.split("_")[-1])
+            CAT_VIEW_MODE[uid] = "all"
+            safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
+            return True
+
+        if data.startswith("fc_s_"):
+            page = int(data.split("_")[-1])
+            CAT_VIEW_MODE[uid] = "search"
+            q = (CAT_LAST_QUERY.get(uid) or "").strip()
+            if not q:
+                CAT_SEARCH_WAIT[uid] = True
+                CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
+                kb = types.InlineKeyboardMarkup(row_width=1)
+                kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
+                safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
+            else:
+                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
+            return True
+
+        if data == "fc_search":
+            CAT_VIEW_MODE[uid] = "search"
+            CAT_SEARCH_WAIT[uid] = True
+            CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
+            safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
+            return True
+
+        # toggle category selection
+        if data.startswith("fc_t_"):
+            parts = data.split("_")
+            # formats:
+            #   fc_t_<cid>_<mode>_<page>
+            # legacy:
+            #   fc_t_<cid>_<page>
+            cid = parts[2]
+            if len(parts) >= 5:
+                mode = parts[3]
+                page = int(parts[4])
+            else:
+                mode = "top"
+                page = int(parts[3])
+
+            if cid in CATEGORY_IDS:
+                CATEGORY_IDS.remove(cid)
+            else:
+                CATEGORY_IDS.add(cid)
+            save_user_state()
+
+            if mode == "all":
+                CAT_VIEW_MODE[uid] = "all"
+                safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
+            elif mode == "search":
+                CAT_VIEW_MODE[uid] = "search"
+                q = (CAT_LAST_QUERY.get(uid) or "").strip()
+                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
+            else:
+                CAT_VIEW_MODE[uid] = "top"
+                safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
             return True
 
         if data == "fc_clear":
-            with FILE_LOCK:
-                set_category_ids([])
-            bot.answer_callback_query(c.id, "קטגוריות נוקו.")
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(0), cb_id=None)
-            return True
-
-        if data == "fc_sync":
-            bot.answer_callback_query(c.id, "מסנכרן…")
-            cats, err = affiliate_category_get()
-            if err:
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"❌ סנכרון נכשל: {err}", reply_markup=_categories_menu_kb(0), cb_id=None)
+            CATEGORY_IDS.clear()
+            save_user_state()
+            mode = CAT_VIEW_MODE.get(uid, "top")
+            if mode == "all":
+                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+            elif mode == "search":
+                q = (CAT_LAST_QUERY.get(uid) or "").strip()
+                safe_edit_message(c.message, f"✅ נוקה! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
             else:
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"✅ סונכרנו {len(cats)} קטגוריות.", reply_markup=_categories_menu_kb(0), cb_id=None)
+                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
             return True
 
         if data == "fc_random":
             cats = get_categories()
-            if not cats:
-                bot.answer_callback_query(c.id, "אין קטגוריות במטמון. לחץ סנכרון.", show_alert=True)
-                return True
-            choice = random.choice(cats)
-            cid = str(choice.get("id"))
-            with FILE_LOCK:
-                set_category_ids([cid])
-            bot.answer_callback_query(c.id, f"נבחרה: {choice.get('name')}")
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(0), cb_id=None)
+            if cats:
+                pick = random.choice(cats)["id"]
+                CATEGORY_IDS.clear()
+                CATEGORY_IDS.add(str(pick))
+                save_user_state()
+            mode = CAT_VIEW_MODE.get(uid, "top")
+            if mode == "all":
+                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+            elif mode == "search":
+                q = (CAT_LAST_QUERY.get(uid) or "").strip()
+                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+            else:
+                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
             return True
 
-        if data.startswith("fc_t_"):
-            # fc_t_<cid>_<page>
-            parts = data.split("_")
-            if len(parts) >= 4:
-                cid = parts[2]
-                page = int(parts[3])
+        if data == "fc_sync":
+            _ = get_categories(force=True)
+            mode = CAT_VIEW_MODE.get(uid, "top")
+            if mode == "all":
+                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+            elif mode == "search":
+                q = (CAT_LAST_QUERY.get(uid) or "").strip()
+                safe_edit_message(c.message, f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
             else:
-                return False
-            selected = get_selected_category_ids()
-            sset = set(selected)
-            if cid in sset:
-                sset.remove(cid)
-            else:
-                sset.add(cid)
-            # preserve original order as much as possible
-            new_order = [x for x in selected if x in sset] + [x for x in sset if x not in selected]
-            with FILE_LOCK:
-                set_category_ids(new_order)
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 קטגוריות (בחירה מרובה):", reply_markup=_categories_menu_kb(page), cb_id=c.id)
+                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
             return True
+
 
     except Exception as e:
         try:
@@ -2655,6 +2777,34 @@ def handle_forward_for_target(msg):
         f"✅ נשמר יעד {label}: {target_value}\n"
         f"{details}\n\nאפשר לעבור בין יעדים מהתפריט: 🎯/🔒"
     )
+
+# ========= CATEGORY SEARCH (text input) =========
+@bot.message_handler(func=lambda m: bool(CAT_SEARCH_WAIT.get(m.from_user.id, False)) and is_admin(m.from_user.id), content_types=["text"])
+def handle_category_search_text(m):
+    uid = m.from_user.id
+    chat_id = m.chat.id
+    q = (m.text or "").strip()
+    # stop waiting even if query is empty
+    CAT_SEARCH_WAIT[uid] = False
+    if not q:
+        bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש. נסה שוב דרך 🔎 חיפוש בקטגוריות.")
+        return
+    CAT_LAST_QUERY[uid] = q
+    ctx = CAT_SEARCH_CTX.get(uid)
+    try:
+        if ctx and ctx[0] == chat_id:
+            bot.edit_message_text(
+                f"🔎 תוצאות חיפוש לקטגוריה: {q}",
+                chat_id=ctx[0],
+                message_id=ctx[1],
+                reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q),
+            )
+        else:
+            bot.send_message(chat_id, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+    except Exception as e:
+        log_warn(f"[CAT] edit/search menu failed: {e}")
+        bot.send_message(chat_id, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+
 
 # ========= UPLOAD CSV =========
 @bot.message_handler(commands=['upload_source'])
