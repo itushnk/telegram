@@ -329,9 +329,15 @@ def _ai_enabled() -> bool:
     return bool(GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None)
 
 def _get_openai_client():
-    global _openai_client
+    global _openai_client, OPENAI_MODEL_EFFECTIVE
     if _openai_client is None:
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        # Resolve an actually-available model once (prevents 403 model_not_found loops).
+        try:
+            _resolve_model_effective(_openai_client)
+        except Exception as e:
+            logging.warning(f"[AI] model resolve failed: {e}")
+            OPENAI_MODEL_EFFECTIVE = OPENAI_MODEL
     return _openai_client
 
 
@@ -422,12 +428,9 @@ AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "0") or "0"))
 AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "0") or "0")  # percent (0-100)
 AE_FREE_SHIP_ONLY_DEFAULT = (os.environ.get("AE_FREE_SHIP_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
 AE_FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("AE_FREE_SHIP_THRESHOLD_ILS", "38") or "38")  # heuristic
-
-# Backward-compatible alias (some parts/logs may use FREE_SHIP_THRESHOLD_ILS)
-FREE_SHIP_THRESHOLD_ILS = float(os.environ.get('FREE_SHIP_THRESHOLD_ILS', '') or AE_FREE_SHIP_THRESHOLD_ILS)
-
 AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
 
+FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("FREE_SHIP_THRESHOLD_ILS", str(AE_FREE_SHIP_THRESHOLD_ILS)) or str(AE_FREE_SHIP_THRESHOLD_ILS))  # alias/backward-compat
 MIN_ORDERS = _get_state_int("min_orders", AE_MIN_ORDERS_DEFAULT)
 MIN_RATING = _get_state_float("min_rating", AE_MIN_RATING_DEFAULT)
 FREE_SHIP_ONLY = _get_state_bool("free_ship_only", AE_FREE_SHIP_ONLY_DEFAULT)
@@ -1403,24 +1406,75 @@ def save_delay_seconds(seconds: int) -> None:
 POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
 
 # ========= ADMIN =========
-def _user_id_from(obj) -> int | None:
-    try:
-        # Message
-        if hasattr(obj, "from_user") and obj.from_user:
-            return int(obj.from_user.id)
-        # CallbackQuery (sometimes obj.message.from_user is the bot; prefer obj.from_user above)
-        if hasattr(obj, "message") and obj.message and getattr(obj.message, "from_user", None):
-            return int(obj.message.from_user.id)
-    except Exception:
-        pass
-    return None
-
 def _is_admin(obj) -> bool:
-    # If no admins configured, allow all (safer for first-time setup)
+    """Return True if the sender is allowed to use admin-only actions.
+
+    Supports both:
+    - Message (msg)
+    - CallbackQuery (c)
+    """
+    # If no admins configured -> allow everyone (useful for first setup)
     if not ADMIN_USER_IDS:
         return True
-    uid = _user_id_from(obj)
-    return uid is not None and (uid in ADMIN_USER_IDS)
+
+    uid = None
+    # CallbackQuery has from_user; Message has from_user; some objects have .message.from_user
+    try:
+        if getattr(obj, "from_user", None) is not None:
+            uid = obj.from_user.id
+        elif getattr(obj, "message", None) is not None and getattr(obj.message, "from_user", None) is not None:
+            uid = obj.message.from_user.id
+    except Exception:
+        uid = None
+
+    return (uid is not None) and (uid in ADMIN_USER_IDS)
+
+
+
+@bot.message_handler(commands=["myid", "whoami"])
+def cmd_myid(msg):
+    uid = msg.from_user.id if msg.from_user else None
+    uname = ("@" + msg.from_user.username) if (msg.from_user and msg.from_user.username) else "(no username)"
+    bot.reply_to(msg, f"🆔 מזהה משתמש (User ID): {uid}\n👤 משתמש: {uname}")
+
+@bot.message_handler(commands=["ai"])
+def cmd_ai(msg):
+    # Keep this mostly admin-only (but let anyone see basic instructions)
+    if not _is_admin(msg):
+        bot.reply_to(
+            msg,
+            "אין לך הרשאה לפקודות ניהול.\n"
+            "כדי להגדיר הרשאה: הפעל /myid ואז הוסף את המספר שקיבלת ל-ADMIN_USER_IDS ב-ENV (ב-Railway), למשל: 123456789"
+        )
+        return
+
+    key_ok = bool(OPENAI_API_KEY and OPENAI_API_KEY.strip())
+    bot.reply_to(
+        msg,
+        "🤖 סטטוס AI\n"
+        f"GPT_ENABLED={GPT_ENABLED}\n"
+        f"OPENAI_MODEL={OPENAI_MODEL}\n"
+        f"OPENAI_MODEL_EFFECTIVE={OPENAI_MODEL_EFFECTIVE}\n"
+        f"OPENAI_API_KEY={'OK' if key_ok else 'MISSING'}\n"
+        f"GPT_ON_REFILL={GPT_ON_REFILL} | GPT_ON_UPLOAD={GPT_ON_UPLOAD} | GPT_ON_SEND_FALLBACK={GPT_ON_SEND_FALLBACK}\n"
+        f"GPT_BATCH_SIZE={GPT_BATCH_SIZE} | GPT_TIMEOUT_SECONDS={GPT_TIMEOUT_SECONDS} | GPT_MAX_RETRIES={GPT_MAX_RETRIES}"
+    )
+
+@bot.message_handler(commands=["ai_test"])
+def cmd_ai_test(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין לך הרשאה.")
+        return
+    if not _ai_enabled():
+        bot.reply_to(msg, "AI כבוי או OPENAI_API_KEY חסר. בדוק GPT_ENABLED ו-OPENAI_API_KEY.")
+        return
+    try:
+        client = _get_openai_client()
+        # Force a fresh model resolution and show what was chosen
+        chosen, available = _resolve_model_effective(client)
+        bot.reply_to(msg, f"✅ models.list עובד.\nנבחר מודל: {chosen}\nדגימה זמינה: {', '.join(available[:10]) or '(none)'}")
+    except Exception as e:
+        bot.reply_to(msg, f"❌ בדיקת AI נכשלה: {e}")
 
 # ========= MERGE =========
 def _key_of_row(r: dict):
@@ -2705,29 +2759,6 @@ def cmd_start(msg):
     _save_admin_chat_id(msg.chat.id)
     bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
 
-@bot.message_handler(commands=['myid','whoami'])
-def cmd_myid(msg):
-    try:
-        uid = msg.from_user.id if msg.from_user else None
-        chat_id = msg.chat.id if msg.chat else None
-        bot.reply_to(msg, f"🆔 User ID שלך: {uid}\n💬 Chat ID: {chat_id}")
-    except Exception:
-        try:
-            bot.reply_to(msg, "🆔 לא הצלחתי לקרוא את ה-ID מההודעה הזו.")
-        except Exception:
-            pass
-
-@bot.message_handler(commands=['admins'])
-def cmd_admins(msg):
-    # Admin-only: show configured admin ids (count only by default)
-    if not _is_admin(msg):
-        try:
-            uid = _user_id_from(msg)
-            bot.reply_to(msg, f"⛔ אין לך הרשאה. ה-User ID שלך הוא: {uid}\nהוסף אותו ל-ADMIN_USER_IDS ב-Railway (מופרד בפסיקים).")
-        except Exception:
-            pass
-        return
-    bot.reply_to(msg, f"✅ Admin IDs configured: {sorted(list(ADMIN_USER_IDS)) if ADMIN_USER_IDS else '(none - all allowed)'}")
 @bot.message_handler(commands=['pending_status','queue'])
 def pending_status_cmd(msg):
     with FILE_LOCK:
@@ -2910,6 +2941,7 @@ if __name__ == "__main__":
 # AI diagnostics
 try:
     ai_state = "ON" if _ai_enabled() else "OFF"
+    ai_diagnostics_startup()
     ai_note = ""
     if GPT_ENABLED and not OPENAI_API_KEY:
         ai_note = " (missing OPENAI_API_KEY)"
