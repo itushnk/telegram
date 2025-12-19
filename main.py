@@ -2780,7 +2780,8 @@ def handle_forward_for_target(msg):
     )
 
 # ========= CATEGORY SEARCH (text input) =========
-@bot.message_handler(func=lambda m: bool(CAT_SEARCH_WAIT.get(m.from_user.id, False)) and is_admin(m.from_user.id), content_types=["text"])
+# Note: _is_admin expects a Message/Callback object (not a raw user_id).
+@bot.message_handler(func=lambda m: bool(CAT_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
 def handle_category_search_text(m):
     uid = m.from_user.id
     chat_id = m.chat.id
