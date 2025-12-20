@@ -10,11 +10,6 @@ Changes vs previous:
 """
 
 import os, sys
-try:
-    import fcntl  # type: ignore
-except Exception:
-    fcntl = None  # type: ignore
-
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -28,7 +23,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20uidfix")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20fix3")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -2305,7 +2300,6 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
 def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
-        uid = getattr(getattr(c, 'from_user', None), 'id', 0) or 0
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -3176,11 +3170,16 @@ t2 = threading.Thread(target=refill_daemon, daemon=True)
 t2.start()
 
 # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
+# IMPORTANT: If Telegram returns 409 (another getUpdates poller is running),
+# we EXIT to avoid uncontrolled posting (auto/refill threads may still run).
 while True:
     try:
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
-        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+        if ("Conflict: terminated by other getUpdates request" in msg) or ("Error code: 409" in msg):
+            log_error(f"Polling error: {e}. Another instance is polling. Exiting to avoid uncontrolled posting.")
+            sys.exit(0)
+        wait = 5
         log_error(f"Polling error: {e}. Retrying in {wait}s...")
         time.sleep(wait)
