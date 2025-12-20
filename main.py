@@ -2323,6 +2323,7 @@ CAT_LAST_QUERY: dict[int, str] = {}     # uid -> last search query
 CAT_SEARCH_WAIT: dict[int, bool] = {}   # uid -> waiting for text query?
 CAT_SEARCH_CTX: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id)
 
+CAT_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
 # --- Manual PRODUCT search UI state (per admin user) ---
 # This is separate from category search. It lets admins type a keyword
 # and the bot will fetch products from AliExpress Affiliate API and add
@@ -2424,6 +2425,8 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
         switch_row.append(types.InlineKeyboardButton("📚 כל הקטגוריות", callback_data="fc_all_0"))
     switch_row.append(types.InlineKeyboardButton("🔎 חיפוש", callback_data="fc_search"))
     kb.row(*switch_row[:2]) if len(switch_row) == 2 else kb.row(*switch_row)
+    if mode == "search" and query:
+        kb.row(types.InlineKeyboardButton("🛒 חפש מוצרים למילת החיפוש", callback_data="prod_search_last"))
 
     # Actions
     kb.row(
@@ -2524,7 +2527,28 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
             kb = types.InlineKeyboardMarkup(row_width=1)
             kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=None)
+
+            # Ask for keyword (in groups, user must Reply to this prompt due to privacy mode)
+            try:
+                prompt = bot.send_message(
+                    chat_id,
+                    "🔎 שלח עכשיו מילת חיפוש לסינון קטגוריות (לדוגמה: iPhone / שעון / בית / כלי עבודה).\n"
+                    "טיפ: בקבוצה צריך לעשות *Reply* להודעה הזאת כדי שהבוט יקבל את הטקסט.",
+                    parse_mode="Markdown",
+                    reply_markup=types.ForceReply(selective=True),
+                )
+                CAT_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
+            except Exception:
+                bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש לסינון קטגוריות (לדוגמה: iPhone / שעון / בית / כלי עבודה).")
+
+            safe_edit_message(
+                bot,
+                chat_id=chat_id,
+                message=c.message,
+                new_text="🔎 מחכה למילת חיפוש…",
+                reply_markup=kb,
+                cb_id=None,
+            )
             return True
 
         # toggle category selection
@@ -2824,6 +2848,29 @@ def on_inline_click(c):
         return
 
     # --- Manual product keyword search ---
+    
+    if data == "prod_search_last":
+        uid = c.from_user.id
+        q = (CAT_LAST_QUERY.get(uid) or "").strip()
+        if not q:
+            bot.answer_callback_query(c.id, "אין מילת חיפוש פעילה.")
+            return
+        bot.answer_callback_query(c.id, "מחפש…")
+        # Run product search immediately and add to queue (no AI)
+        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}")
+        added, dups, total_after, last_page, err = refill_from_affiliate(AE_REFILL_MIN_QUEUE, keywords=q)
+        if err:
+            bot.send_message(chat_id, f"⚠️ החיפוש הסתיים עם הודעה: {err}")
+        bot.send_message(
+            chat_id,
+            f"✅ סיום חיפוש עבור: {q}\n"
+            f"נוספו לתור: {added}\n"
+            f"כפולים שנדחו: {dups}\n"
+            f"סה״כ בתור: {total_after}\n"
+            f"עמוד אחרון שנבדק: {last_page}"
+        )
+        return
+
     if data == "prod_search":
         uid = c.from_user.id
         PROD_SEARCH_WAIT[uid] = True
@@ -3255,12 +3302,42 @@ def handle_category_search_text(m):
     uid = m.from_user.id
     chat_id = m.chat.id
     q = (m.text or "").strip()
+
+    # In groups, require reply to the prompt message (privacy mode)
+    try:
+        chat_type = getattr(m.chat, "type", "") or ""
+    except Exception:
+        chat_type = ""
+
+    prompt_ctx = CAT_SEARCH_PROMPT.get(uid)
+    if chat_type in ("group", "supergroup"):
+        if not (getattr(m, "reply_to_message", None) and prompt_ctx and prompt_ctx[0] == chat_id and m.reply_to_message.message_id == prompt_ctx[1]):
+            bot.reply_to(m, "כדי שהחיפוש יעבוד בקבוצה: לחץ Reply על הודעת החיפוש של הבוט ואז כתוב את מילת החיפוש.")
+            return
+
     # stop waiting even if query is empty
     CAT_SEARCH_WAIT[uid] = False
+
+    # delete the prompt message (if any)
+    if prompt_ctx:
+        try:
+            _safe_delete(prompt_ctx[0], prompt_ctx[1])
+        except Exception:
+            pass
+        CAT_SEARCH_PROMPT.pop(uid, None)
+
     if not q:
         bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש. נסה שוב דרך 🔎 חיפוש בקטגוריות.")
         return
+
     CAT_LAST_QUERY[uid] = q
+
+    # Count matched categories for feedback
+    try:
+        total = len(_filter_categories(get_categories(), mode="search", uid=uid, query=q))
+    except Exception:
+        total = 0
+
     ctx = CAT_SEARCH_CTX.get(uid)
     try:
         if ctx and ctx[0] == chat_id:
@@ -3276,6 +3353,11 @@ def handle_category_search_text(m):
         log_warn(f"[CAT] edit/search menu failed: {e}")
         bot.send_message(chat_id, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
 
+    # Explicit feedback
+    if total <= 0:
+        bot.send_message(chat_id, f"❗️לא מצאתי קטגוריות שמתאימות ל: {q}\nנסה מילה אחרת, או לחץ על 🛒 חפש מוצרים למילת החיפוש.")
+    else:
+        bot.send_message(chat_id, f"✅ נמצאו {total} קטגוריות שמתאימות ל: {q}\nאפשר לבחור קטגוריות, או לחץ על 🛒 חפש מוצרים למילת החיפוש.")
 
 # ========= MANUAL PRODUCT SEARCH (text input) =========
 @bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
