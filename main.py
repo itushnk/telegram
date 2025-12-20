@@ -240,11 +240,6 @@ SCHEDULE_FLAG_FILE      = os.path.join(BASE_DIR, "schedule_enforced.flag")
 CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
-PUBLISH_DISABLED_FLAG_FILE = os.path.join(BASE_DIR, "publish_disabled.flag")
-REFILL_PAUSED_FLAG_FILE   = os.path.join(BASE_DIR, "refill_paused.flag")
-
-# Persistent history of already-posted items (for de-dup across restarts)
-POSTED_KEYS_FILE          = os.path.join(BASE_DIR, "posted_keys.jsonl")
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
 
@@ -295,7 +290,7 @@ AE_SHIP_TO_COUNTRY = (os.environ.get("AE_SHIP_TO_COUNTRY", "IL") or "IL").strip(
 AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip().upper()
 
 # target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח.
-AE_TARGET_CURRENCY = (os.environ.get("AE_TARGET_CURRENCY", "USD") or "USD").strip().upper()
+AE_TARGET_CURRENCY = "USD"
 
 
 # =================== AI (OpenAI) — “לתת חיים למוצרים” ===================
@@ -422,20 +417,6 @@ AE_REFILL_MAX_PAGES = int(os.environ.get("AE_REFILL_MAX_PAGES", "3") or "3")
 AE_REFILL_PAGE_SIZE = int(os.environ.get("AE_REFILL_PAGE_SIZE", "50") or "50")
 AE_REFILL_SORT = (os.environ.get("AE_REFILL_SORT", "LAST_VOLUME_DESC") or "LAST_VOLUME_DESC").strip().upper()
 
-# ========= DEDUP (avoid repeated products) =========
-AE_DEDUP_KEY_MODE = (os.environ.get("AE_DEDUP_KEY_MODE", "item_id") or "item_id").strip().lower()
-AE_DEDUP_MAX_DAYS = int(float(os.environ.get("AE_DEDUP_MAX_DAYS", "30") or "30"))
-AE_DEDUP_MAX_ITEMS = int(float(os.environ.get("AE_DEDUP_MAX_ITEMS", "5000") or "5000"))
-AE_DEDUP_SCOPE = (os.environ.get("AE_DEDUP_SCOPE", "all") or "all").strip().lower()  # queue|posted|all
-AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND = (os.environ.get("AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND", "1") or "1").strip().lower() in ("1","true","yes","on")
-
-# ========= PRICE INPUT CURRENCY =========
-# If your affiliate/app prices are already in ILS (but without a '₪' sign), set:
-#   AE_PRICE_INPUT_CURRENCY=ILS
-# If prices are in USD (default), leave as USD.
-# AUTO: convert only when '$'/'usd' appears; otherwise assume ILS.
-AE_PRICE_INPUT_CURRENCY = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
-
 # Optional price filtering (ILS buckets) for refill results.
 # Example: AE_PRICE_BUCKETS=1-5,5-10,10-20,20-50,50+
 AE_PRICE_BUCKETS_RAW_DEFAULT = (os.environ.get("AE_PRICE_BUCKETS", "") or os.environ.get("AE_PRICE_FILTER", "") or "").strip()
@@ -526,127 +507,6 @@ EXPECTING_TARGET = {}      # dict[user_id] = "public"|"private"
 EXPECTING_UPLOAD = set()   # user_ids שמצפים ל-CSV
 FILE_LOCK = threading.Lock()
 
-
-POSTED_LOCK = threading.Lock()
-_POSTED_KEYS: set[str] = set()
-
-def _touch_flag(path: str):
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("1")
-    except Exception:
-        pass
-
-def _remove_flag(path: str):
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
-
-def is_publish_enabled() -> bool:
-    # publish is enabled unless the disabled-flag exists
-    return not os.path.exists(PUBLISH_DISABLED_FLAG_FILE)
-
-def set_publish_enabled(enabled: bool):
-    if enabled:
-        _remove_flag(PUBLISH_DISABLED_FLAG_FILE)
-    else:
-        _touch_flag(PUBLISH_DISABLED_FLAG_FILE)
-
-def is_refill_paused() -> bool:
-    return os.path.exists(REFILL_PAUSED_FLAG_FILE)
-
-def set_refill_paused(paused: bool):
-    if paused:
-        _touch_flag(REFILL_PAUSED_FLAG_FILE)
-    else:
-        _remove_flag(REFILL_PAUSED_FLAG_FILE)
-
-def _dedup_key_of_row(r: dict) -> str:
-    """Return a stable de-dup key for a row according to AE_DEDUP_KEY_MODE.
-
-    Recommended: AE_DEDUP_KEY_MODE=item_id
-    """
-    item_id = str(r.get("ItemId") or r.get("ProductId") or r.get("item_id") or "").strip()
-    title   = str(r.get("Title") or "").strip()
-    buy     = str(r.get("BuyLink") or r.get("Promotion Url") or "").strip()
-
-    mode = (AE_DEDUP_KEY_MODE or "item_id").lower()
-    if mode in ("item", "itemid", "item_id"):
-        if item_id:
-            return f"id:{item_id}"
-        # fallback if item_id missing
-        if buy:
-            return f"buy:{buy}"
-        return f"title:{title}"
-    if mode in ("item_id_buy", "item+buy", "id_buy"):
-        return f"id:{item_id}|buy:{buy}" if item_id else f"title:{title}|buy:{buy}"
-    if mode in ("title_buy", "title+buy"):
-        return f"title:{title}|buy:{buy}"
-    # default fallback
-    return f"id:{item_id}" if item_id else f"title:{title}|buy:{buy}"
-
-def _load_posted_keys():
-    """Load already-posted keys from disk (jsonl), apply retention."""
-    global _POSTED_KEYS
-    keys = set()
-    now = time.time()
-    max_age = max(1, int(AE_DEDUP_MAX_DAYS)) * 86400
-    try:
-        if os.path.exists(POSTED_KEYS_FILE):
-            with open(POSTED_KEYS_FILE, "r", encoding="utf-8") as f:
-                for ln in f:
-                    ln = (ln or "").strip()
-                    if not ln:
-                        continue
-                    try:
-                        obj = json.loads(ln)
-                        ts = float(obj.get("ts") or 0)
-                        k  = str(obj.get("key") or "").strip()
-                    except Exception:
-                        # support plain lines: "key"
-                        ts = 0
-                        k = ln
-                    if not k:
-                        continue
-                    if ts and (now - ts) > max_age:
-                        continue
-                    keys.add(k)
-    except Exception:
-        pass
-
-    # cap size
-    if AE_DEDUP_MAX_ITEMS and len(keys) > AE_DEDUP_MAX_ITEMS:
-        # keep arbitrary subset (we don't store ordering in memory)
-        keys = set(list(keys)[-AE_DEDUP_MAX_ITEMS:])
-
-    with POSTED_LOCK:
-        _POSTED_KEYS = keys
-
-def _mark_posted_key(key: str):
-    if not key:
-        return
-    now = time.time()
-    with POSTED_LOCK:
-        if key in _POSTED_KEYS:
-            return
-        _POSTED_KEYS.add(key)
-
-    try:
-        os.makedirs(os.path.dirname(POSTED_KEYS_FILE), exist_ok=True)
-        with open(POSTED_KEYS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": now, "key": key}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-def _is_already_posted(key: str) -> bool:
-    with POSTED_LOCK:
-        return key in _POSTED_KEYS
-
-# Load posted keys once on startup
-_load_posted_keys()
 # ========= SINGLE INSTANCE LOCK =========
 def acquire_single_instance_lock(lock_path: str):
     """מונע שתי ריצות *באותה מכונה/קונטיינר*. לא מונע שני קונטיינרים שונים בענן."""
@@ -806,60 +666,6 @@ def usd_to_ils(price_text: str, rate: float) -> str:
     if ("₪" in raw_original) or ("ILS" in up) or ("NIS" in up):
         ils = float(num)
     else:
-        ils = float(num) * float(rate)
-
-    # Apply decimals
-    dec = PRICE_DECIMALS
-    try:
-        dec = int(dec)
-    except Exception:
-        dec = 2
-    return _format_money(round(ils, dec), dec)
-
-
-def price_to_ils(price_text: str, rate: float) -> str:
-    """Normalize incoming price to an ILS-formatted string.
-
-    Controlled by AE_PRICE_INPUT_CURRENCY:
-      - USD  (default): convert using rate (existing behavior)
-      - ILS           : DO NOT convert (only normalize/format)
-      - AUTO          : convert only if '$'/'usd' appears; otherwise assume ILS
-    """
-    if price_text is None:
-        return ""
-    cur = (AE_PRICE_INPUT_CURRENCY or "USD").upper()
-
-    raw_original = str(price_text)
-    up = raw_original.upper()
-    if ("₪" in raw_original) or ("ILS" in up) or ("NIS" in up):
-        # If the price string already indicates ILS, never convert again
-        cur = "ILS"
-
-    raw_clean = clean_price_text(raw_original)
-    num = _extract_float(raw_clean)
-    if num is None:
-        return ""
-
-    # Optional cents-as-integer normalization
-    try:
-        if AE_PRICE_INT_IS_CENTS and raw_clean.replace(".", "").isdigit():
-            # If there is no decimal point, treat as cents
-            if "." not in raw_clean and "," not in raw_original:
-                if num > 0:
-                    num = num / 100.0
-    except Exception:
-        pass
-
-    if cur == "ILS":
-        ils = float(num)
-    elif cur == "AUTO":
-        # If it clearly looks USD -> convert, else assume ILS
-        if _is_usd_price(raw_original):
-            ils = float(num) * float(rate)
-        else:
-            ils = float(num)
-    else:
-        # USD
         ils = float(num) * float(rate)
 
     # Apply decimals
@@ -1523,34 +1329,15 @@ def post_to_channel(product) -> bool:
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
     with FILE_LOCK:
-        if not is_publish_enabled():
-            log_info(f"{source}: publish disabled -> skip sending")
-            return False
         pending = read_products(PENDING_CSV)
         if not pending:
             log_info(f"{source}: no pending")
             return False
 
         item = pending[0]
-        dedup_key = _key_of_row(item)
         item_id = (item.get("ItemId") or "").strip()
         title = (item.get("Title") or "").strip()[:120]
         log_info(f"{source}: sending ItemId={item_id} | Title={title}")
-
-        # Optional: skip items already posted (prevents loops)
-        if AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND and dedup_key and _is_already_posted(dedup_key):
-            log_info(f"{source}: already-posted -> drop from queue (key={dedup_key})")
-            try:
-                write_products(PENDING_CSV, pending[1:])
-            except Exception as e:
-                log_info(f"{source}: drop already-posted failed, retry once: {e}")
-                time.sleep(0.2)
-                try:
-                    write_products(PENDING_CSV, pending[1:])
-                except Exception as e2:
-                    log_exc(f"{source}: drop already-posted FAILED permanently: {e2}")
-                    return False
-            return True
 
         ok = post_to_channel(item)
         if not ok:
@@ -1559,9 +1346,6 @@ def send_next_locked(source: str = "loop") -> bool:
             return False
 
         try:
-            # Mark as posted BEFORE advancing the queue (so retries don't duplicate)
-            if dedup_key:
-                _mark_posted_key(dedup_key)
             write_products(PENDING_CSV, pending[1:])
         except Exception as e:
             log_info(f"{source}: write FAILED, retry once: {e}")
@@ -1574,6 +1358,7 @@ def send_next_locked(source: str = "loop") -> bool:
 
         log_info(f"{source}: sent & advanced queue (ItemId={item_id})")
         return True
+
 
 # ========= DELAY =========
 AUTO_SCHEDULE = [
@@ -1699,9 +1484,10 @@ def cmd_ai_test(msg):
 
 # ========= MERGE =========
 def _key_of_row(r: dict):
-    # De-dup key (stable across link variations)
-    return _dedup_key_of_row(r)
-
+    item_id = (r.get("ItemId") or "").strip()
+    title   = (r.get("Title") or "").strip()
+    buy     = (r.get("BuyLink") or "").strip()
+    return (item_id if item_id else None, title if not item_id else None, buy)
 
 def merge_from_data_into_pending():
     """Merge rows from DATA_CSV into PENDING_CSV.
@@ -1712,11 +1498,6 @@ def merge_from_data_into_pending():
         data_rows = read_products(DATA_CSV)
         pending_rows = read_products(PENDING_CSV)
         existing_keys = {_key_of_row(r) for r in pending_rows}
-
-    # Optionally de-dup against already-posted history (persisted)
-    if AE_DEDUP_SCOPE in ("posted", "all"):
-        with POSTED_LOCK:
-            existing_keys |= set(_POSTED_KEYS)
 
     # Only new candidates (so we don't waste AI calls)
     new_candidates = [r for r in data_rows if _key_of_row(r) not in existing_keys]
@@ -1992,8 +1773,8 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     sale_text, sale_is_from = _pick_value(sale_raw)
     orig_text, orig_is_from = _pick_value(orig_raw)
 
-    sale_ils = price_to_ils(sale_text, USD_TO_ILS_RATE_DEFAULT)
-    orig_ils = price_to_ils(orig_text, USD_TO_ILS_RATE_DEFAULT)
+    sale_ils = usd_to_ils(sale_text, USD_TO_ILS_RATE_DEFAULT)
+    orig_ils = usd_to_ils(orig_text, USD_TO_ILS_RATE_DEFAULT)
 
     product_id = str(p.get("product_id", "")).strip()
 
@@ -2700,13 +2481,6 @@ def inline_menu():
         types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
     )
 
-    pub_label = "🛑 עצור פרסום" if is_publish_enabled() else "✅ הפעל פרסום"
-    refill_label = "⏸️ עצור מילוי אוטומטי" if not is_refill_paused() else "▶️ הפעל מילוי אוטומטי"
-    kb.add(
-        types.InlineKeyboardButton(pub_label, callback_data="toggle_publish"),
-        types.InlineKeyboardButton(refill_label, callback_data="toggle_refill"),
-    )
-
     kb.add(
         types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
     )
@@ -2767,29 +2541,12 @@ def on_inline_click(c):
         return
 
     if data == "publish_now":
-        if not is_publish_enabled():
-            bot.answer_callback_query(c.id, "פרסום כבוי. הפעל דרך הכפתור ✅ הפעל פרסום.", show_alert=True)
-            return
         ok = send_next_locked("manual")
         if not ok:
             bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
             return
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text="✅ בוצעה פעולה על הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
-
-    elif data == "toggle_publish":
-        enabled = is_publish_enabled()
-        set_publish_enabled(not enabled)
-        state = "✅ פרסום הופעל" if not enabled else "🛑 פרסום נעצר"
-        safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"{state}.", reply_markup=inline_menu(), cb_id=c.id)
-
-    elif data == "toggle_refill":
-        paused = is_refill_paused()
-        set_refill_paused(not paused)
-        state = "▶️ מילוי אוטומטי הופעל" if paused else "⏸️ מילוי אוטומטי הושהה"
-        safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"{state}.", reply_markup=inline_menu(), cb_id=c.id)
+                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "pending_status":
         with FILE_LOCK:
@@ -3259,11 +3016,6 @@ def auto_post_loop():
                 DELAY_EVENT.clear()
                 continue
 
-            if not is_publish_enabled():
-                DELAY_EVENT.wait(timeout=30)
-                DELAY_EVENT.clear()
-                continue
-
             send_next_locked("auto")
             DELAY_EVENT.wait(timeout=delay)
             DELAY_EVENT.clear()
@@ -3294,9 +3046,6 @@ def refill_daemon():
 
     while True:
         try:
-            if is_refill_paused():
-                time.sleep(30)
-                continue
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
 
@@ -3411,6 +3160,38 @@ except Exception:
         print(f"[WARN] remove_webhook failed: {e2}", flush=True)
 print_webhook_info()
 
+# --- Single-instance guard (prevents 409 conflicts when accidentally running twice) ---
+# Note: this prevents multiple processes *inside the same container/VM*. If you run multiple replicas (Railway scaling)
+# or another host is running the same BOT_TOKEN, you must stop the other instance / set replicas=1.
+BOT_LOCK_FILE = os.getenv("BOT_LOCK_FILE", "/tmp/telegram_bot_singleton.lock")
+BOT_REQUIRE_SINGLE_INSTANCE = os.getenv("BOT_REQUIRE_SINGLE_INSTANCE", "1").strip() not in ("0", "false", "False", "no", "NO")
+
+def acquire_single_instance_lock():
+    if not BOT_REQUIRE_SINGLE_INSTANCE:
+        return None
+    try:
+        fd = os.open(BOT_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log_error(f"[BOOT] Another bot process is already running (lock busy: {BOT_LOCK_FILE}). Exiting to avoid Telegram 409.")
+            os.close(fd)
+            sys.exit(0)
+        # Write PID for debugging (best-effort)
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            os.fsync(fd)
+        except Exception:
+            pass
+        return fd
+    except Exception as e:
+        log_error(f"[BOOT] Failed to acquire singleton lock ({BOT_LOCK_FILE}): {e}. Continuing without lock.")
+        return None
+
+_singleton_lock_fd = acquire_single_instance_lock()
+# --- End single-instance guard ---
+
 if not os.path.exists(AUTO_FLAG_FILE):
     write_auto_flag("on")
 
@@ -3426,6 +3207,11 @@ while True:
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
-        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+        if "Conflict: terminated by other getUpdates request" in msg:
+            # Another instance is polling with the same BOT_TOKEN.
+            # Exit to avoid an uncontrolled state where auto-posting threads keep running but you cannot control the bot.
+            log_error(f"Polling error: {e}. Another instance is polling. Exiting to avoid uncontrolled posting.")
+            sys.exit(0)
+        wait = 5
         log_error(f"Polling error: {e}. Retrying in {wait}s...")
         time.sleep(wait)
