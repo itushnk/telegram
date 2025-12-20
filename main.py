@@ -1814,8 +1814,13 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     return products, resp_code, resp_msg
 
 
-def affiliate_product_query(page_no: int, page_size: int, category_id: str | None = None) -> tuple[list[dict], int | None, str | None]:
-    """Affiliate product query with optional category filter."""
+def affiliate_product_query(page_no: int, page_size: int, category_id: str | None = None, keywords: str | None = None) -> tuple[list[dict], int | None, str | None]:
+    """Affiliate product query with optional category filter.
+
+    Notes:
+    - If `keywords` is provided, it is sent as-is to TOP.
+    - Otherwise, if AE_KEYWORDS exists, it rotates keywords to avoid repetitive results.
+    """
     fields = "product_id,product_title,product_main_image_url,promotion_link,promotion_url,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
     biz = {
         "tracking_id": AE_TRACKING_ID,
@@ -1831,10 +1836,13 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     if category_id:
         biz["category_ids"] = str(category_id).strip()
 
-    # If AE_KEYWORDS provided, rotate keywords to avoid repetitive results
-    if AE_KEYWORDS:
+    # Manual keywords override (e.g., admin "manual search")
+    if keywords:
+        biz["keywords"] = str(keywords).strip()
+    # Otherwise rotate env keywords (if provided)
+    elif AE_KEYWORDS:
         kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS) if k.strip()]
-        if kws and "keywords" not in biz:
+        if kws:
             biz["keywords"] = kws[(page_no - 1) % len(kws)]
     payload = _top_call("aliexpress.affiliate.product.query", biz)
     resp = _extract_resp_result(payload)
@@ -1924,7 +1932,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
 
 
-def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | None]:
+def refill_from_affiliate(max_needed: int, keywords: str | None = None) -> tuple[int, int, int, int, str | None]:
     """
     מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
     """
@@ -1965,7 +1973,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
             for page_no in range(1, max_pages_per_cat + 1):
                 last_page = page_no
                 try:
-                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id)
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id, keywords=keywords)
                     last_resp = (resp_code, resp_msg, len(products))
 
                     if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
@@ -2043,20 +2051,25 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                 break
 
     else:
-        # No categories selected -> use HotProduct feed (most stable) + apply filters
+        # No categories selected:
+        # - If admin provided keywords: use affiliate.product.query with those keywords.
+        # - Otherwise: use HotProduct feed (most stable) + optional AE_KEYWORDS fallback.
         for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
             last_page = page_no
             try:
-                products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
-                # Fallback: some accounts/params return empty from hotproduct query.
-                # If AE_KEYWORDS exists, try affiliate.product.query with rotating keywords.
-                if (not products) and AE_KEYWORDS:
-                    try:
-                        products2, rc2, rm2 = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
-                        if products2:
-                            products, resp_code, resp_msg = products2, rc2, rm2
-                    except Exception:
-                        pass
+                if keywords:
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None, keywords=keywords)
+                else:
+                    products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
+                    # Fallback: some accounts/params return empty from hotproduct query.
+                    # If AE_KEYWORDS exists, try affiliate.product.query with rotating keywords.
+                    if (not products) and AE_KEYWORDS:
+                        try:
+                            products2, rc2, rm2 = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
+                            if products2:
+                                products, resp_code, resp_msg = products2, rc2, rm2
+                        except Exception:
+                            pass
                 last_resp = (resp_code, resp_msg, len(products))
 
                 if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
@@ -2309,6 +2322,14 @@ CAT_VIEW_MODE: dict[int, str] = {}      # uid -> "top" | "all" | "search"
 CAT_LAST_QUERY: dict[int, str] = {}     # uid -> last search query
 CAT_SEARCH_WAIT: dict[int, bool] = {}   # uid -> waiting for text query?
 CAT_SEARCH_CTX: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id)
+
+# --- Manual PRODUCT search UI state (per admin user) ---
+# This is separate from category search. It lets admins type a keyword
+# and the bot will fetch products from AliExpress Affiliate API and add
+# them to the pending queue.
+PROD_SEARCH_WAIT: dict[int, bool] = {}        # uid -> waiting for keyword text?
+PROD_SEARCH_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
+PROD_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
 
 # Keywords used to shrink the category list in "top" mode (Hebrew+English)
 CATEGORY_TOP_KEYWORDS = [
@@ -2761,6 +2782,7 @@ def inline_menu():
 
     kb.add(
         types.InlineKeyboardButton("🔥 מלא מהאפילייט עכשיו", callback_data="refill_now"),
+        types.InlineKeyboardButton("🔎 חיפוש ידני", callback_data="prod_search"),
         types.InlineKeyboardButton("₪ המרת $→₪ (לקובץ הבא)", callback_data="convert_next"),
         types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"),
     )
@@ -2799,6 +2821,26 @@ def on_inline_click(c):
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
+        return
+
+    # --- Manual product keyword search ---
+    if data == "prod_search":
+        uid = c.from_user.id
+        PROD_SEARCH_WAIT[uid] = True
+        PROD_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
+        try:
+            prompt = bot.send_message(
+                chat_id,
+                "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח).\n"
+                "טיפ: אם אתה בתוך קבוצה – *תענה/י* להודעה הזאת (Reply) כדי שהבוט יקבל את הטקסט.",
+                parse_mode='Markdown',
+                reply_markup=types.ForceReply(selective=True)
+            )
+            PROD_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
+        except Exception:
+            # Fallback without ForceReply
+            bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח)")
+        bot.answer_callback_query(c.id)
         return
 
 
@@ -3233,6 +3275,86 @@ def handle_category_search_text(m):
     except Exception as e:
         log_warn(f"[CAT] edit/search menu failed: {e}")
         bot.send_message(chat_id, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+
+
+# ========= MANUAL PRODUCT SEARCH (text input) =========
+@bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
+def handle_manual_product_search_text(m):
+    """Handle admin keyword search that fetches affiliate products and adds them to queue.
+
+    Important: In group chats, bots often don't receive regular text due to privacy mode.
+    We therefore send a ForceReply prompt and require the user to reply to that message.
+    """
+    uid = m.from_user.id
+    chat_id = m.chat.id
+    q = (m.text or "").strip()
+
+    # If in group/supergroup, require reply to the prompt message so bot will receive it.
+    try:
+        chat_type = getattr(m.chat, "type", "") or ""
+    except Exception:
+        chat_type = ""
+
+    prompt_ctx = PROD_SEARCH_PROMPT.get(uid)
+    if chat_type in ("group", "supergroup"):
+        if not (getattr(m, "reply_to_message", None) and prompt_ctx and prompt_ctx[0] == chat_id and m.reply_to_message.message_id == prompt_ctx[1]):
+            bot.reply_to(m, "כדי שהחיפוש יעבוד בקבוצה: לחץ Reply על הודעת החיפוש של הבוט ואז כתוב את מילת החיפוש.")
+            return
+
+    # Clear wait state
+    PROD_SEARCH_WAIT[uid] = False
+    if prompt_ctx:
+        try:
+            _safe_delete(prompt_ctx[0], prompt_ctx[1])
+        except Exception:
+            pass
+        PROD_SEARCH_PROMPT.pop(uid, None)
+
+    if not q:
+        bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש. נסה שוב דרך 🔎 חיפוש ידני.")
+        return
+
+    # Immediate feedback
+    try:
+        status = bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} ...")
+    except Exception:
+        status = None
+
+    try:
+        max_needed = int(os.environ.get("AE_MANUAL_SEARCH_MAX", "80") or 80)
+        added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed, keywords=q)
+
+        note = ""
+        if not added:
+            note = (
+                "\n\nטיפים אם אין תוצאות:\n"
+                "• נסה מילה באנגלית (AliExpress מחזיר טוב יותר באנגלית)\n"
+                "• בדוק סינונים (מחיר/דירוג/הזמנות/משלוח חינם)\n"
+                "• נסה מילה כללית יותר"
+            )
+
+        text = (
+            "🔎 חיפוש ידני הושלם\n"
+            f"מילת חיפוש: {q}\n"
+            f"נוספו לתור: {added}\n"
+            f"כפולים שנדחו: {dup}\n"
+            f"סה\"כ בתור: {total_after}\n"
+            f"דף אחרון שנבדק: {last_page}\n"
+            f"שגיאה/מידע: {last_error or 'אין'}"
+            f"{note}"
+        )
+
+        if status:
+            safe_edit_message(bot, chat_id=chat_id, message=status, new_text=text, reply_markup=inline_menu(), cb_id=None)
+        else:
+            bot.send_message(chat_id, text, reply_markup=inline_menu())
+    except Exception as e:
+        err = f"❌ שגיאה בחיפוש: {type(e).__name__}: {e}"
+        log_warn(err)
+        if status:
+            safe_edit_message(bot, chat_id=chat_id, message=status, new_text=err, reply_markup=inline_menu(), cb_id=None)
+        else:
+            bot.send_message(chat_id, err, reply_markup=inline_menu())
 
 
 # ========= UPLOAD CSV =========
