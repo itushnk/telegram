@@ -2,7 +2,7 @@
 """
 main.py — Telegram Post Bot + AliExpress Affiliate refill
 
-Version: 2025-12-16h
+Version: 2025-12-20a
 Changes vs previous:
 - Fix TOP timestamp to GMT+8 (per TOP gateway requirement)
 - Raise on TOP error_response (so you finally see the real error instead of '0 products' and None)
@@ -94,6 +94,20 @@ def _get_state_float(key: str, default: float = 0.0) -> float:
 def _get_state_bool(key: str, default: bool = False) -> bool:
     s = _get_state_str(key, "1" if default else "0").lower()
     return s in ("1", "true", "yes", "y", "on", "t")
+
+
+# ===== runtime toggles stored in bot_state.json =====
+def is_publish_enabled() -> bool:
+    return _get_state_bool("publish_enabled", True)
+
+def set_publish_enabled(flag: bool):
+    _set_state_str("publish_enabled", "1" if bool(flag) else "0")
+
+def is_refill_paused() -> bool:
+    return _get_state_bool("refill_paused", False)
+
+def set_refill_paused(flag: bool):
+    _set_state_str("refill_paused", "1" if bool(flag) else "0")
 
 def _get_state_csv_set(key: str, default_raw: str = "") -> set[str]:
     raw = _get_state_str(key, default_raw)
@@ -242,6 +256,7 @@ AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
+AE_PRICE_INPUT_CURRENCY = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()  # USD/ILS/AUTO
 
 PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
 AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
@@ -509,6 +524,8 @@ FILE_LOCK = threading.Lock()
 
 # ========= SINGLE INSTANCE LOCK =========
 def acquire_single_instance_lock(lock_path: str):
+    if fcntl is None:
+        raise RuntimeError("fcntl unavailable (non-Linux runtime)")
     """מונע שתי ריצות *באותה מכונה/קונטיינר*. לא מונע שני קונטיינרים שונים בענן."""
     try:
         if os.name == "nt":
@@ -1328,6 +1345,9 @@ def post_to_channel(product) -> bool:
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
+    if not is_publish_enabled():
+        log_info(f"{source}: publish disabled, skipping")
+        return False
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
@@ -2481,6 +2501,15 @@ def inline_menu():
         types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
     )
 
+    # --- runtime toggles ---
+    pub_label = "🛑 עצור פרסום" if is_publish_enabled() else "✅ הפעל פרסום"
+    refill_label = "⏸️ עצור מילוי אוטומטי" if (not is_refill_paused()) else "▶️ הפעל מילוי אוטומטי"
+    kb.add(
+        types.InlineKeyboardButton(pub_label, callback_data="toggle_publish"),
+        types.InlineKeyboardButton(refill_label, callback_data="toggle_refill"),
+    )
+
+
     kb.add(
         types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
     )
@@ -2520,7 +2549,7 @@ def inline_menu():
     )
 
     kb.add(types.InlineKeyboardButton(
-        f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"
+        f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET} | פרסום: {'פעיל' if is_publish_enabled() else 'כבוי'} | מילוי: {'פעיל' if (AE_REFILL_ENABLED and not is_refill_paused()) else 'מושהה'}", callback_data="noop_info"
     ))
     return kb
 
@@ -2541,6 +2570,9 @@ def on_inline_click(c):
         return
 
     if data == "publish_now":
+        if not is_publish_enabled():
+            bot.answer_callback_query(c.id, "🛑 פרסום כבוי. הפעל דרך התפריט.", show_alert=True)
+            return
         ok = send_next_locked("manual")
         if not ok:
             bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
@@ -2648,7 +2680,22 @@ def on_inline_click(c):
         except Exception as e:
             bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
 
-    elif data == "toggle_auto_mode":
+    
+    elif data == "toggle_publish":
+        new_state = not is_publish_enabled()
+        set_publish_enabled(new_state)
+        bot.answer_callback_query(c.id, "✅ פרסום הופעל" if new_state else "🛑 פרסום נעצר")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="בחר פעולה:", reply_markup=inline_menu(), cb_id=None)
+        return
+
+    elif data == "toggle_refill":
+        new_paused = not is_refill_paused()
+        set_refill_paused(new_paused)
+        bot.answer_callback_query(c.id, "⏸️ מילוי אוטומטי נעצר" if new_paused else "▶️ מילוי אוטומטי הופעל")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="בחר פעולה:", reply_markup=inline_menu(), cb_id=None)
+        return
+
+elif data == "toggle_auto_mode":
         current = read_auto_flag()
         new_mode = "off" if current == "on" else "on"
         write_auto_flag(new_mode)
@@ -3002,6 +3049,11 @@ def auto_post_loop():
     init_pending()
 
     while True:
+        if not is_publish_enabled():
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
+
         if read_auto_flag() == "on":
             delay = get_auto_delay()
             if delay is None or is_quiet_now():
@@ -3046,6 +3098,10 @@ def refill_daemon():
 
     while True:
         try:
+            if is_refill_paused():
+                time.sleep(15)
+                continue
+
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
 
@@ -3160,38 +3216,6 @@ except Exception:
         print(f"[WARN] remove_webhook failed: {e2}", flush=True)
 print_webhook_info()
 
-# --- Single-instance guard (prevents 409 conflicts when accidentally running twice) ---
-# Note: this prevents multiple processes *inside the same container/VM*. If you run multiple replicas (Railway scaling)
-# or another host is running the same BOT_TOKEN, you must stop the other instance / set replicas=1.
-BOT_LOCK_FILE = os.getenv("BOT_LOCK_FILE", "/tmp/telegram_bot_singleton.lock")
-BOT_REQUIRE_SINGLE_INSTANCE = os.getenv("BOT_REQUIRE_SINGLE_INSTANCE", "1").strip() not in ("0", "false", "False", "no", "NO")
-
-def acquire_single_instance_lock():
-    if not BOT_REQUIRE_SINGLE_INSTANCE:
-        return None
-    try:
-        fd = os.open(BOT_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log_error(f"[BOOT] Another bot process is already running (lock busy: {BOT_LOCK_FILE}). Exiting to avoid Telegram 409.")
-            os.close(fd)
-            sys.exit(0)
-        # Write PID for debugging (best-effort)
-        try:
-            os.ftruncate(fd, 0)
-            os.write(fd, str(os.getpid()).encode("utf-8"))
-            os.fsync(fd)
-        except Exception:
-            pass
-        return fd
-    except Exception as e:
-        log_error(f"[BOOT] Failed to acquire singleton lock ({BOT_LOCK_FILE}): {e}. Continuing without lock.")
-        return None
-
-_singleton_lock_fd = acquire_single_instance_lock()
-# --- End single-instance guard ---
-
 if not os.path.exists(AUTO_FLAG_FILE):
     write_auto_flag("on")
 
@@ -3207,11 +3231,6 @@ while True:
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
-        if "Conflict: terminated by other getUpdates request" in msg:
-            # Another instance is polling with the same BOT_TOKEN.
-            # Exit to avoid an uncontrolled state where auto-posting threads keep running but you cannot control the bot.
-            log_error(f"Polling error: {e}. Another instance is polling. Exiting to avoid uncontrolled posting.")
-            sys.exit(0)
-        wait = 5
+        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
         log_error(f"Polling error: {e}. Retrying in {wait}s...")
         time.sleep(wait)
