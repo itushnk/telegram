@@ -1932,7 +1932,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
 
 
-def refill_from_affiliate(max_needed: int, keywords: str | None = None) -> tuple[int, int, int, int, str | None]:
+def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_selected_categories: bool = False) -> tuple[int, int, int, int, str | None]:
     """
     מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
     """
@@ -1953,7 +1953,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None) -> tuple
 
     
     # Build active filters snapshot
-    selected_cats = get_selected_category_ids()
+    selected_cats = [] if ignore_selected_categories else get_selected_category_ids()
     # Distribute evenly if categories selected
     if selected_cats:
         n = len(selected_cats)
@@ -2331,6 +2331,264 @@ CAT_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_me
 PROD_SEARCH_WAIT: dict[int, bool] = {}        # uid -> waiting for keyword text?
 PROD_SEARCH_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
 PROD_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
+
+# --- Manual PRODUCT search preview session (per admin user) ---
+# Stores last fetched results for a keyword so you can review what was found BEFORE adding to queue.
+MANUAL_SEARCH_SESS: dict[int, dict] = {}  # uid -> {q, page, per_page, results:[{row,ok,reason}], idx}
+MANUAL_SEARCH_MSG: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id) last preview message
+
+
+def _ms_clear(uid: int):
+    """Clear manual search session and delete last preview message if exists."""
+    try:
+        ctx = MANUAL_SEARCH_MSG.pop(uid, None)
+        if ctx:
+            _safe_delete(ctx[0], ctx[1])
+    except Exception:
+        pass
+    MANUAL_SEARCH_SESS.pop(uid, None)
+
+def _ms_active_filters_text() -> str:
+    parts = []
+    if AE_PRICE_BUCKETS_RAW:
+        parts.append(f"💸 מחיר: {AE_PRICE_BUCKETS_RAW}")
+    if MIN_ORDERS:
+        parts.append(f"📦 מינ' הזמנות: {MIN_ORDERS}")
+    if MIN_RATING:
+        try:
+            parts.append(f"⭐ מינ' דירוג: {float(MIN_RATING):g}%")
+        except Exception:
+            parts.append(f"⭐ מינ' דירוג: {MIN_RATING}%")
+    if FREE_SHIP_ONLY:
+        parts.append(f"🚚 משלוח חינם (>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g})")
+    cats = get_selected_category_ids()
+    if cats:
+        parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
+    return " | ".join(parts) if parts else "ללא"
+
+def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
+    """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
+    # Price buckets
+    if AE_PRICE_BUCKETS:
+        sale_num = _extract_float(row.get("SalePrice") or "")
+        if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+            return False, "מחוץ לסינון מחיר"
+    # Orders
+    if MIN_ORDERS:
+        o = safe_int(row.get("Orders") or "0", 0)
+        if o < int(MIN_ORDERS):
+            return False, f"פחות מ-{MIN_ORDERS} הזמנות"
+    # Rating
+    if MIN_RATING:
+        r = _extract_float(row.get("Rating") or "")
+        if r is None or float(r) < float(MIN_RATING):
+            return False, f"דירוג נמוך מ-{MIN_RATING}%"
+    # Free ship only (our heuristic threshold)
+    if FREE_SHIP_ONLY:
+        sale_num = _extract_float(row.get("SalePrice") or "")
+        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+            return False, f"מתחת לסף משלוח חינם ₪{AE_FREE_SHIP_THRESHOLD_ILS:g}"
+    # Buy link
+    if not (row.get("BuyLink") or "").strip():
+        return False, "אין קישור רכישה"
+    return True, ""
+
+def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False) -> dict:
+    """Fetch one page from AliExpress Affiliate API and prepare preview session."""
+    # IMPORTANT: For manual search we default to ALL categories (category_id=None),
+    # so the keyword is the primary selector.
+    cat_id = None
+    if use_selected_categories:
+        cats = get_selected_category_ids()
+        cat_id = cats[0] if cats else None  # keep it simple: first selected
+    products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=q)
+
+    # Map and evaluate
+    results = []
+    raw_count = 0
+    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "free_ship": 0, "other": 0}
+    for p in (products or []):
+        raw_count += 1
+        row = _map_affiliate_product_to_row(p)
+        ok, reason = _ms_eval_row_filters(row)
+        if not ok:
+            # bucket reasons (best-effort)
+            if "קישור" in reason:
+                reasons["no_link"] += 1
+            elif "מחיר" in reason:
+                reasons["price"] += 1
+            elif "הזמנות" in reason:
+                reasons["orders"] += 1
+            elif "דירוג" in reason:
+                reasons["rating"] += 1
+            elif "משלוח" in reason:
+                reasons["free_ship"] += 1
+            else:
+                reasons["other"] += 1
+        results.append({"row": row, "ok": ok, "reason": reason})
+
+    sess = {
+        "q": q,
+        "page": page,
+        "per_page": per_page,
+        "idx": 0,
+        "results": results,
+        "raw_count": raw_count,
+        "resp_code": resp_code,
+        "resp_msg": resp_msg,
+        "reasons": reasons,
+        "use_selected_categories": bool(use_selected_categories),
+    }
+    MANUAL_SEARCH_SESS[uid] = sess
+    return sess
+
+def _ms_kb(uid: int) -> 'types.InlineKeyboardMarkup':
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    sess = MANUAL_SEARCH_SESS.get(uid) or {}
+    results = sess.get("results") or []
+    idx = int(sess.get("idx") or 0)
+    idx = max(0, min(idx, max(0, len(results)-1))) if results else 0
+    sess["idx"] = idx
+
+    # nav
+    kb.row(
+        types.InlineKeyboardButton("⬅️", callback_data="ms_prev"),
+        types.InlineKeyboardButton("➡️", callback_data="ms_next"),
+    )
+
+    kb.row(
+        types.InlineKeyboardButton("➕ הוסף לתור", callback_data="ms_add_one"),
+        types.InlineKeyboardButton("➕➕ הוסף את כל הדף", callback_data="ms_add_page"),
+    )
+
+    kb.row(
+        types.InlineKeyboardButton("📄 דף קודם", callback_data="ms_page_prev"),
+        types.InlineKeyboardButton("📄 דף הבא", callback_data="ms_page_next"),
+    )
+
+    kb.row(
+        types.InlineKeyboardButton("🧹 נקה סשן", callback_data="ms_close"),
+        types.InlineKeyboardButton("⬅️ תפריט", callback_data="ms_back"),
+    )
+    return kb
+
+def _ms_caption(uid: int) -> tuple[str, str | None]:
+    """Return (caption, image_url_or_none) for current result."""
+    sess = MANUAL_SEARCH_SESS.get(uid) or {}
+    q = str(sess.get("q") or "").strip()
+    page = int(sess.get("page") or 1)
+    results = sess.get("results") or []
+    if not results:
+        resp_code = sess.get("resp_code")
+        resp_msg = sess.get("resp_msg")
+        reasons = sess.get("reasons") or {}
+        raw_count = int(sess.get("raw_count") or 0)
+        flt = _ms_active_filters_text()
+        info = (
+            f"🔎 חיפוש ידני: <b>{html.escape(q)}</b>\n"
+            f"דף: {page}\n"
+            f"סינונים פעילים: {html.escape(flt)}\n\n"
+        )
+        if raw_count > 0:
+            info += (
+                f"מצאתי {raw_count} תוצאות גולמיות אבל אף אחת לא עברה את הסינונים.\n"
+                f"נפסלו: ללא קישור={reasons.get('no_link',0)} | מחיר={reasons.get('price',0)} | הזמנות={reasons.get('orders',0)} | דירוג={reasons.get('rating',0)} | משלוח={reasons.get('free_ship',0)}\n\n"
+            )
+        info += f"resp_code={resp_code} resp_msg={html.escape(str(resp_msg or ''))}"
+        return info, None
+
+    idx = int(sess.get("idx") or 0)
+    idx = max(0, min(idx, len(results)-1))
+    sess["idx"] = idx
+    item = results[idx]
+    row = item.get("row") or {}
+    ok = bool(item.get("ok"))
+    reason = str(item.get("reason") or "").strip()
+
+    title = str(row.get("Title") or "").strip()
+    if len(title) > 120:
+        title = title[:117] + "…"
+
+    sale = str(row.get("SalePrice") or "").strip()
+    orig = str(row.get("OriginalPrice") or "").strip()
+    rating = str(row.get("Rating") or "").strip()
+    orders = str(row.get("Orders") or "").strip()
+    link = str(row.get("BuyLink") or "").strip()
+    img = str(row.get("ImageURL") or "").strip() or None
+
+    status_line = "✅ עומד בסינונים" if ok else f"🚫 נפסל: {html.escape(reason)}"
+    flt = _ms_active_filters_text()
+
+    caption = (
+        f"🔎 חיפוש ידני: <b>{html.escape(q)}</b>\n"
+        f"תוצאה {idx+1}/{len(results)} | דף {page}\n"
+        f"סינונים פעילים: {html.escape(flt)}\n"
+        f"{status_line}\n\n"
+        f"<b>{html.escape(title)}</b>\n"
+        f"💰 {html.escape(sale)} (מקורי {html.escape(orig)})\n"
+        f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}\n"
+        f"🔗 {html.escape(link)}"
+    )
+    return caption, img
+
+def _ms_show(uid: int, chat_id: int, force_new: bool = True):
+    """Show current manual-search preview item."""
+    cap, img = _ms_caption(uid)
+    kb = _ms_kb(uid)
+
+    # delete previous preview message to keep the chat clean
+    try:
+        prev = MANUAL_SEARCH_MSG.get(uid)
+        if prev and prev[0] == chat_id:
+            _safe_delete(prev[0], prev[1])
+    except Exception:
+        pass
+
+    try:
+        if img:
+            msg = bot.send_photo(chat_id, img, caption=cap, parse_mode="HTML", reply_markup=kb)
+        else:
+            msg = bot.send_message(chat_id, cap, parse_mode="HTML", reply_markup=kb)
+        MANUAL_SEARCH_MSG[uid] = (chat_id, msg.message_id)
+    except Exception as e:
+        # fallback to text
+        msg = bot.send_message(chat_id, cap + f"\n\n(שגיאת תמונה: {e})", parse_mode="HTML", reply_markup=kb)
+        MANUAL_SEARCH_MSG[uid] = (chat_id, msg.message_id)
+
+def _ms_add_rows_to_queue(rows: list[dict]) -> tuple[int, int, int]:
+    """Add rows to pending queue with dedupe. Returns (added, dups, total_after)."""
+    if not rows:
+        with FILE_LOCK:
+            total = len(read_products(PENDING_CSV))
+        return 0, 0, total
+
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        existing = {_key_of_row(r) for r in pending}
+        added = 0
+        dups = 0
+        for r in rows:
+            k = _key_of_row(r)
+            if k in existing:
+                dups += 1
+                continue
+            existing.add(k)
+            pending.append(r)
+            added += 1
+        write_products(PENDING_CSV, pending)
+        total = len(pending)
+    return added, dups, total
+
+def _ms_start(uid: int, chat_id: int, q: str):
+    q = (q or "").strip()
+    if not q:
+        bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש.")
+        return
+    # reset session and fetch first page
+    _ms_clear(uid)
+    bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} (שולח ל-AliExpress בדיוק כפי שהזנת)")
+    _ms_fetch_page(uid, q=q, page=1, per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10), use_selected_categories=False)
+    _ms_show(uid, chat_id)
 
 # Keywords used to shrink the category list in "top" mode (Hebrew+English)
 CATEGORY_TOP_KEYWORDS = [
@@ -2806,6 +3064,10 @@ def inline_menu():
 
     kb.add(
         types.InlineKeyboardButton("🔥 מלא מהאפילייט עכשיו", callback_data="refill_now"),
+        types.InlineKeyboardButton("🔥 אפילייט (כל הקטגוריות)", callback_data="refill_now_all"),
+    )
+
+    kb.add(
         types.InlineKeyboardButton("🔎 חיפוש ידני", callback_data="prod_search"),
         types.InlineKeyboardButton("₪ המרת $→₪ (לקובץ הבא)", callback_data="convert_next"),
         types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"),
@@ -2855,6 +3117,9 @@ def on_inline_click(c):
         if not q:
             bot.answer_callback_query(c.id, "אין מילת חיפוש פעילה.")
             return
+        bot.answer_callback_query(c.id)
+        _ms_start(uid=uid, chat_id=chat_id, q=q)
+        return
         bot.answer_callback_query(c.id, "מחפש…")
         # Run product search immediately and add to queue (no AI)
         bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}")
@@ -2887,6 +3152,87 @@ def on_inline_click(c):
         except Exception:
             # Fallback without ForceReply
             bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח)")
+        bot.answer_callback_query(c.id)
+        return
+
+
+    # --- Manual product search preview callbacks (ms_*) ---
+    if data.startswith("ms_"):
+        uid = c.from_user.id
+        sess = MANUAL_SEARCH_SESS.get(uid)
+        if not sess:
+            bot.answer_callback_query(c.id, "אין סשן חיפוש פעיל.", show_alert=True)
+            return
+
+        q = str(sess.get("q") or "").strip()
+        page = int(sess.get("page") or 1)
+        per_page = int(sess.get("per_page") or 10)
+
+        def _refresh():
+            _ms_show(uid, chat_id)
+
+        if data == "ms_back":
+            bot.answer_callback_query(c.id)
+            _ms_clear(uid)
+            bot.send_message(chat_id, "✅ תפריט ראשי", reply_markup=inline_menu())
+            return
+
+        if data == "ms_close":
+            bot.answer_callback_query(c.id, "נסגר.")
+            _ms_clear(uid)
+            return
+
+        if data == "ms_prev":
+            sess["idx"] = max(0, int(sess.get("idx") or 0) - 1)
+            bot.answer_callback_query(c.id)
+            _refresh()
+            return
+
+        if data == "ms_next":
+            results = sess.get("results") or []
+            sess["idx"] = min(max(0, len(results)-1), int(sess.get("idx") or 0) + 1) if results else 0
+            bot.answer_callback_query(c.id)
+            _refresh()
+            return
+
+        if data == "ms_page_next":
+            bot.answer_callback_query(c.id, "טוען דף הבא…")
+            _ms_fetch_page(uid, q=q, page=page + 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")))
+            _refresh()
+            return
+
+        if data == "ms_page_prev":
+            if page <= 1:
+                bot.answer_callback_query(c.id, "זה כבר הדף הראשון.")
+                return
+            bot.answer_callback_query(c.id, "טוען דף קודם…")
+            _ms_fetch_page(uid, q=q, page=page - 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")))
+            _refresh()
+            return
+
+        if data == "ms_add_one":
+            results = sess.get("results") or []
+            idx = int(sess.get("idx") or 0)
+            if not results:
+                bot.answer_callback_query(c.id, "אין תוצאות להוסיף.", show_alert=True)
+                return
+            idx = max(0, min(idx, len(results)-1))
+            item = results[idx]
+            if not item.get("ok"):
+                bot.answer_callback_query(c.id, f"לא נוסף: {item.get('reason')}", show_alert=True)
+                return
+            row = item.get("row") or {}
+            added, dups, total = _ms_add_rows_to_queue([row])
+            bot.answer_callback_query(c.id, f"נוסף: {added} | כפול: {dups} | בתור: {total}")
+            return
+
+        if data == "ms_add_page":
+            results = sess.get("results") or []
+            ok_rows = [it.get("row") for it in results if it.get("ok") and it.get("row")]
+            added, dups, total = _ms_add_rows_to_queue(ok_rows)
+            bot.answer_callback_query(c.id, f"נוספו: {added} | כפולים: {dups} | בתור: {total}", show_alert=True)
+            return
+
         bot.answer_callback_query(c.id)
         return
 
@@ -3245,12 +3591,24 @@ def on_inline_click(c):
         msg_txt = "🧹 workfile.csv אופס לריק (נשמרו רק כותרות). התור לא שונה." if ok else "שגיאה במחיקת workfile.csv"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id)
-
     elif data == "refill_now":
         max_needed = 80
         added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed)
         text = (
             "🔥 מילוי מהאפילייט הושלם.\n"
+            f"נוספו לתור: {added}\n"
+            f"כפולים: {dup}\n"
+            f"סה\"כ בתור: {total_after}\n"
+            f"דף אחרון שנבדק: {last_page}\n"
+            f"שגיאה/מידע: {last_error}"
+        )
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "refill_now_all":
+        max_needed = 80
+        added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed, ignore_selected_categories=True)
+        text = (
+            "🔥 מילוי מהאפילייט (כל הקטגוריות) הושלם.\n"
             f"נוספו לתור: {added}\n"
             f"כפולים: {dup}\n"
             f"סה\"כ בתור: {total_after}\n"
@@ -3396,47 +3754,9 @@ def handle_manual_product_search_text(m):
         bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש. נסה שוב דרך 🔎 חיפוש ידני.")
         return
 
-    # Immediate feedback
-    try:
-        status = bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} ...")
-    except Exception:
-        status = None
-
-    try:
-        max_needed = int(os.environ.get("AE_MANUAL_SEARCH_MAX", "80") or 80)
-        added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed, keywords=q)
-
-        note = ""
-        if not added:
-            note = (
-                "\n\nטיפים אם אין תוצאות:\n"
-                "• נסה מילה באנגלית (AliExpress מחזיר טוב יותר באנגלית)\n"
-                "• בדוק סינונים (מחיר/דירוג/הזמנות/משלוח חינם)\n"
-                "• נסה מילה כללית יותר"
-            )
-
-        text = (
-            "🔎 חיפוש ידני הושלם\n"
-            f"מילת חיפוש: {q}\n"
-            f"נוספו לתור: {added}\n"
-            f"כפולים שנדחו: {dup}\n"
-            f"סה\"כ בתור: {total_after}\n"
-            f"דף אחרון שנבדק: {last_page}\n"
-            f"שגיאה/מידע: {last_error or 'אין'}"
-            f"{note}"
-        )
-
-        if status:
-            safe_edit_message(bot, chat_id=chat_id, message=status, new_text=text, reply_markup=inline_menu(), cb_id=None)
-        else:
-            bot.send_message(chat_id, text, reply_markup=inline_menu())
-    except Exception as e:
-        err = f"❌ שגיאה בחיפוש: {type(e).__name__}: {e}"
-        log_warn(err)
-        if status:
-            safe_edit_message(bot, chat_id=chat_id, message=status, new_text=err, reply_markup=inline_menu(), cb_id=None)
-        else:
-            bot.send_message(chat_id, err, reply_markup=inline_menu())
+    # Start preview session (show found products before adding to queue)
+    _ms_start(uid=uid, chat_id=chat_id, q=q)
+    return
 
 
 # ========= UPLOAD CSV =========
