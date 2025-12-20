@@ -9,6 +9,7 @@ Changes vs previous:
 - Better refill diagnostics when 0 products returned
 """
 
+import html
 import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
@@ -71,6 +72,10 @@ def _get_state_str(key: str, default: str = "") -> str:
 def _set_state_str(key: str, value: str):
     BOT_STATE[key] = (value or "").strip()
     _save_state(BOT_STATE)
+
+
+def _set_state_bool(key: str, value: bool):
+    _set_state_str(key, "1" if value else "0")
 
 
 def _get_state_int(key: str, default: int = 0) -> int:
@@ -340,6 +345,22 @@ GPT_OVERWRITE = (os.environ.get("GPT_OVERWRITE", "1") or "1").strip().lower() in
 # מתי להריץ AI
 GPT_ON_REFILL = (os.environ.get("GPT_ON_REFILL", "1") or "1").strip().lower() in ("1","true","yes","on")
 GPT_ON_UPLOAD = (os.environ.get("GPT_ON_UPLOAD", "1") or "1").strip().lower() in ("1","true","yes","on")
+
+GPT_ON_SEND_FALLBACK = (os.environ.get("GPT_ON_SEND_FALLBACK", "0") or "0").strip().lower() in ("1","true","yes","on")
+
+# ========= AI APPROVAL WORKFLOW =========
+# Default behavior requested: do NOT send any products to OpenAI automatically on startup/refill/upload.
+# Admin must explicitly approve items and trigger AI.
+AI_AUTO_DEFAULT = (os.environ.get("AI_AUTO_MODE", os.environ.get("AI_AUTO_DEFAULT", "0")) or "0").strip().lower() in ("1","true","yes","on")
+AI_AUTO_MODE = _get_state_bool("ai_auto_mode", AI_AUTO_DEFAULT)
+
+def ai_auto_mode() -> bool:
+    return bool(AI_AUTO_MODE)
+
+def set_ai_auto_mode(flag: bool):
+    global AI_AUTO_MODE
+    AI_AUTO_MODE = bool(flag)
+    _set_state_bool("ai_auto_mode", AI_AUTO_MODE)
 
 # יציבות/ביצועים
 GPT_TIMEOUT_SECONDS = int(os.environ.get("GPT_TIMEOUT_SECONDS", "45") or "45")
@@ -841,8 +862,18 @@ def normalize_row_keys(row):
     out["Title"] = out.get("Title", "") or out.get("Product Desc", "") or out.get("product_title","") or ""
     out["Strengths"] = out.get("Strengths", "") or ""
 
-    return out
+    # AI workflow state: raw / approved / rejected / done
+    st = str(out.get("AIState", "") or out.get("AiState", "") or out.get("ai_state", "") or "").strip().lower()
+    if st not in ("raw", "approved", "rejected", "done"):
+        st = ""
+    if not st:
+        if str(out.get("Opening", "")).strip() and str(out.get("Title", "")).strip() and str(out.get("Strengths", "")).strip():
+            st = "done"
+        else:
+            st = "raw"
+    out["AIState"] = st
 
+    return out
 
 # =================== AI helpers ===================
 
@@ -1014,7 +1045,7 @@ def read_products(path):
 def write_products(path, rows):
     base_headers = [
         "ItemId","ImageURL","Title","OriginalPrice","SalePrice","Discount",
-        "Rating","Orders","BuyLink","CouponCode","Opening","Video Url","Strengths"
+        "Rating","Orders","BuyLink","CouponCode","Opening","Video Url","Strengths","AIState"
     ]
     if not rows:
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1547,6 +1578,7 @@ def cmd_ai(msg):
         f"OPENAI_MODEL_EFFECTIVE={OPENAI_MODEL_EFFECTIVE}\n"
         f"OPENAI_API_KEY={'OK' if key_ok else 'MISSING'}\n"
         f"GPT_ON_REFILL={GPT_ON_REFILL} | GPT_ON_UPLOAD={GPT_ON_UPLOAD} | GPT_ON_SEND_FALLBACK={GPT_ON_SEND_FALLBACK}\n"
+
         f"GPT_BATCH_SIZE={GPT_BATCH_SIZE} | GPT_TIMEOUT_SECONDS={GPT_TIMEOUT_SECONDS} | GPT_MAX_RETRIES={GPT_MAX_RETRIES}"
     )
 
@@ -1587,7 +1619,7 @@ def merge_from_data_into_pending():
     new_candidates = [r for r in data_rows if _key_of_row(r) not in existing_keys]
 
     # AI enrichment (optional) — run only on new candidates
-    if GPT_ON_UPLOAD and new_candidates:
+    if ai_auto_mode() and GPT_ON_UPLOAD and new_candidates:
         try:
             upd, err = ai_enrich_rows(new_candidates, reason="csv_upload")
             if err:
@@ -1887,6 +1919,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Opening": "",
         "Strengths": "",
         "Video Url": (p.get("product_video_url") or "").strip(),
+        "AIState": "raw",
     })
 
 
@@ -1983,7 +2016,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                             break
 
                     # AI enrichment (optional)
-                    if GPT_ON_REFILL and new_rows:
+                    if ai_auto_mode() and GPT_ON_REFILL and new_rows:
                         try:
                             upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
                             if err:
@@ -2070,7 +2103,7 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
                     new_rows.append(row)
 
                 # AI enrichment (optional)
-                if GPT_ON_REFILL and new_rows:
+                if ai_auto_mode() and GPT_ON_REFILL and new_rows:
                     try:
                         upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
                         if err:
@@ -2557,6 +2590,132 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
         return True
     return False
 
+# ========= AI REVIEW / APPROVAL UI =========
+AI_REVIEW_CTX: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id) of last review photo/message
+
+def _ai_candidates(pending_rows: list[dict]) -> list[int]:
+    # We review only items that are not already "done" or "rejected".
+    out = []
+    for i, r in enumerate(pending_rows):
+        st = str(r.get("AIState","") or "").strip().lower()
+        if st not in ("raw", "approved", "rejected", "done"):
+            st = "raw"
+            r["AIState"] = st
+        if st in ("raw", "approved"):
+            out.append(i)
+    return out
+
+def _ai_get_pos(uid: int) -> int:
+    return _get_state_int(f"ai_review_pos_{uid}", 0)
+
+def _ai_set_pos(uid: int, pos: int):
+    _set_state_str(f"ai_review_pos_{uid}", str(max(0, int(pos))))
+
+def _safe_delete(chat_id: int, message_id: int):
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+def _ai_caption_for_row(r: dict, pos: int, total: int) -> str:
+    item_id = str(r.get("ItemId","") or "").strip()
+    title_raw = str(r.get("OrigTitle","") or r.get("Title","") or "").strip()
+    st = str(r.get("AIState","") or "").strip().lower()
+    st_he = {"raw":"ממתין", "approved":"מאושר", "rejected":"לא", "done":"בוצע"}.get(st, st)
+    price = str(r.get("SalePrice","") or "").strip()
+    discount = str(r.get("Discount","") or "").strip()
+    rating = str(r.get("Rating","") or "").strip()
+    orders = str(r.get("Orders","") or "").strip()
+    lines = [
+        f"🖼️ אישור AI ({pos+1}/{max(1,total)})",
+        f"🧾 מספר: <b>{html.escape(item_id) if item_id else '—'}</b>",
+        f"🧠 סטטוס AI: <b>{html.escape(st_he)}</b>",
+    ]
+    if title_raw:
+        # Keep it short
+        t = title_raw
+        if len(t) > 160:
+            t = t[:157] + "..."
+        lines.append(f"📝 כותרת: {html.escape(t)}")
+    meta = []
+    if price:
+        meta.append(f"מחיר: {html.escape(price)}")
+    if discount:
+        meta.append(f"הנחה: {html.escape(discount)}")
+    if rating:
+        meta.append(f"דירוג: {html.escape(rating)}")
+    if orders:
+        meta.append(f"הזמנות: {html.escape(orders)}")
+    if meta:
+        lines.append(" • ".join(meta))
+    lines.append("")
+    lines.append("בחר מה לעשות:")
+    return "\n".join(lines)
+
+def _ai_review_kb(r: dict) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    st = str(r.get("AIState","") or "").strip().lower()
+    approve_label = "✅ לאישור" if st != "approved" else "↩️ בטל אישור"
+    kb.row(
+        types.InlineKeyboardButton(approve_label, callback_data="ai_rev_toggle"),
+        types.InlineKeyboardButton("⛔ לא לשליחה ל-AI", callback_data="ai_rev_reject"),
+        types.InlineKeyboardButton("🚀 הרץ AI (מאושרים)", callback_data="ai_run_approved"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("⬅️ הקודם", callback_data="ai_rev_prev"),
+        types.InlineKeyboardButton("הבא ➡️", callback_data="ai_rev_next"),
+        types.InlineKeyboardButton("✅ אישור 5", callback_data="ai_rev_approve5"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("⬅️ חזרה לתפריט", callback_data="ai_rev_back"),
+    )
+    return kb
+
+def _ai_review_show(chat_id: int, uid: int, prefer_delete: bool = True):
+    with FILE_LOCK:
+        pending_rows = read_products(PENDING_CSV)
+    # ensure AIState exists
+    for rr in pending_rows:
+        _ = normalize_row_keys(rr)
+
+    candidates = _ai_candidates(pending_rows)
+    if not candidates:
+        # cleanup previous review msg if any
+        ctx = AI_REVIEW_CTX.get(uid)
+        if ctx and prefer_delete:
+            _safe_delete(ctx[0], ctx[1])
+            AI_REVIEW_CTX.pop(uid, None)
+        bot.send_message(chat_id, "אין פריטים שממתינים לאישור AI כרגע ✅", reply_markup=inline_menu())
+        return
+
+    pos = _ai_get_pos(uid)
+    pos = max(0, min(pos, len(candidates)-1))
+    _ai_set_pos(uid, pos)
+    idx = candidates[pos]
+    r = pending_rows[idx]
+    caption = _ai_caption_for_row(r, pos, len(candidates))
+    kb = _ai_review_kb(r)
+
+    # delete previous review message (keeps chat clean)
+    if prefer_delete:
+        ctx = AI_REVIEW_CTX.get(uid)
+        if ctx and ctx[0] == chat_id:
+            _safe_delete(ctx[0], ctx[1])
+
+    img = str(r.get("ImageURL","") or "").strip()
+    try:
+        if img:
+            m = bot.send_photo(chat_id, photo=img, caption=caption, reply_markup=kb, parse_mode="HTML")
+        else:
+            m = bot.send_message(chat_id, caption, reply_markup=kb, parse_mode="HTML")
+        AI_REVIEW_CTX[uid] = (chat_id, m.message_id)
+    except Exception as e:
+        # If URL photo failed, fall back to text
+        log_warn(f"[AI-REVIEW] send photo failed: {e}")
+        m = bot.send_message(chat_id, caption, reply_markup=kb, parse_mode="HTML")
+        AI_REVIEW_CTX[uid] = (chat_id, m.message_id)
+
+
 def inline_menu():
     kb = types.InlineKeyboardMarkup(row_width=3)
 
@@ -2569,6 +2728,16 @@ def inline_menu():
     kb.add(
         types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
     )
+
+    # AI approval / review controls
+    ai_auto_txt = "פעיל" if ai_auto_mode() else "כבוי"
+    kb.add(
+        types.InlineKeyboardButton(f"🧠 AI אוטומטי: {ai_auto_txt}", callback_data="ai_auto_toggle"),
+        types.InlineKeyboardButton("🖼️ אישור AI (תצוגה)", callback_data="ai_review"),
+        types.InlineKeyboardButton("🚀 הרץ AI (מאושרים)", callback_data="ai_run_approved"),
+    )
+
+
     # Currency / conversion controls (affiliate prices)
     conv_state = "פעיל" if (AE_PRICE_INPUT_CURRENCY == "USD" and AE_PRICE_CONVERT_USD_TO_ILS) else "כבוי"
     kb.add(
@@ -2630,6 +2799,140 @@ def on_inline_click(c):
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
+        return
+
+
+    # --- AI approval workflow ---
+    if data == "ai_auto_toggle":
+        set_ai_auto_mode(not ai_auto_mode())
+        bot.answer_callback_query(c.id, "עודכן.")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"🧠 מצב AI אוטומטי כעת: {'פעיל' if ai_auto_mode() else 'כבוי'}",
+                          reply_markup=inline_menu(), cb_id=None)
+        return
+
+    if data == "ai_review":
+        bot.answer_callback_query(c.id)
+        _ai_review_show(chat_id=chat_id, uid=c.from_user.id)
+        return
+
+    if data == "ai_rev_back":
+        bot.answer_callback_query(c.id)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="✅ תפריט ראשי", reply_markup=inline_menu(), cb_id=None)
+        return
+
+    if data in ("ai_rev_next", "ai_rev_prev", "ai_rev_toggle", "ai_rev_reject", "ai_rev_approve5"):
+        uid = c.from_user.id
+        with FILE_LOCK:
+            pending_rows = read_products(PENDING_CSV)
+
+        # ensure AIState exists
+        for rr in pending_rows:
+            _ = normalize_row_keys(rr)
+
+        candidates = _ai_candidates(pending_rows)
+        if not candidates:
+            bot.answer_callback_query(c.id, "אין פריטים לאישור.")
+            _ai_review_show(chat_id=chat_id, uid=uid)
+            return
+
+        pos = _ai_get_pos(uid)
+        pos = max(0, min(pos, len(candidates)-1))
+
+        def write_back():
+            with FILE_LOCK:
+                write_products(PENDING_CSV, pending_rows)
+
+        if data == "ai_rev_next":
+            pos = min(pos + 1, len(candidates)-1)
+            _ai_set_pos(uid, pos)
+            bot.answer_callback_query(c.id)
+            _ai_review_show(chat_id=chat_id, uid=uid)
+            return
+
+        if data == "ai_rev_prev":
+            pos = max(pos - 1, 0)
+            _ai_set_pos(uid, pos)
+            bot.answer_callback_query(c.id)
+            _ai_review_show(chat_id=chat_id, uid=uid)
+            return
+
+        if data == "ai_rev_toggle":
+            idx = candidates[pos]
+            r = pending_rows[idx]
+            st = str(r.get("AIState","") or "").strip().lower()
+            if st == "approved":
+                r["AIState"] = "raw"
+                bot.answer_callback_query(c.id, "בוטל אישור.")
+            else:
+                r["AIState"] = "approved"
+                bot.answer_callback_query(c.id, "אושר לשליחה ל-AI.")
+            write_back()
+            _ai_review_show(chat_id=chat_id, uid=uid)
+            return
+
+        if data == "ai_rev_reject":
+            idx = candidates[pos]
+            r = pending_rows[idx]
+            r["AIState"] = "rejected"
+            write_back()
+            bot.answer_callback_query(c.id, "סומן: לא לשליחה ל-AI.")
+            # stay at same pos, but list might shrink; clamp
+            _ai_set_pos(uid, min(pos, max(0, len(_ai_candidates(pending_rows))-1)))
+            _ai_review_show(chat_id=chat_id, uid=uid)
+            return
+
+        if data == "ai_rev_approve5":
+            # approve current + next 4
+            changed = 0
+            for j in range(pos, min(pos + 5, len(candidates))):
+                idx = candidates[j]
+                r = pending_rows[idx]
+                if str(r.get("AIState","") or "").strip().lower() != "approved":
+                    r["AIState"] = "approved"
+                    changed += 1
+            write_back()
+            bot.answer_callback_query(c.id, f"אושר: {changed} פריטים.")
+            # move to next after the block
+            new_pos = min(pos + 5, len(candidates)-1)
+            _ai_set_pos(uid, new_pos)
+            _ai_review_show(chat_id=chat_id, uid=uid)
+            return
+
+    if data == "ai_run_approved":
+        uid = c.from_user.id
+        bot.answer_callback_query(c.id)
+        if not _ai_enabled():
+            bot.send_message(chat_id, "❌ AI כבוי או OPENAI_API_KEY חסר. בדוק GPT_ENABLED ו-OPENAI_API_KEY.")
+            return
+        with FILE_LOCK:
+            pending_rows = read_products(PENDING_CSV)
+        for rr in pending_rows:
+            _ = normalize_row_keys(rr)
+        approved = [r for r in pending_rows if str(r.get("AIState","") or "").strip().lower() == "approved"]
+        if not approved:
+            bot.send_message(chat_id, "אין פריטים מאושרים לשליחה ל-AI כרגע ✅")
+            return
+        bot.send_message(chat_id, f"⏳ מריץ AI על {len(approved)} פריטים מאושרים…")
+        try:
+            upd, err = ai_enrich_rows(approved, reason="manual_approval")
+            # mark done where filled
+            done_count = 0
+            for r in approved:
+                if str(r.get("Opening","")).strip() and str(r.get("Title","")).strip() and str(r.get("Strengths","")).strip():
+                    r["AIState"] = "done"
+                    done_count += 1
+            with FILE_LOCK:
+                write_products(PENDING_CSV, pending_rows)
+            if err:
+                bot.send_message(chat_id, f"⚠️ AI הסתיים עם אזהרה: {err}\n✅ עודכנו: {upd}\n🟢 סומנו כ'בוצע': {done_count}")
+            else:
+                bot.send_message(chat_id, f"✅ AI הסתיים.\nעודכנו: {upd}\n🟢 סומנו כ'בוצע': {done_count}")
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ שגיאה בהרצת AI: {e}")
+        # refresh review view if user is in it
+        _ai_review_show(chat_id=chat_id, uid=uid)
         return
 
     if data == "publish_now":
@@ -2905,7 +3208,7 @@ def handle_forward_for_target(msg):
     )
 
 # ========= CATEGORY SEARCH (text input) =========
-@bot.message_handler(func=lambda m: bool(CAT_SEARCH_WAIT.get(m.from_user.id, False)) and is_admin(m.from_user.id), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(CAT_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
 def handle_category_search_text(m):
     uid = m.from_user.id
     chat_id = m.chat.id
