@@ -241,6 +241,12 @@ CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
+# Runtime control flags
+POSTING_DISABLED_FLAG_FILE = os.path.join(BASE_DIR, "posting_disabled.flag")  # אם קיים => לא מפרסם
+REFILL_PAUSED_FLAG_FILE    = os.path.join(BASE_DIR, "refill_paused.flag")     # אם קיים => לא ממלא אוטומטית
+POSTED_KEYS_FILE           = os.path.join(BASE_DIR, "posted_keys.jsonl")      # היסטוריית דה-דופ (מוצרים שכבר פורסמו)
+
+
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
 
 PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
@@ -249,6 +255,24 @@ AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lowe
 AE_PRICE_INT_IS_CENTS = (os.environ.get("AE_PRICE_INT_IS_CENTS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 # When price is a range like "1.23-4.56": choose "min" or "max" or "mid"
 AE_PRICE_PICK_MODE = (os.environ.get("AE_PRICE_PICK_MODE", "min") or "min").strip().lower()
+
+# Price input currency from affiliate API:
+# - "USD": convert using USD_TO_ILS_RATE
+# - "ILS"/"NIS": treat numbers as already in ILS (no conversion)
+# - "AUTO": convert only if a USD marker is detected; otherwise keep as ILS if ₪/ILS/NIS present, else assume USD
+AE_PRICE_INPUT_CURRENCY = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
+
+# Dedup configuration (affects merge/refill and optional skip-on-send)
+AE_DEDUP_KEY_MODE = (os.environ.get("AE_DEDUP_KEY_MODE", "item_id") or "item_id").strip().lower()  # item_id | link | strict
+AE_DEDUP_SCOPE = (os.environ.get("AE_DEDUP_SCOPE", "all") or "all").strip().lower()  # pending | posted | all
+AE_DEDUP_MAX_DAYS = int((os.environ.get("AE_DEDUP_MAX_DAYS", "30") or "30").strip() or 30)
+AE_DEDUP_MAX_ITEMS = int((os.environ.get("AE_DEDUP_MAX_ITEMS", "5000") or "5000").strip() or 5000)
+AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND = (os.environ.get("AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND", "1").strip().lower() in ("1","true","yes","on"))
+
+# Runtime toggles
+AE_REFILL_PAUSE_BUTTON_ENABLED = (os.environ.get("AE_REFILL_PAUSE_BUTTON_ENABLED", "1").strip().lower() in ("1","true","yes","on"))
+POSTING_TOGGLE_BUTTON_ENABLED = (os.environ.get("POSTING_TOGGLE_BUTTON_ENABLED", "1").strip().lower() in ("1","true","yes","on"))
+
 
 AE_KEYWORDS = (os.environ.get("AE_KEYWORDS", "") or "").strip()
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
@@ -637,44 +661,55 @@ def _format_money(num: float, decimals: int) -> str:
         return str(int(round(num)))
     return f"{num:.{decimals}f}"
 
-def usd_to_ils(price_text: str, rate: float) -> str:
-    """Convert a USD price string to ILS string, preserving decimals.
 
-    Notes:
-    - If the raw string already looks like ILS (₪/ILS/NIS), we DO NOT convert again.
-    - If the API returns cents as an integer string (e.g. '1290' meaning $12.90), we normalize.
+def usd_to_ils(price_text: str, rate: float) -> str:
+    """Normalize a price string to ILS (₪).
+
+    Behavior is controlled by AE_PRICE_INPUT_CURRENCY:
+      - ILS/NIS: treat numeric values as already ILS (no conversion)
+      - USD: convert numeric values from USD to ILS using `rate`
+      - AUTO: if ₪/ILS/NIS marker exists => no conversion; otherwise assume USD
+
+    Also supports "cents as int" when AE_PRICE_INT_IS_CENTS=1.
     """
     if price_text is None:
         return ""
-    raw_original = str(price_text)
-    raw_clean = clean_price_text(raw_original)
-    num = _extract_float(raw_clean)
-    if num is None:
+    raw_original = str(price_text).strip()
+    raw = raw_original
+
+    # Detect ILS markers
+    raw_upper = raw.upper()
+    has_ils_marker = ("₪" in raw) or ("ILS" in raw_upper) or ("NIS" in raw_upper)
+
+    # Extract numeric part (keep digits/dot/comma)
+    m = re.search(r"([0-9]+(?:[\.,][0-9]+)?)", raw)
+    if not m:
         return ""
 
-    # Heuristic: cents-as-integer (common in some affiliate fields)
-    if AE_PRICE_INT_IS_CENTS and raw_clean and raw_clean.isdigit():
-        try:
-            ival = int(raw_clean)
-            if ival >= 1000 and ival <= 10000000:
-                num = ival / 100.0
-        except Exception:
-            pass
-
-    # If already ILS -> don't convert again
-    up = raw_original.upper()
-    if ("₪" in raw_original) or ("ILS" in up) or ("NIS" in up):
-        ils = float(num)
-    else:
-        ils = float(num) * float(rate)
-
-    # Apply decimals
-    dec = PRICE_DECIMALS
+    num_str = m.group(1).replace(",", ".")
     try:
-        dec = int(dec)
+        val = float(num_str)
     except Exception:
-        dec = 2
-    return _format_money(round(ils, dec), dec)
+        return ""
+
+    # Normalize cents (e.g. 1290 -> 12.90)
+    if AE_PRICE_INT_IS_CENTS and val >= 100:  # heuristic to avoid touching small values
+        val = val / 100.0
+
+    cur = (AE_PRICE_INPUT_CURRENCY or "USD").strip().upper()
+    if cur in ("ILS", "NIS"):
+        ils = val
+    else:
+        # AUTO or USD: if it already looks like ILS, don't convert; else convert as USD
+        if has_ils_marker:
+            ils = val
+        else:
+            ils = val * float(rate)
+
+    # Format
+    fmt = f"{{:.{PRICE_DECIMALS}f}}" if PRICE_DECIMALS is not None else "{:.2f}"
+    out = fmt.format(ils).rstrip("0").rstrip(".")
+    return out
 
 
 def _parse_price_buckets(raw: str):
@@ -1327,17 +1362,47 @@ def post_to_channel(product) -> bool:
 
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
+
 def send_next_locked(source: str = "loop") -> bool:
     with FILE_LOCK:
+        if not is_posting_enabled():
+            log_info(f"{source}: posting disabled (skip send)")
+            return False
+
         pending = read_products(PENDING_CSV)
         if not pending:
             log_info(f"{source}: no pending")
             return False
 
+        # Optional: skip already-posted items (dedup history)
+        if AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND:
+            skipped = 0
+            while pending:
+                k0 = _key_of_row(pending[0])
+                if _is_already_posted(k0):
+                    skipped += 1
+                    it0 = pending[0]
+                    log_info(f"{source}: skip already-posted key={k0} ItemId={(it0.get('ItemId') or '').strip()}")
+                    pending = pending[1:]
+                    try:
+                        write_products(PENDING_CSV, pending)
+                    except Exception as e:
+                        log_info(f"{source}: write FAILED while skipping: {e}")
+                        return False
+                else:
+                    break
+            if skipped and not pending:
+                log_info(f"{source}: skipped {skipped} already-posted items; queue empty")
+                return False
+            if skipped:
+                log_info(f"{source}: skipped {skipped} already-posted items; continue send")
+
         item = pending[0]
         item_id = (item.get("ItemId") or "").strip()
         title = (item.get("Title") or "").strip()[:120]
-        log_info(f"{source}: sending ItemId={item_id} | Title={title}")
+        k = _key_of_row(item)
+
+        log_info(f"{source}: sending key={k} | ItemId={item_id} | Title={title}")
 
         ok = post_to_channel(item)
         if not ok:
@@ -1345,6 +1410,7 @@ def send_next_locked(source: str = "loop") -> bool:
             log_info(f"{source}: send FAILED, queue NOT advanced (ItemId={item_id})")
             return False
 
+        # advance queue
         try:
             write_products(PENDING_CSV, pending[1:])
         except Exception as e:
@@ -1353,14 +1419,18 @@ def send_next_locked(source: str = "loop") -> bool:
             try:
                 write_products(PENDING_CSV, pending[1:])
             except Exception as e2:
-                log_exc(f"{source}: write FAILED permanently: {e2}")
+                log_info(f"{source}: write FAILED twice, queue may be inconsistent: {e2}")
                 return False
+
+        # mark posted (persistent dedup)
+        _mark_posted(k)
 
         log_info(f"{source}: sent & advanced queue (ItemId={item_id})")
         return True
 
 
 # ========= DELAY =========
+
 AUTO_SCHEDULE = [
     (dtime(6, 0),  dtime(9, 0),  1200),
     (dtime(9, 0),  dtime(15, 0), 1500),
@@ -1378,6 +1448,35 @@ def read_auto_flag():
 def write_auto_flag(value):
     with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
         f.write(value)
+
+
+def is_posting_enabled() -> bool:
+    return not os.path.exists(POSTING_DISABLED_FLAG_FILE)
+
+def set_posting_enabled(enabled: bool) -> None:
+    try:
+        if enabled:
+            if os.path.exists(POSTING_DISABLED_FLAG_FILE):
+                os.remove(POSTING_DISABLED_FLAG_FILE)
+        else:
+            with open(POSTING_DISABLED_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write("off")
+    except Exception as e:
+        log_info(f"[POSTING] failed to toggle: {e}")
+
+def is_refill_paused() -> bool:
+    return os.path.exists(REFILL_PAUSED_FLAG_FILE)
+
+def set_refill_paused(paused: bool) -> None:
+    try:
+        if paused:
+            with open(REFILL_PAUSED_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write("paused")
+        else:
+            if os.path.exists(REFILL_PAUSED_FLAG_FILE):
+                os.remove(REFILL_PAUSED_FLAG_FILE)
+    except Exception as e:
+        log_info(f"[REFILL] failed to toggle pause: {e}")
 
 def get_auto_delay():
     now = _now_il().time()
@@ -1430,6 +1529,11 @@ def _is_admin(obj) -> bool:
 
     return (uid is not None) and (uid in ADMIN_USER_IDS)
 
+# Backwards-compatible alias: some handlers were written with is_admin(...)
+# and expect it to exist.
+def is_admin(obj) -> bool:
+    return _is_admin(obj)
+
 
 
 @bot.message_handler(commands=["myid", "whoami"])
@@ -1477,12 +1581,127 @@ def cmd_ai_test(msg):
     except Exception as e:
         bot.reply_to(msg, f"❌ בדיקת AI נכשלה: {e}")
 
-# ========= MERGE =========
-def _key_of_row(r: dict):
+
+# ========= MERGE / DEDUP =========
+def _normalize_buy_link(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+        sp = urlsplit(url.strip())
+        netloc = (sp.netloc or "").lower().lstrip("www.")
+        path = (sp.path or "").rstrip("/")
+        return f"{netloc}{path}".lower()
+    except Exception:
+        return (url or "").strip().lower()
+
+def _extract_product_id_from_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        # common patterns: .../item/1005001234567890.html or productId=...
+        m = re.search(r"(?:item/|item/)(\d{6,})", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"(?:product(?:id)?|itemid)=(\d{6,})", url, flags=re.I)
+        if m:
+            return m.group(1)
+        # fallback: any long digit run
+        m = re.search(r"(\d{8,})", url)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+def _key_of_row(r: dict) -> str:
+    """Stable dedup key. Default: ItemId only (prevents same product from reappearing even if BuyLink changes)."""
     item_id = (r.get("ItemId") or "").strip()
     title   = (r.get("Title") or "").strip()
     buy     = (r.get("BuyLink") or "").strip()
-    return (item_id if item_id else None, title if not item_id else None, buy)
+    url_id  = _extract_product_id_from_url(buy)
+    normurl = _normalize_buy_link(buy)
+
+    mode = (AE_DEDUP_KEY_MODE or "item_id").strip().lower()
+    if mode in ("item", "item_id", "id"):
+        if item_id:
+            return f"id:{item_id}"
+        if url_id:
+            return f"id:{url_id}"
+        if normurl:
+            return f"url:{normurl}"
+        return f"title:{title.lower()}"
+    if mode in ("link", "url", "buy_link"):
+        if normurl:
+            return f"url:{normurl}"
+        if item_id:
+            return f"id:{item_id}"
+        if url_id:
+            return f"id:{url_id}"
+        return f"title:{title.lower()}"
+    # strict
+    return f"id:{item_id or url_id}|url:{normurl}|title:{title.lower()}"
+
+def _load_posted_keys() -> dict:
+    """Load {key_str: ts} from POSTED_KEYS_FILE."""
+    d: dict[str, float] = {}
+    if not os.path.exists(POSTED_KEYS_FILE):
+        return d
+    try:
+        with open(POSTED_KEYS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = (line or "").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    k = (obj.get("k") or "").strip()
+                    ts = float(obj.get("ts") or 0)
+                    if k:
+                        d[k] = ts
+                except Exception:
+                    continue
+    except Exception:
+        return d
+    return d
+
+def _purge_posted_keys(d: dict) -> dict:
+    """Apply AE_DEDUP_MAX_DAYS / AE_DEDUP_MAX_ITEMS."""
+    if not d:
+        return d
+    now = time.time()
+    # days
+    if AE_DEDUP_MAX_DAYS and AE_DEDUP_MAX_DAYS > 0:
+        cutoff = now - (AE_DEDUP_MAX_DAYS * 86400)
+        d = {k: ts for k, ts in d.items() if ts >= cutoff}
+    # max items
+    if AE_DEDUP_MAX_ITEMS and AE_DEDUP_MAX_ITEMS > 0 and len(d) > AE_DEDUP_MAX_ITEMS:
+        # keep newest
+        items = sorted(d.items(), key=lambda kv: kv[1], reverse=True)[:AE_DEDUP_MAX_ITEMS]
+        d = {k: ts for k, ts in items}
+    return d
+
+def _save_posted_keys(d: dict) -> None:
+    d = _purge_posted_keys(d)
+    try:
+        with open(POSTED_KEYS_FILE, "w", encoding="utf-8") as f:
+            # write newest first (not required, but readable)
+            for k, ts in sorted(d.items(), key=lambda kv: kv[1], reverse=True):
+                f.write(json.dumps({"k": k, "ts": ts}, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log_info(f"[DEDUP] failed saving posted keys: {e}")
+
+POSTED_KEYS = _purge_posted_keys(_load_posted_keys())
+
+def _posted_keys_set() -> set:
+    return set(POSTED_KEYS.keys())
+
+def _is_already_posted(key: str) -> bool:
+    return bool(key) and key in POSTED_KEYS
+
+def _mark_posted(key: str) -> None:
+    if not key:
+        return
+    POSTED_KEYS[key] = time.time()
+    _save_posted_keys(POSTED_KEYS)
 
 def merge_from_data_into_pending():
     """Merge rows from DATA_CSV into PENDING_CSV.
@@ -1493,6 +1712,8 @@ def merge_from_data_into_pending():
         data_rows = read_products(DATA_CSV)
         pending_rows = read_products(PENDING_CSV)
         existing_keys = {_key_of_row(r) for r in pending_rows}
+        if AE_DEDUP_SCOPE in ("all", "posted", "pending+posted"):
+            existing_keys |= _posted_keys_set()
 
     # Only new candidates (so we don't waste AI calls)
     new_candidates = [r for r in data_rows if _key_of_row(r) not in existing_keys]
@@ -1812,6 +2033,8 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
         existing_keys = {_key_of_row(r) for r in pending_rows}
+        if AE_DEDUP_SCOPE in ("all", "posted", "pending+posted"):
+            existing_keys |= _posted_keys_set()
 
     added = 0
     dup = 0
@@ -2295,7 +2518,6 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
 def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
-        uid = getattr(getattr(c, 'from_user', None), 'id', None) or 0
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -2352,13 +2574,13 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
         if data.startswith("fc_menu_"):
             page = int(data.split("_")[-1])
             CAT_VIEW_MODE[uid] = "top"
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid), cb_id=c.id)
+            safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
             return True
 
         if data.startswith("fc_all_"):
             page = int(data.split("_")[-1])
             CAT_VIEW_MODE[uid] = "all"
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid), cb_id=c.id)
+            safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
             return True
 
         if data.startswith("fc_s_"):
@@ -2370,9 +2592,9 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
                 kb = types.InlineKeyboardMarkup(row_width=1)
                 kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=c.id)
+                safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
             else:
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q), cb_id=c.id)
+                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
             return True
 
         if data == "fc_search":
@@ -2381,7 +2603,7 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
             kb = types.InlineKeyboardMarkup(row_width=1)
             kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=c.id)
+            safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
             return True
 
         # toggle category selection
@@ -2398,23 +2620,23 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             else:
                 mode = "top"
                 page = int(parts[3])
-
-            if cid in CATEGORY_IDS:
-                CATEGORY_IDS.remove(cid)
+            selected = set(get_selected_category_ids())
+            if cid in selected:
+                selected.remove(cid)
             else:
-                CATEGORY_IDS.add(cid)
-            save_user_state()
-
+                selected.add(cid)
+            # persist to bot state
+            set_category_ids(",".join(sorted(selected)))
             if mode == "all":
                 CAT_VIEW_MODE[uid] = "all"
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
             elif mode == "search":
                 CAT_VIEW_MODE[uid] = "search"
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q), cb_id=c.id)
+                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
             else:
                 CAT_VIEW_MODE[uid] = "top"
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
             return True
 
         if data == "fc_clear":
@@ -2422,12 +2644,12 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             save_user_state()
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"✅ נוקה! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=c.id)
+                safe_edit_message(c.message, f"✅ נוקה! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
             else:
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
             return True
 
         if data == "fc_random":
@@ -2439,24 +2661,24 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 save_user_state()
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=c.id)
+                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
             else:
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
             return True
 
         if data == "fc_sync":
             _ = get_categories(force=True)
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=c.id)
+                safe_edit_message(c.message, f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
             else:
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text= "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=c.id)
+                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
             return True
 
 
@@ -2468,60 +2690,54 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
         return True
     return False
 
+
 def inline_menu():
-    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb = types.InlineKeyboardMarkup(row_width=2)
 
     kb.add(
-        types.InlineKeyboardButton("📢 פרסם עכשיו", callback_data="publish_now"),
-        types.InlineKeyboardButton("📊 סטטוס שידור", callback_data="pending_status"),
-        types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
-    )
-
-    kb.add(
-        types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
-    )
-
-    kb.add(
-        types.InlineKeyboardButton("⏱️ דקה", callback_data="delay_60"),
-        types.InlineKeyboardButton("⏱️ 20ד", callback_data="delay_1200"),
-        types.InlineKeyboardButton("⏱️ 25ד", callback_data="delay_1500"),
-        types.InlineKeyboardButton("⏱️ 30ד", callback_data="delay_1800"),
-    )
-
-    kb.add(
-        types.InlineKeyboardButton("⚙️ מצב אוטומטי (קצב) החלפה", callback_data="toggle_auto_mode"),
-        types.InlineKeyboardButton("🕒 מצב שינה (החלפה)", callback_data="toggle_schedule"),
-        types.InlineKeyboardButton("📥 העלה CSV", callback_data="upload_source"),
-    )
-
-    kb.add(
-        types.InlineKeyboardButton("🔥 מלא מהאפילייט עכשיו", callback_data="refill_now"),
-        types.InlineKeyboardButton("₪ המרת $→₪ (לקובץ הבא)", callback_data="convert_next"),
-        types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"),
-    )
-
-    kb.add(
-        types.InlineKeyboardButton("🗑️ מחק פריטי התור מהקובץ", callback_data="delete_source_from_pending"),
-        types.InlineKeyboardButton("🧹 מחק את workfile.csv", callback_data="delete_source_file"),
-    )
-
-    kb.add(
-        types.InlineKeyboardButton("🎯 ציבורי (השתמש)", callback_data="target_public"),
-        types.InlineKeyboardButton("🔒 פרטי (השתמש)", callback_data="target_private"),
+        types.InlineKeyboardButton("🔄 רענן תפריט", callback_data="refresh_menu"),
+        types.InlineKeyboardButton("📦 ניהול תור", callback_data="queue_menu"),
     )
     kb.add(
-        types.InlineKeyboardButton("🆕 בחר ערוץ ציבורי", callback_data="choose_public"),
-        types.InlineKeyboardButton("🆕 בחר ערוץ פרטי", callback_data="choose_private"),
-        types.InlineKeyboardButton("❌ בטל בחירת יעד", callback_data="choose_cancel"),
+        types.InlineKeyboardButton("🧲 מלא מהאפילייט עכשיו", callback_data="refill_now"),
+        types.InlineKeyboardButton("🚀 פרסם עכשיו", callback_data="publish_now"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📊 סטטוס", callback_data="show_stats"),
+        types.InlineKeyboardButton("🎛️ פילטרים", callback_data="flt_menu"),
     )
 
-    kb.add(types.InlineKeyboardButton(
-        f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"
-    ))
+    # Toggles
+    if POSTING_TOGGLE_BUTTON_ENABLED or AE_REFILL_PAUSE_BUTTON_ENABLED:
+        toggle_btns = []
+        if POSTING_TOGGLE_BUTTON_ENABLED:
+            toggle_btns.append(
+                types.InlineKeyboardButton(
+                    ("🛑 עצור פרסום" if is_posting_enabled() else "✅ הפעל פרסום"),
+                    callback_data="toggle_posting",
+                )
+            )
+        if AE_REFILL_PAUSE_BUTTON_ENABLED:
+            toggle_btns.append(
+                types.InlineKeyboardButton(
+                    ("⏸️ עצור מילוי אוטומטי" if not is_refill_paused() else "▶️ הפעל מילוי אוטומטי"),
+                    callback_data="toggle_refill_pause",
+                )
+            )
+        if toggle_btns:
+            kb.add(*toggle_btns)
+
+    pub_state = "פעיל" if is_posting_enabled() else "כבוי"
+    refill_state = "פעיל" if not is_refill_paused() else "מושהה"
+    kb.add(
+        types.InlineKeyboardButton(
+            f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET} | פרסום: {pub_state} | מילוי: {refill_state}",
+            callback_data="noop_info",
+        )
+    )
     return kb
 
-# ========= INLINE CALLBACKS =========
-@bot.callback_query_handler(func=lambda c: True)
+
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS
 
@@ -2543,6 +2759,31 @@ def on_inline_click(c):
             return
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
+
+
+    elif data == "toggle_posting":
+        set_posting_enabled(not is_posting_enabled())
+        msg = "✅ פרסום הופעל" if is_posting_enabled() else "🛑 פרסום נעצר"
+        safe_edit_message(
+            bot,
+            chat_id=chat_id,
+            message=c.message,
+            new_text=msg,
+            reply_markup=inline_menu(),
+            cb_id=c.id,
+        )
+
+    elif data == "toggle_refill_pause":
+        set_refill_paused(not is_refill_paused())
+        msg = "▶️ מילוי אוטומטי הופעל" if not is_refill_paused() else "⏸️ מילוי אוטומטי הושהה"
+        safe_edit_message(
+            bot,
+            chat_id=chat_id,
+            message=c.message,
+            new_text=msg,
+            reply_markup=inline_menu(),
+            cb_id=c.id,
+        )
 
     elif data == "pending_status":
         with FILE_LOCK:
@@ -2780,8 +3021,7 @@ def handle_forward_for_target(msg):
     )
 
 # ========= CATEGORY SEARCH (text input) =========
-# Note: _is_admin expects a Message/Callback object (not a raw user_id).
-@bot.message_handler(func=lambda m: bool(CAT_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(CAT_SEARCH_WAIT.get(m.from_user.id, False)) and is_admin(m.from_user.id), content_types=["text"])
 def handle_category_search_text(m):
     uid = m.from_user.id
     chat_id = m.chat.id
@@ -3042,6 +3282,10 @@ def refill_daemon():
     print("[INFO] Refill daemon started", flush=True)
 
     while True:
+        if AE_REFILL_PAUSE_BUTTON_ENABLED and is_refill_paused():
+            time.sleep(min(30, AE_REFILL_INTERVAL_SECONDS))
+            continue
+
         try:
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
