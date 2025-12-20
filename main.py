@@ -10,17 +10,16 @@ Changes vs previous:
 """
 
 import os, sys
+try:
+    import fcntl  # type: ignore
+except Exception:
+    fcntl = None  # type: ignore
+
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
-
-# Optional (Linux) file-lock helper
-try:
-    import fcntl  # type: ignore
-except Exception:
-    fcntl = None
 
 import logging
 import hashlib
@@ -29,7 +28,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20fix2")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20uidfix")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -296,18 +295,7 @@ AE_SHIP_TO_COUNTRY = (os.environ.get("AE_SHIP_TO_COUNTRY", "IL") or "IL").strip(
 AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE", "HE") or "HE").strip().upper()
 
 # target_currency של API לא כולל ILS, לכן עובדים עם USD וממירים לש"ח.
-AE_TARGET_CURRENCY = (os.environ.get("AE_TARGET_CURRENCY", "USD") or "USD").strip().upper()
-AE_PRICE_INPUT_CURRENCY = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "") or "").strip().upper()  # "", AUTO, USD, ILS
-AE_DEDUP_KEY_MODE = (os.environ.get("AE_DEDUP_KEY_MODE", "item_id") or "item_id").strip().lower()
-AE_DEDUP_SCOPE = (os.environ.get("AE_DEDUP_SCOPE", "all") or "all").strip().lower()  # pending|posted|all
-AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND = (os.environ.get("AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND", "1") or "1").strip().lower() in ("1","true","yes","on")
-AE_DEDUP_MAX_DAYS = int(float(os.environ.get("AE_DEDUP_MAX_DAYS", "30") or "30"))
-AE_DEDUP_MAX_ITEMS = int(float(os.environ.get("AE_DEDUP_MAX_ITEMS", "5000") or "5000"))
-
-# Runtime kill-switch flags (persist on disk)
-PUBLISH_FLAG_FILE = os.path.join(LOG_DIR, "publish_enabled.flag")
-REFILL_FLAG_FILE  = os.path.join(LOG_DIR, "refill_enabled.flag")
-POSTED_KEYS_FILE  = os.path.join(LOG_DIR, "posted_keys.jsonl")
+AE_TARGET_CURRENCY = "USD"
 
 
 # =================== AI (OpenAI) — “לתת חיים למוצרים” ===================
@@ -538,8 +526,7 @@ def acquire_single_instance_lock(lock_path: str):
                 sys.exit(1)
             return f
         else:
-            if fcntl is None:
-                raise RuntimeError("fcntl unavailable")
+            import fcntl
             f = open(lock_path, "w")
             try:
                 fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -656,23 +643,15 @@ def _format_money(num: float, decimals: int) -> str:
     return f"{num:.{decimals}f}"
 
 def usd_to_ils(price_text: str, rate: float) -> str:
-    """Normalize/convert price to ILS.
+    """Convert a USD price string to ILS string, preserving decimals.
 
-    - If AE_PRICE_INPUT_CURRENCY=ILS: treat input as ILS (no conversion).
-    - If AE_PRICE_INPUT_CURRENCY=USD: treat input as USD and convert to ILS using rate.
-    - If AE_PRICE_INPUT_CURRENCY=AUTO or empty: 
-      - If raw string contains ₪/ILS/NIS -> assume ILS.
-      - Else if AE_TARGET_CURRENCY == "ILS" -> assume ILS (Affiliate API may already return ILS without symbol).
-      - Otherwise assume USD and convert.
-
-    Also supports 'cents as integer' mode when AE_PRICE_INT_IS_CENTS is true.
+    Notes:
+    - If the raw string already looks like ILS (₪/ILS/NIS), we DO NOT convert again.
+    - If the API returns cents as an integer string (e.g. '1290' meaning $12.90), we normalize.
     """
     if price_text is None:
         return ""
-    raw_original = str(price_text).strip()
-    if not raw_original:
-        return ""
-
+    raw_original = str(price_text)
     raw_clean = clean_price_text(raw_original)
     num = _extract_float(raw_clean)
     if num is None:
@@ -682,29 +661,14 @@ def usd_to_ils(price_text: str, rate: float) -> str:
     if AE_PRICE_INT_IS_CENTS and raw_clean and raw_clean.isdigit():
         try:
             ival = int(raw_clean)
-            if ival >= 100 and ival <= 100000000:
+            if ival >= 1000 and ival <= 10000000:
                 num = ival / 100.0
         except Exception:
             pass
 
+    # If already ILS -> don't convert again
     up = raw_original.upper()
-    has_ils_marker = ("₪" in raw_original) or ("ILS" in up) or ("NIS" in up)
-
-    mode = (AE_PRICE_INPUT_CURRENCY or "").strip().upper()
-    if mode in ("ILS", "NIS"):
-        treat_as_ils = True
-    elif mode == "USD":
-        treat_as_ils = False
-    else:
-        # AUTO / empty
-        if has_ils_marker:
-            treat_as_ils = True
-        elif (AE_TARGET_CURRENCY or "").upper() == "ILS":
-            treat_as_ils = True
-        else:
-            treat_as_ils = False
-
-    if treat_as_ils:
+    if ("₪" in raw_original) or ("ILS" in up) or ("NIS" in up):
         ils = float(num)
     else:
         ils = float(num) * float(rate)
@@ -716,6 +680,7 @@ def usd_to_ils(price_text: str, rate: float) -> str:
     except Exception:
         dec = 2
     return _format_money(round(ils, dec), dec)
+
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -1370,19 +1335,6 @@ def post_to_channel(product) -> bool:
 def send_next_locked(source: str = "loop") -> bool:
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
-        # Skip already-posted items if enabled
-        if AE_DEDUP_SKIP_ALREADY_POSTED_ON_SEND:
-            posted = _load_posted_keys() if _dedup_scope_has('posted') else set()
-            changed = False
-            while pending and (_key_of_row(pending[0]) in posted):
-                skip_item = pending.pop(0)
-                changed = True
-                log_info(f"{source}: skip already-posted ItemId={(skip_item.get('ItemId') or '').strip()}")
-            if changed:
-                try:
-                    write_products(PENDING_CSV, pending)
-                except Exception:
-                    pass
         if not pending:
             log_info(f"{source}: no pending")
             return False
@@ -1393,8 +1345,6 @@ def send_next_locked(source: str = "loop") -> bool:
         log_info(f"{source}: sending ItemId={item_id} | Title={title}")
 
         ok = post_to_channel(item)
-        if ok and _dedup_scope_has('posted'):
-            _append_posted_key(_key_of_row(item))
         if not ok:
             # IMPORTANT: do NOT advance queue on failures
             log_info(f"{source}: send FAILED, queue NOT advanced (ItemId={item_id})")
@@ -1433,35 +1383,6 @@ def read_auto_flag():
 def write_auto_flag(value):
     with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
         f.write(value)
-
-def read_publish_flag() -> str:
-    try:
-        with open(PUBLISH_FLAG_FILE, "r", encoding="utf-8") as f:
-            return (f.read() or "").strip() or "on"
-    except Exception:
-        return "on"
-
-def write_publish_flag(value: str):
-    try:
-        with open(PUBLISH_FLAG_FILE, "w", encoding="utf-8") as f:
-            f.write((value or "on").strip())
-    except Exception:
-        pass
-
-def read_refill_flag() -> str:
-    try:
-        with open(REFILL_FLAG_FILE, "r", encoding="utf-8") as f:
-            return (f.read() or "").strip() or ("on" if AE_REFILL_ENABLED else "off")
-    except Exception:
-        return "on" if AE_REFILL_ENABLED else "off"
-
-def write_refill_flag(value: str):
-    try:
-        with open(REFILL_FLAG_FILE, "w", encoding="utf-8") as f:
-            f.write((value or "on").strip())
-    except Exception:
-        pass
-
 
 def get_auto_delay():
     now = _now_il().time()
@@ -1566,83 +1487,12 @@ def cmd_ai_test(msg):
     except Exception as e:
         bot.reply_to(msg, f"❌ בדיקת AI נכשלה: {e}")
 
-# ========= DEDUP / POSTED HISTORY =========
-_POSTED_KEYS_CACHE = None  # set[str]
-
-def _load_posted_keys() -> set[str]:
-    """Load posted keys from POSTED_KEYS_FILE (JSONL). Keep only last AE_DEDUP_MAX_ITEMS and last AE_DEDUP_MAX_DAYS."""
-    global _POSTED_KEYS_CACHE
-    if _POSTED_KEYS_CACHE is not None:
-        return _POSTED_KEYS_CACHE
-
-    keys: list[tuple[float, str]] = []
-    now_ts = time.time()
-    max_age = max(1, AE_DEDUP_MAX_DAYS) * 86400.0
-    try:
-        if os.path.exists(POSTED_KEYS_FILE):
-            with open(POSTED_KEYS_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = (line or "").strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        ts = float(obj.get("ts") or 0)
-                        k = str(obj.get("k") or "").strip()
-                        if not k:
-                            continue
-                        if ts and (now_ts - ts) > max_age:
-                            continue
-                        keys.append((ts or now_ts, k))
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-
-    # keep newest
-    keys.sort(key=lambda x: x[0], reverse=True)
-    keys = keys[: max(100, AE_DEDUP_MAX_ITEMS)]
-    _POSTED_KEYS_CACHE = set(k for _, k in keys)
-    return _POSTED_KEYS_CACHE
-
-def _append_posted_key(k: str):
-    k = (k or "").strip()
-    if not k:
-        return
-    s = _load_posted_keys()
-    if k in s:
-        return
-    s.add(k)
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        with open(POSTED_KEYS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": time.time(), "k": k}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-def _dedup_key_of_row(r: dict) -> str:
-    """Return a stable key for dedup based on AE_DEDUP_KEY_MODE."""
-    item_id = (r.get("ItemId") or "").strip()
-    buy = (r.get("BuyLink") or "").strip()
-    title = (r.get("Title") or "").strip()
-    mode = (AE_DEDUP_KEY_MODE or "item_id").strip().lower()
-    if mode in ("item", "itemid", "item_id", "product_id"):
-        return item_id or buy or title
-    if mode in ("buy", "buy_link", "link", "url"):
-        return buy or item_id or title
-    # item_id_or_link (default-ish)
-    return item_id or buy or title
-
-def _dedup_scope_has(scope_name: str) -> bool:
-    s = (AE_DEDUP_SCOPE or "all").strip().lower()
-    if s == "all":
-        return True
-    return scope_name in s.split(",")
-
 # ========= MERGE =========
 def _key_of_row(r: dict):
-    return _dedup_key_of_row(r)
-
+    item_id = (r.get("ItemId") or "").strip()
+    title   = (r.get("Title") or "").strip()
+    buy     = (r.get("BuyLink") or "").strip()
+    return (item_id if item_id else None, title if not item_id else None, buy)
 
 def merge_from_data_into_pending():
     """Merge rows from DATA_CSV into PENDING_CSV.
@@ -1653,10 +1503,6 @@ def merge_from_data_into_pending():
         data_rows = read_products(DATA_CSV)
         pending_rows = read_products(PENDING_CSV)
         existing_keys = {_key_of_row(r) for r in pending_rows}
-        if _dedup_scope_has('posted'):
-            existing_keys |= set(_load_posted_keys())
-        if _dedup_scope_has('posted'):
-            existing_keys |= set(_load_posted_keys())
 
     # Only new candidates (so we don't waste AI calls)
     new_candidates = [r for r in data_rows if _key_of_row(r) not in existing_keys]
@@ -1976,8 +1822,6 @@ def refill_from_affiliate(max_needed: int) -> tuple[int, int, int, int, str | No
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
         existing_keys = {_key_of_row(r) for r in pending_rows}
-        if _dedup_scope_has('posted'):
-            existing_keys |= set(_load_posted_keys())
 
     added = 0
     dup = 0
@@ -2461,6 +2305,7 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
 def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
+        uid = getattr(getattr(c, 'from_user', None), 'id', 0) or 0
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -2642,13 +2487,6 @@ def inline_menu():
         types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
     )
 
-    pub_lbl = "✅ פרסום פעיל" if read_publish_flag()=="on" else "🛑 פרסום כבוי"
-    ref_lbl = "▶️ מילוי פעיל" if read_refill_flag()=="on" else "⏸️ מילוי מושהה"
-    kb.add(
-        types.InlineKeyboardButton(pub_lbl, callback_data="toggle_publish"),
-        types.InlineKeyboardButton(ref_lbl, callback_data="toggle_refill"),
-    )
-
     kb.add(
         types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
     )
@@ -2708,25 +2546,7 @@ def on_inline_click(c):
     if handle_filters_callback(c, data, chat_id):
         return
 
-
-    if data == "toggle_publish":
-        new_val = "off" if read_publish_flag() == "on" else "on"
-        write_publish_flag(new_val)
-        bot.answer_callback_query(c.id, "עודכן ✅", show_alert=False)
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="תפריט ניהול:", reply_markup=inline_menu(), cb_id=None)
-        return
-
-    if data == "toggle_refill":
-        new_val = "off" if read_refill_flag() == "on" else "on"
-        write_refill_flag(new_val)
-        bot.answer_callback_query(c.id, "עודכן ✅", show_alert=False)
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="תפריט ניהול:", reply_markup=inline_menu(), cb_id=None)
-        return
-
     if data == "publish_now":
-        if read_publish_flag() != "on":
-            bot.answer_callback_query(c.id, "פרסום כבוי כרגע 🛑", show_alert=True)
-            return
         ok = send_next_locked("manual")
         if not ok:
             bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
@@ -3202,10 +3022,6 @@ def auto_post_loop():
                 DELAY_EVENT.clear()
                 continue
 
-            if read_publish_flag() != "on":
-                DELAY_EVENT.wait(timeout=30)
-                DELAY_EVENT.clear()
-                continue
             send_next_locked("auto")
             DELAY_EVENT.wait(timeout=delay)
             DELAY_EVENT.clear()
@@ -3223,22 +3039,12 @@ def auto_post_loop():
             DELAY_EVENT.clear()
             continue
 
-        if read_publish_flag() != "on":
-            DELAY_EVENT.wait(timeout=30)
-            DELAY_EVENT.clear()
-            continue
         send_next_locked("loop")
         DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
         DELAY_EVENT.clear()
 
 # ========= REFILL DAEMON =========
 def refill_daemon():
-    # init refill flag file
-    try:
-        if not os.path.exists(REFILL_FLAG_FILE):
-            write_refill_flag('on' if AE_REFILL_ENABLED else 'off')
-    except Exception:
-        pass
     if not AE_REFILL_ENABLED:
         print("[INFO] Affiliate refill disabled.", flush=True)
         return
@@ -3246,10 +3052,6 @@ def refill_daemon():
 
     while True:
         try:
-            if read_refill_flag() != 'on':
-                time.sleep(10)
-                continue
-
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
 
