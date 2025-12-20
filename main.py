@@ -23,7 +23,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20buttons")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20currencyfix")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -208,45 +208,6 @@ from telebot import types
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
 
-# ========= RUN-TIME TOGGLES (persisted flags) =========
-PUBLISH_DISABLED_FLAG = os.getenv("PUBLISH_DISABLED_FLAG", "publish_disabled.flag")
-REFILL_PAUSED_FLAG = os.getenv("REFILL_PAUSED_FLAG", "refill_paused.flag")
-
-def is_publish_enabled() -> bool:
-    return not os.path.exists(PUBLISH_DISABLED_FLAG)
-
-def set_publish_enabled(enabled: bool) -> None:
-    if enabled:
-        try:
-            if os.path.exists(PUBLISH_DISABLED_FLAG):
-                os.remove(PUBLISH_DISABLED_FLAG)
-        except Exception:
-            pass
-    else:
-        try:
-            with open(PUBLISH_DISABLED_FLAG, "w", encoding="utf-8") as f:
-                f.write("disabled\n")
-        except Exception:
-            pass
-
-def is_refill_paused() -> bool:
-    return os.path.exists(REFILL_PAUSED_FLAG)
-
-def set_refill_paused(paused: bool) -> None:
-    if paused:
-        try:
-            with open(REFILL_PAUSED_FLAG, "w", encoding="utf-8") as f:
-                f.write("paused\n")
-        except Exception:
-            pass
-    else:
-        try:
-            if os.path.exists(REFILL_PAUSED_FLAG):
-                os.remove(REFILL_PAUSED_FLAG)
-        except Exception:
-            pass
-
-
 # ========= CONFIG (Telegram) =========
 BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or "").strip()  # חובה ב-ENV
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
@@ -281,6 +242,32 @@ AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
+
+# ========= PRICE CURRENCY MODE =========
+# AE affiliate API usually returns prices in the requested target_currency (default USD),
+# but sometimes the returned fields (especially app_* fields) may already be in ILS.
+# We support a runtime switch to tell the bot what currency the incoming prices are in,
+# and whether to convert USD→ILS for display.
+AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
+AE_PRICE_INPUT_CURRENCY = (_get_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY_DEFAULT) or AE_PRICE_INPUT_CURRENCY_DEFAULT).strip().upper()
+if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
+    AE_PRICE_INPUT_CURRENCY = "USD"
+
+AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
+
+def _display_currency_code() -> str:
+    # If input is already ILS, never convert again.
+    if AE_PRICE_INPUT_CURRENCY == "ILS":
+        return "ILS"
+    # Input is USD: convert only when enabled
+    return "ILS" if AE_PRICE_CONVERT_USD_TO_ILS else "USD"
+
+def _display_currency_suffix_he() -> str:
+    return 'ש"ח' if _display_currency_code() == "ILS" else "$"
+
+def _display_currency_symbol() -> str:
+    return "₪" if _display_currency_code() == "ILS" else "$"
 
 PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
 AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
@@ -521,6 +508,15 @@ def set_category_ids(ids: list[str]):
     _set_state_str("category_ids_raw", CATEGORY_IDS_RAW)
 
 
+# Keep a mutable set in memory for category selection UI (persisted via CATEGORY_IDS_RAW)
+CATEGORY_IDS = set(get_selected_category_ids())
+
+def save_user_state():
+    """Persist current filters that are maintained in-memory (currently: category ids)."""
+    global CATEGORY_IDS
+    set_category_ids(sorted(list(CATEGORY_IDS), key=str))
+
+
 def set_price_buckets_raw(raw: str):
     global AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS
     raw = (raw or "").strip()
@@ -714,6 +710,49 @@ def usd_to_ils(price_text: str, rate: float) -> str:
     except Exception:
         dec = 2
     return _format_money(round(ils, dec), dec)
+
+
+
+def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str:
+    """Normalize incoming price text to what we display in the post.
+
+    Rules:
+    - If AE_PRICE_INPUT_CURRENCY=ILS → treat input as ILS and NEVER convert.
+    - If input is USD:
+        - If AE_PRICE_CONVERT_USD_TO_ILS is ON → convert USD→ILS using usd_to_ils_rate.
+        - If OFF → keep USD as-is (no conversion).
+    - Cents-as-integer normalization (AE_PRICE_INT_IS_CENTS) is applied in both modes.
+    """
+    if price_text is None:
+        return ""
+    raw = str(price_text)
+    raw_clean = clean_price_text(raw)
+    num = _extract_float(raw_clean)
+    if num is None:
+        return ""
+
+    # Normalize integer-cents when configured
+    if AE_PRICE_INT_IS_CENTS and raw_clean and raw_clean.isdigit():
+        try:
+            ival = int(raw_clean)
+            if ival >= 1000 and ival <= 10000000:
+                num = ival / 100.0
+        except Exception:
+            pass
+
+    # If input currency is ILS, do not convert
+    if AE_PRICE_INPUT_CURRENCY == "ILS":
+        return _format_money(float(num), PRICE_DECIMALS)
+
+    # Input is USD
+    if not AE_PRICE_CONVERT_USD_TO_ILS:
+        return _format_money(float(num), PRICE_DECIMALS)
+
+    try:
+        num = float(num) * float(usd_to_ils_rate)
+    except Exception:
+        pass
+    return _format_money(float(num), PRICE_DECIMALS)
 
 
 def _parse_price_buckets(raw: str):
@@ -1185,13 +1224,19 @@ def format_post(product):
                 lines.append(part)
         lines.append("")
     price_label = "מחיר החל מ" if (product.get("PriceIsFrom") or "").strip() else "מחיר מבצע"
-    price_line = f'💰 {price_label}: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
+    cur_code = _display_currency_code()
+    if cur_code == "ILS":
+        price_line = f'💰 {price_label}: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
+        ship_line = '🚚 משלוח חינם מעל 38 ש"ח או 7.49 ש"ח'
+    else:
+        price_line = f'💰 {price_label}: ${sale_price} (מחיר מקורי: ${original_price})'
+        ship_line = '🚚 משלוח/מחירון לפי תנאי המוכר'
     lines += [
         price_line,
         discount_text,
         f"⭐ דירוג: {rating_percent}",
         f"📦 {orders_text}",
-        "🚚 משלוח חינם מעל 38 ש\"ח או 7.49 ש\"ח",
+        ship_line,
     ]
 
     if coupon_text:
@@ -1367,9 +1412,6 @@ def post_to_channel(product) -> bool:
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
-    if not is_publish_enabled():
-        print("[INFO] Publishing is disabled. Skipping send.", flush=True)
-        return False
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
@@ -1815,8 +1857,8 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     sale_text, sale_is_from = _pick_value(sale_raw)
     orig_text, orig_is_from = _pick_value(orig_raw)
 
-    sale_ils = usd_to_ils(sale_text, USD_TO_ILS_RATE_DEFAULT)
-    orig_ils = usd_to_ils(orig_text, USD_TO_ILS_RATE_DEFAULT)
+    sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT)
+    orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE_DEFAULT)
 
     product_id = str(p.get("product_id", "")).strip()
 
@@ -1833,9 +1875,9 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "ItemId": product_id,
         "ImageURL": (p.get("product_main_image_url") or "").strip(),
         "Title": (p.get("product_title") or "").strip(),
-        "OriginalPrice": orig_ils,
+        "OriginalPrice": orig_disp,
         "OriginalIsFrom": ("1" if orig_is_from else ""),
-        "SalePrice": sale_ils,
+        "SalePrice": sale_disp,
         "PriceIsFrom": ("1" if sale_is_from else ""),
         "Discount": (p.get("discount") or "").strip(),
         "Rating": (p.get("evaluate_rate") or "").strip(),
@@ -2342,7 +2384,7 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
 def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
-        uid = getattr(getattr(c, 'from_user', None), 'id', None) or 0
+        uid = getattr(getattr(c, 'from_user', None), 'id', None) or getattr(getattr(getattr(c, 'message', None), 'from_user', None), 'id', 0)
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -2399,13 +2441,13 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
         if data.startswith("fc_menu_"):
             page = int(data.split("_")[-1])
             CAT_VIEW_MODE[uid] = "top"
-            safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid), cb_id=None)
             return True
 
         if data.startswith("fc_all_"):
             page = int(data.split("_")[-1])
             CAT_VIEW_MODE[uid] = "all"
-            safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid), cb_id=None)
             return True
 
         if data.startswith("fc_s_"):
@@ -2417,9 +2459,9 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
                 kb = types.InlineKeyboardMarkup(row_width=1)
                 kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-                safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=None)
             else:
-                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q), cb_id=None)
             return True
 
         if data == "fc_search":
@@ -2428,7 +2470,7 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
             kb = types.InlineKeyboardMarkup(row_width=1)
             kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-            safe_edit_message(c.message, "🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=None)
             return True
 
         # toggle category selection
@@ -2454,14 +2496,14 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
 
             if mode == "all":
                 CAT_VIEW_MODE[uid] = "all"
-                safe_edit_message(c.message, "🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 בחר קטגוריות (כל הקטגוריות):", reply_markup=_categories_menu_kb(page, mode="all", uid=uid), cb_id=None)
             elif mode == "search":
                 CAT_VIEW_MODE[uid] = "search"
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(page, mode="search", uid=uid, query=q), cb_id=None)
             else:
                 CAT_VIEW_MODE[uid] = "top"
-                safe_edit_message(c.message, "🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🧩 בחר קטגוריות (פופולריות):", reply_markup=_categories_menu_kb(page, mode="top", uid=uid), cb_id=None)
             return True
 
         if data == "fc_clear":
@@ -2469,12 +2511,12 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             save_user_state()
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=None)
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, f"✅ נוקה! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"✅ נוקה! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=None)
             else:
-                safe_edit_message(c.message, "✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="✅ נוקה! עכשיו בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
             return True
 
         if data == "fc_random":
@@ -2486,24 +2528,24 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 save_user_state()
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=None)
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=None)
             else:
-                safe_edit_message(c.message, "🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
             return True
 
         if data == "fc_sync":
             _ = get_categories(force=True)
             mode = CAT_VIEW_MODE.get(uid, "top")
             if mode == "all":
-                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=None)
             elif mode == "search":
                 q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(c.message, f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=None)
             else:
-                safe_edit_message(c.message, "🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid))
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
             return True
 
 
@@ -2525,14 +2567,15 @@ def inline_menu():
     )
 
     kb.add(
-        types.InlineKeyboardButton(("✅ פרסום פעיל" if is_publish_enabled() else "🛑 פרסום כבוי"), callback_data="toggle_publish"),
-        types.InlineKeyboardButton(("▶️ מילוי פעיל" if not is_refill_paused() else "⏸️ מילוי מושהה"), callback_data="toggle_refill"),
-    )
-
-
-    kb.add(
         types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
     )
+    # Currency / conversion controls (affiliate prices)
+    conv_state = "פעיל" if (AE_PRICE_INPUT_CURRENCY == "USD" and AE_PRICE_CONVERT_USD_TO_ILS) else "כבוי"
+    kb.add(
+        types.InlineKeyboardButton(f"💱 מטבע מקור: {AE_PRICE_INPUT_CURRENCY}", callback_data="toggle_price_input_currency"),
+        types.InlineKeyboardButton(f"🔁 המרת $→₪: {conv_state}", callback_data="toggle_usd2ils_convert"),
+    )
+
 
     kb.add(
         types.InlineKeyboardButton("⏱️ דקה", callback_data="delay_60"),
@@ -2576,7 +2619,7 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
-    global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS
+    global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
 
     if not _is_admin(c):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
@@ -2584,20 +2627,6 @@ def on_inline_click(c):
 
     data = c.data or ""
     chat_id = c.message.chat.id
-
-    if data == "toggle_publish":
-        enabled = not is_publish_enabled()
-        set_publish_enabled(enabled)
-        bot.answer_callback_query(c.id, f"פרסום {'הופעל' if enabled else 'כובה'}.")
-        safe_edit_message(c.message, "בחר פעולה:", reply_markup=inline_menu())
-        return
-
-    if data == "toggle_refill":
-        paused = not is_refill_paused()
-        set_refill_paused(paused)
-        bot.answer_callback_query(c.id, f"מילוי אוטומטי {'הושהה' if paused else 'הופעל'}.")
-        safe_edit_message(c.message, "בחר פעולה:", reply_markup=inline_menu())
-        return
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
@@ -2619,8 +2648,10 @@ def on_inline_click(c):
         schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
         delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
         target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
+        conv_state = "פעיל" if (AE_PRICE_INPUT_CURRENCY == "USD" and AE_PRICE_CONVERT_USD_TO_ILS) else "כבוי"
+        currency_line = f"💱 מטבע מקור: {AE_PRICE_INPUT_CURRENCY} | המרה $→₪: {conv_state} | מציג: {_display_currency_code()}"
         if count == 0:
-            text = f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅"
+            text = f"{schedule_line}\n{delay_line}\n{target_line}\n{currency_line}\nאין פוסטים ממתינים ✅"
         else:
             total_seconds = (count - 1) * POST_DELAY_SECONDS
             eta = now_il + timedelta(seconds=total_seconds)
@@ -2632,6 +2663,7 @@ def on_inline_click(c):
                 f"{status_line}\n"
                 f"{delay_line}\n"
                 f"{target_line}\n"
+                f"{currency_line}\n"
                 f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
                 f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
                 f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
@@ -2641,7 +2673,8 @@ def on_inline_click(c):
                           new_text=text, reply_markup=inline_menu(), parse_mode='HTML', cb_id=c.id)
 
     elif data == "pf_menu":
-        txt = f'💸 סינון מחיר (בש"ח)\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"}\nבחר טווחים:'
+        cur_name = "ש\"ח" if _display_currency_code() == "ILS" else "$"
+        txt = f'💸 סינון מחיר ({cur_name})\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"}\nבחר טווחים:'
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=c.id)
 
     elif data == "pf_back":
@@ -2651,7 +2684,8 @@ def on_inline_click(c):
         with FILE_LOCK:
             set_price_buckets_raw("")
         bot.answer_callback_query(c.id, "סינון מחיר בוטל.")
-        txt = '💸 סינון מחיר (בש"ח)\nמצב נוכחי: ללא\nבחר טווחים:'
+        cur_name = "ש\"ח" if _display_currency_code() == "ILS" else "$"
+        txt = f'💸 סינון מחיר ({cur_name})\nמצב נוכחי: ללא\nבחר טווחים:'
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=None)
 
     elif data.startswith("pf_"):
@@ -2671,7 +2705,8 @@ def on_inline_click(c):
         with FILE_LOCK:
             set_price_buckets_raw(raw)
         bot.answer_callback_query(c.id, f"עודכן: {raw or 'ללא'}")
-        txt = f'💸 סינון מחיר (בש"ח)\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"}\nבחר טווחים:'
+        cur_name = "ש\"ח" if _display_currency_code() == "ILS" else "$"
+        txt = f'💸 סינון מחיר ({cur_name})\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"}\nבחר טווחים:'
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=None)
 
     elif data == "reload_merge":
@@ -2694,6 +2729,29 @@ def on_inline_click(c):
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=f"החלפתי מצב לשידור: {state}",
                           reply_markup=inline_menu(), cb_id=c.id)
+
+
+    elif data == "toggle_price_input_currency":
+        # Toggle how we interpret incoming affiliate prices (USD vs ILS)
+        AE_PRICE_INPUT_CURRENCY = "ILS" if AE_PRICE_INPUT_CURRENCY == "USD" else "USD"
+        _set_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY)
+        # If switched away from USD, conversion is irrelevant (but we keep the stored flag)
+        bot.answer_callback_query(c.id, f"עודכן מטבע מקור למחירים: {AE_PRICE_INPUT_CURRENCY}")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"✅ עודכן מטבע מקור למחירים: {AE_PRICE_INPUT_CURRENCY}",
+                          reply_markup=inline_menu(), cb_id=None)
+
+    elif data == "toggle_usd2ils_convert":
+        if AE_PRICE_INPUT_CURRENCY != "USD":
+            bot.answer_callback_query(c.id, "כדי להפעיל המרה צריך שמטבע המקור יהיה USD.", show_alert=True)
+            return
+        AE_PRICE_CONVERT_USD_TO_ILS = not bool(AE_PRICE_CONVERT_USD_TO_ILS)
+        _set_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS)
+        state_txt = "פעיל" if AE_PRICE_CONVERT_USD_TO_ILS else "כבוי"
+        bot.answer_callback_query(c.id, f"המרה $→₪: {state_txt}")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"✅ המרת $→₪ כעת: {state_txt}",
+                          reply_markup=inline_menu(), cb_id=None)
 
     elif data.startswith("delay_"):
         try:
@@ -3109,9 +3167,6 @@ def refill_daemon():
 
     while True:
         try:
-            if is_refill_paused():
-                time.sleep(5)
-                continue
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
 
@@ -3155,6 +3210,7 @@ if __name__ == "__main__":
     log_info(f"[CFG] PUBLIC_CHANNEL={os.environ.get('PUBLIC_CHANNEL', '')} | CURRENT_TARGET={CURRENT_TARGET}")
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
+    log_info(f"[CFG] PRICE_INPUT_CURRENCY={AE_PRICE_INPUT_CURRENCY} | CONVERT_USD_TO_ILS={AE_PRICE_CONVERT_USD_TO_ILS} | DISPLAY={_display_currency_code()}")
     log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
 
