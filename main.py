@@ -23,7 +23,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20fix3")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20buttons")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -207,6 +207,45 @@ from telebot import types
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
+
+# ========= RUN-TIME TOGGLES (persisted flags) =========
+PUBLISH_DISABLED_FLAG = os.getenv("PUBLISH_DISABLED_FLAG", "publish_disabled.flag")
+REFILL_PAUSED_FLAG = os.getenv("REFILL_PAUSED_FLAG", "refill_paused.flag")
+
+def is_publish_enabled() -> bool:
+    return not os.path.exists(PUBLISH_DISABLED_FLAG)
+
+def set_publish_enabled(enabled: bool) -> None:
+    if enabled:
+        try:
+            if os.path.exists(PUBLISH_DISABLED_FLAG):
+                os.remove(PUBLISH_DISABLED_FLAG)
+        except Exception:
+            pass
+    else:
+        try:
+            with open(PUBLISH_DISABLED_FLAG, "w", encoding="utf-8") as f:
+                f.write("disabled\n")
+        except Exception:
+            pass
+
+def is_refill_paused() -> bool:
+    return os.path.exists(REFILL_PAUSED_FLAG)
+
+def set_refill_paused(paused: bool) -> None:
+    if paused:
+        try:
+            with open(REFILL_PAUSED_FLAG, "w", encoding="utf-8") as f:
+                f.write("paused\n")
+        except Exception:
+            pass
+    else:
+        try:
+            if os.path.exists(REFILL_PAUSED_FLAG):
+                os.remove(REFILL_PAUSED_FLAG)
+        except Exception:
+            pass
+
 
 # ========= CONFIG (Telegram) =========
 BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or "").strip()  # חובה ב-ENV
@@ -1328,6 +1367,9 @@ def post_to_channel(product) -> bool:
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
+    if not is_publish_enabled():
+        print("[INFO] Publishing is disabled. Skipping send.", flush=True)
+        return False
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
@@ -2300,6 +2342,7 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
 def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
+        uid = getattr(getattr(c, 'from_user', None), 'id', None) or 0
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -2482,6 +2525,12 @@ def inline_menu():
     )
 
     kb.add(
+        types.InlineKeyboardButton(("✅ פרסום פעיל" if is_publish_enabled() else "🛑 פרסום כבוי"), callback_data="toggle_publish"),
+        types.InlineKeyboardButton(("▶️ מילוי פעיל" if not is_refill_paused() else "⏸️ מילוי מושהה"), callback_data="toggle_refill"),
+    )
+
+
+    kb.add(
         types.InlineKeyboardButton("🧰 סינונים", callback_data="flt_menu"),
     )
 
@@ -2535,6 +2584,20 @@ def on_inline_click(c):
 
     data = c.data or ""
     chat_id = c.message.chat.id
+
+    if data == "toggle_publish":
+        enabled = not is_publish_enabled()
+        set_publish_enabled(enabled)
+        bot.answer_callback_query(c.id, f"פרסום {'הופעל' if enabled else 'כובה'}.")
+        safe_edit_message(c.message, "בחר פעולה:", reply_markup=inline_menu())
+        return
+
+    if data == "toggle_refill":
+        paused = not is_refill_paused()
+        set_refill_paused(paused)
+        bot.answer_callback_query(c.id, f"מילוי אוטומטי {'הושהה' if paused else 'הופעל'}.")
+        safe_edit_message(c.message, "בחר פעולה:", reply_markup=inline_menu())
+        return
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
@@ -3046,6 +3109,9 @@ def refill_daemon():
 
     while True:
         try:
+            if is_refill_paused():
+                time.sleep(5)
+                continue
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
 
@@ -3170,16 +3236,11 @@ t2 = threading.Thread(target=refill_daemon, daemon=True)
 t2.start()
 
 # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
-# IMPORTANT: If Telegram returns 409 (another getUpdates poller is running),
-# we EXIT to avoid uncontrolled posting (auto/refill threads may still run).
 while True:
     try:
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
-        if ("Conflict: terminated by other getUpdates request" in msg) or ("Error code: 409" in msg):
-            log_error(f"Polling error: {e}. Another instance is polling. Exiting to avoid uncontrolled posting.")
-            sys.exit(0)
-        wait = 5
+        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
         log_error(f"Polling error: {e}. Retrying in {wait}s...")
         time.sleep(wait)
