@@ -255,17 +255,20 @@ USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.
 # and whether to convert USD→ILS for display.
 AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
 AE_PRICE_INPUT_CURRENCY = (_get_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY_DEFAULT) or AE_PRICE_INPUT_CURRENCY_DEFAULT).strip().upper()
-if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
+if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS", "AUTO"):
     AE_PRICE_INPUT_CURRENCY = "USD"
 
 AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
 
 def _display_currency_code() -> str:
-    # If input is already ILS, never convert again.
+    # If the input is already ILS, show ILS.
     if AE_PRICE_INPUT_CURRENCY == "ILS":
         return "ILS"
-    # Input is USD: convert only when enabled
+    # AUTO: infer per-product currency when possible; display depends on convert flag.
+    if AE_PRICE_INPUT_CURRENCY == "AUTO":
+        return "ILS" if AE_PRICE_CONVERT_USD_TO_ILS else "USD"
+    # USD
     return "ILS" if AE_PRICE_CONVERT_USD_TO_ILS else "USD"
 
 def _display_currency_suffix_he() -> str:
@@ -734,71 +737,49 @@ def usd_to_ils(price_text: str, rate: float) -> str:
 
 
 
-def _detect_currency_hint(raw: str) -> str | None:
-    """Best-effort currency detection from raw price text."""
-    if raw is None:
-        return None
-    s = str(raw)
-    # Hebrew shekel sign or explicit ILS
-    if "₪" in s or "ILS" in s.upper() or "NIS" in s.upper():
-        return "ILS"
-    # Dollar sign or explicit USD
-    if "$" in s or "USD" in s.upper() or "US$" in s.upper():
-        return "USD"
-    return None
-
-
-def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str:
+def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float, src_currency: str | None = None) -> str:
     """Normalize incoming price text to what we display in the post.
 
-    Rules (autodetected first):
-    - If the raw text contains ₪/ILS → treat as ILS and NEVER convert.
-    - If the raw text contains $/USD → treat as USD.
-    - Otherwise fall back to AE_PRICE_INPUT_CURRENCY.
-
-    Then:
-    - If input is ILS → display as-is.
-    - If input is USD:
-        - If AE_PRICE_CONVERT_USD_TO_ILS is ON → convert USD→ILS using usd_to_ils_rate.
-        - If OFF → keep USD numeric amount (still displayed as number; symbol is added elsewhere if needed).
-    - Cents-as-integer normalization (AE_PRICE_INT_IS_CENTS) is applied when raw looks like an integer-cents amount.
+    - src_currency (when provided) overrides AE_PRICE_INPUT_CURRENCY per product.
+    - If AE_PRICE_INPUT_CURRENCY=AUTO and src_currency is missing, we try to infer currency from the raw text.
+    - Integer-cents normalization is applied when AE_PRICE_INT_IS_CENTS is ON, and also with a conservative heuristic
+      for very large integers (helps when the affiliate API returns cents without the flag being set).
     """
     if price_text is None:
         return ""
     raw = str(price_text)
-
-    # Currency hint from raw string beats env defaults
-    hint = _detect_currency_hint(raw)
-    input_ccy = hint or (AE_PRICE_INPUT_CURRENCY or "USD")
-
     raw_clean = clean_price_text(raw)
     num = _extract_float(raw_clean)
     if num is None:
         return ""
 
-    # Heuristic for integer-cents payloads:
-    # Many affiliate payloads ship prices as integer cents (e.g., "3699" meaning 36.99).
-    # We only apply this if the cleaned text is purely digits AND looks like a cents amount.
+    # Normalize integer-cents when configured (or when clearly looks like cents)
     if raw_clean and raw_clean.isdigit():
         try:
             ival = int(raw_clean)
-            if AE_PRICE_INT_IS_CENTS:
-                # explicit mode
-                if ival >= 1000 and ival <= 10000000:
-                    num = ival / 100.0
-            else:
-                # auto-heuristic when not explicit:
-                # if it's >=1000 and <=500000 and no decimal originally, it's probably cents.
-                if ival >= 1000 and ival <= 500000:
-                    num = ival / 100.0
+            if AE_PRICE_INT_IS_CENTS or (ival >= 10000 and ival <= 10000000):
+                num = ival / 100.0
         except Exception:
             pass
 
+    cur = (src_currency or "").strip().upper()
+
+    # AUTO inference from raw string when currency is unknown
+    if not cur and AE_PRICE_INPUT_CURRENCY == "AUTO":
+        up = raw.upper()
+        if "ILS" in up or "NIS" in up or "₪" in raw:
+            cur = "ILS"
+        elif "$" in raw or "USD" in up:
+            cur = "USD"
+
+    if not cur:
+        cur = AE_PRICE_INPUT_CURRENCY
+
     # If input currency is ILS, do not convert
-    if input_ccy == "ILS":
+    if cur in ("ILS", "NIS"):
         return _format_money(float(num), PRICE_DECIMALS)
 
-    # Input is USD
+    # Treat all other currencies like USD for display logic
     if not AE_PRICE_CONVERT_USD_TO_ILS:
         return _format_money(float(num), PRICE_DECIMALS)
 
@@ -807,7 +788,6 @@ def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str
     except Exception:
         pass
     return _format_money(float(num), PRICE_DECIMALS)
-
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -1892,15 +1872,45 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         products = [products]
     return products, resp_code, resp_msg
 
+
+def affiliate_product_detail_get(product_ids: str, fields: str | None = None) -> tuple[list[dict], int | None, str | None]:
+    """Fetch product details by product_ids (comma-separated).
+
+    Useful for exact matches when admin provides a product URL.
+    """
+    biz = {
+        "tracking_id": AE_TRACKING_ID,
+        "target_language": AE_TARGET_LANGUAGE,
+        "country": AE_SHIP_TO_COUNTRY,
+        "product_ids": str(product_ids).strip(),
+        "fields": fields
+        or "product_id,product_title,product_main_image_url,sale_price,original_price,sale_price_currency,original_price_currency,app_sale_price,app_sale_price_currency,product_detail_url,promotion_link,product_video_url,evaluate_rate,lastest_volume",
+    }
+    payload = _top_call("aliexpress.affiliate.productdetail.get", biz)
+    resp = _extract_resp_result(payload)
+    resp_code = resp.get("resp_code")
+    resp_msg = resp.get("resp_msg")
+
+    result = resp.get("result") or {}
+    products = result.get("products") or result.get("product_list") or []
+
+    if isinstance(products, dict) and "product" in products:
+        products = products.get("product") or []
+    if products is None:
+        products = []
+    if not isinstance(products, list):
+        products = [products]
+    return products, resp_code, resp_msg
+
+
 def _map_affiliate_product_to_row(p: dict) -> dict:
     # מחיר מבצע / מקורי - טיפול בטווחים ("1.23-4.56") + מניעת המרה כפולה אם המחיר כבר בש"ח
-    # Prefer target_* prices when present (they are already in target currency from API),
-    # then fall back to non-target prices.
-    if AE_USE_APP_PRICE:
-        sale_raw = (p.get("target_app_sale_price") or p.get("target_sale_price") or p.get("app_sale_price") or p.get("sale_price") or "")
-    else:
-        sale_raw = (p.get("target_sale_price") or p.get("target_app_sale_price") or p.get("sale_price") or p.get("app_sale_price") or "")
-    orig_raw = (p.get("target_original_price") or p.get("original_price") or "")
+    sale_raw = (
+        p.get("app_sale_price")
+        if AE_USE_APP_PRICE
+        else (p.get("sale_price") or p.get("app_sale_price"))
+    ) or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
+    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
 
     def _pick_value(raw_val):
         s = str(raw_val or "").strip()
@@ -1932,7 +1942,18 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     orig_text, orig_is_from = _pick_value(orig_raw)
 
     sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT)
-    orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE_DEFAULT)
+    sale_cur = (
+        (p.get("app_sale_price_currency") if AE_USE_APP_PRICE else None)
+        or p.get("sale_price_currency")
+        or p.get("target_sale_price_currency")
+        or p.get("original_price_currency")
+        or p.get("target_original_price_currency")
+        or ""
+    )
+    orig_cur = (p.get("original_price_currency") or p.get("target_original_price_currency") or p.get("sale_price_currency") or "")
+
+    sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT, src_currency=(sale_cur or None))
+    orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE_DEFAULT, src_currency=(orig_cur or None))
 
     product_id = str(p.get("product_id", "")).strip()
 
@@ -2365,8 +2386,6 @@ CAT_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_me
 PROD_SEARCH_WAIT: dict[int, bool] = {}        # uid -> waiting for keyword text?
 PROD_SEARCH_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
 PROD_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
-PROD_SEARCH_PRESETS: dict[int, list[str]] = {}  # uid -> preset keywords list for button-based search
-
 
 # --- Manual PRODUCT search preview session (per admin user) ---
 # Stores last fetched results for a keyword so you can review what was found BEFORE adding to queue.
@@ -2402,52 +2421,73 @@ def _ms_active_filters_text() -> str:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
     return " | ".join(parts) if parts else "ללא"
 
-def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
-    """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
-    # Price buckets
+def _ms_eval_row_filters(row: dict, ignore_global: bool = True) -> tuple[bool, str]:
+    """Return (ok, reason_if_not_ok) for manual search preview.
+
+    ignore_global=True means we DO NOT apply global queue filters (MIN_ORDERS/MIN_RATING/FREE_SHIP_ONLY),
+    because manual search is primarily about relevance. Refill still respects the global filters.
+    """
+    # Price buckets still apply (user intentionally set them)
     if AE_PRICE_BUCKETS:
         sale_num = _extract_float(row.get("SalePrice") or "")
         if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
             return False, "מחוץ לסינון מחיר"
-    # Orders
-    if MIN_ORDERS:
-        o = safe_int(row.get("Orders") or "0", 0)
-        if o < int(MIN_ORDERS):
-            return False, f"פחות מ-{MIN_ORDERS} הזמנות"
-    # Rating
-    if MIN_RATING:
-        r = _extract_float(row.get("Rating") or "")
-        if r is None or float(r) < float(MIN_RATING):
-            return False, f"דירוג נמוך מ-{MIN_RATING}%"
-    # Free ship only (our heuristic threshold)
-    if FREE_SHIP_ONLY:
-        sale_num = _extract_float(row.get("SalePrice") or "")
-        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-            return False, f"מתחת לסף משלוח חינם ₪{AE_FREE_SHIP_THRESHOLD_ILS:g}"
-    # Buy link
+
+    if not ignore_global:
+        # Orders
+        if MIN_ORDERS:
+            o = safe_int(row.get("Orders") or "0", 0)
+            if o < int(MIN_ORDERS):
+                return False, f"פחות מ-{MIN_ORDERS} הזמנות"
+        # Rating
+        if MIN_RATING:
+            r = _extract_float(row.get("Rating") or "")
+            if r is None or float(r) < float(MIN_RATING):
+                return False, f"מתחת ל-{MIN_RATING}% דירוג"
+        # Free shipping
+        if FREE_SHIP_ONLY:
+            fs = str(row.get("FreeShipping") or "").strip().lower() in ("1","true","yes","on","y","כן")
+            if not fs:
+                return False, "לא משלוח חינם"
+        # Free shipping threshold
+        if AE_FREE_SHIP_THRESHOLD_ILS:
+            sale_num = _extract_float(row.get("SalePrice") or "")
+            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                return False, f"מתחת לסף משלוח חינם ₪{AE_FREE_SHIP_THRESHOLD_ILS:g}"
+
+    # Must have buy link
     if not (row.get("BuyLink") or "").strip():
         return False, "אין קישור רכישה"
     return True, ""
 
-def _ms_relevance_score(q: str, title: str) -> int:
-    """Simple relevance score for manual search: higher means more likely related."""
+
+_HE_KEYWORD_MAP = [
+    ("שעון חכם", "smartwatch"),
+    ("שעון", "wristwatch"),
+    ("אוזניות", "headphones"),
+    ("מטען", "charger"),
+    ("מטבח", "kitchen gadget"),
+    ("רכב", "car accessories"),
+    ("כלי עבודה", "tools"),
+    ("מקדחה", "drill"),
+    ("נעל", "shoes"),
+    ("תיק", "bag"),
+    ("מצלמה", "camera"),
+]
+
+def _ms_normalize_keywords(q: str) -> str:
+    """Best-effort mapping of common Hebrew keywords to English for the affiliate API."""
     q = (q or "").strip()
-    title = (title or "").strip()
-    if not q or not title:
-        return 0
-    q_low = q.casefold()
-    t_low = title.casefold()
-    # Full phrase match gets a big boost
-    score = 0
-    if q_low in t_low:
-        score += 100
-    # Token matches
-    tokens = [tok.strip() for tok in re.split(r"\s+", q_low) if tok.strip()]
-    for tok in tokens[:6]:
-        if tok and tok in t_low:
-            # longer tokens matter more
-            score += 10 + min(10, len(tok))
-    return score
+    if not q:
+        return q
+    if "http://" in q or "https://" in q:
+        return q
+    if re.search(r"[\u0590-\u05FF]", q):
+        for he, en in _HE_KEYWORD_MAP:
+            if he in q:
+                return en
+    return q
+
 
 def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False) -> dict:
     """Fetch one page from AliExpress Affiliate API and prepare preview session."""
@@ -2457,7 +2497,9 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     if use_selected_categories:
         cats = get_selected_category_ids()
         cat_id = cats[0] if cats else None  # keep it simple: first selected
-    products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=q)
+    kw = _ms_normalize_keywords(q)
+    products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=kw)
+    log_info(f"[MS] fetch uid={uid} page={page} per={per_page} q={q!r} kw={kw!r} cat_id={cat_id} resp_code={resp_code} raw={(len(products or []))}")
 
     # Map and evaluate
     results = []
@@ -2466,7 +2508,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     for p in (products or []):
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
-        ok, reason = _ms_eval_row_filters(row)
+        ok, reason = _ms_eval_row_filters(row, ignore_global=True)
         if not ok:
             # bucket reasons (best-effort)
             if "קישור" in reason:
@@ -2481,15 +2523,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["free_ship"] += 1
             else:
                 reasons["other"] += 1
-        results.append({"row": row, "ok": ok, "reason": reason, "score": _ms_relevance_score(q, str(row.get("Title") or ""))})
-
-    # Prefer results that actually match the query (if we have any matches)
-    try:
-        if results and any((r.get("score") or 0) > 0 for r in results):
-            results = [r for r in results if (r.get("score") or 0) > 0]
-        results.sort(key=lambda r: (r.get("score") or 0), reverse=True)
-    except Exception:
-        pass
+        results.append({"row": row, "ok": ok, "reason": reason})
 
     sess = {
         "q": q,
@@ -3168,39 +3202,6 @@ def on_inline_click(c):
 
     data = c.data or ""
     chat_id = c.message.chat.id
-    # --- Button-based search presets ---
-    if data.startswith("ps_kw_"):
-        uid = c.from_user.id
-        try:
-            i = int(data.replace("ps_kw_", "").strip())
-        except Exception:
-            i = -1
-        presets = PROD_SEARCH_PRESETS.get(uid) or []
-        if 0 <= i < len(presets):
-            q = presets[i]
-            bot.answer_callback_query(c.id, f"מחפש: {q}")
-            _ms_start(uid=uid, chat_id=chat_id, q=q)
-        else:
-            bot.answer_callback_query(c.id, "פג תוקף הרשימה. לחץ שוב על 🔎 חיפוש ידני.", show_alert=True)
-        return
-
-    if data == "ps_type":
-        uid = c.from_user.id
-        PROD_SEARCH_WAIT[uid] = True
-        PROD_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
-        try:
-            prompt = bot.send_message(
-                chat_id,
-                "🔎 כתוב עכשיו מילת חיפוש (לדוגמה: מגן מסך / מטבח / מקדחה / שעון).\n"
-                "טיפ: בקבוצה חייבים Reply להודעה הזאת כדי שהבוט יקבל את הטקסט.",
-                parse_mode="Markdown",
-                reply_markup=types.ForceReply(selective=True)
-            )
-            PROD_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
-        except Exception:
-            bot.send_message(chat_id, "🔎 כתוב עכשיו מילת חיפוש (לדוגמה: מגן מסך / מטבח / מקדחה / שעון).")
-        bot.answer_callback_query(c.id)
-        return
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
@@ -3235,30 +3236,21 @@ def on_inline_click(c):
 
     if data == "prod_search":
         uid = c.from_user.id
-
-        # Build preset keyword buttons from AE_KEYWORDS (first N), so admins can search via buttons.
-        kws = [k.strip() for k in re.split(r"[\n,|]+", (AE_KEYWORDS or "")) if k.strip()]
-        # Keep the list short to fit keyboard nicely
-        presets = kws[:10] if kws else []
-        PROD_SEARCH_PRESETS[uid] = presets
-
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        if presets:
-            for i, kw in enumerate(presets):
-                label = kw
-                if len(label) > 28:
-                    label = label[:27] + "…"
-                kb.add(types.InlineKeyboardButton(f"🔎 {label}", callback_data=f"ps_kw_{i}"))
-        kb.add(types.InlineKeyboardButton("✍️ חיפוש מותאם אישית", callback_data="ps_type"))
-        kb.add(types.InlineKeyboardButton("⬅️ חזרה לתפריט", callback_data="ms_back"))
-
-        bot.send_message(
-            chat_id,
-            "🔎 <b>חיפוש ידני</b>\n"
-            "בחר נושא לחיפוש מהכפתורים למטה, או לחץ על <b>חיפוש מותאם אישית</b> כדי להקליד מילת חיפוש משלך.",
-            parse_mode="HTML",
-            reply_markup=kb
-        )
+        log_info(f"[MS] prompt prod_search uid={uid} chat={c.message.chat.id}")
+        PROD_SEARCH_WAIT[uid] = True
+        PROD_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
+        try:
+            prompt = bot.send_message(
+                chat_id,
+                "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח).\n"
+                "טיפ: אם אתה בתוך קבוצה – *תענה/י* להודעה הזאת (Reply) כדי שהבוט יקבל את הטקסט.",
+                parse_mode='Markdown',
+                reply_markup=types.ForceReply(selective=True)
+            )
+            PROD_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
+        except Exception:
+            # Fallback without ForceReply
+            bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח)")
         bot.answer_callback_query(c.id)
         return
 
@@ -3826,6 +3818,63 @@ def handle_category_search_text(m):
 
 # ========= MANUAL PRODUCT SEARCH (text input) =========
 @bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
+
+def _extract_product_id_from_url(url: str) -> str | None:
+    if not url:
+        return None
+    u = str(url).strip()
+    m = re.search(r"/item/(\d+)\.html", u)
+    if m:
+        return m.group(1)
+    m = re.search(r"productId=(\d+)", u, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # last resort: first long number
+    m = re.search(r"(\d{10,})", u)
+    if m:
+        return m.group(1)
+    return None
+
+def _resolve_aliexpress_url(url: str, timeout: int = 12) -> str:
+    """Resolve s.click / short AliExpress links to the final URL."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+        return str(r.url or url)
+    except Exception:
+        return str(url)
+
+def _manual_search_from_url(uid: int, chat_id: int, url: str) -> bool:
+    """Try to fetch exact product via URL. Returns True if handled."""
+    final_url = _resolve_aliexpress_url(url)
+    pid = _extract_product_id_from_url(final_url)
+    if not pid:
+        log_warn(f"[MS] URL provided but product_id not found. url={url!r} final={final_url!r}")
+        bot.send_message(chat_id, "❗️לא הצלחתי לזהות מזהה מוצר מהקישור. נסה להדביק קישור מלא של מוצר (item/XXXX.html).")
+        return True
+
+    log_info(f"[MS] URL -> product_id={pid} | final={final_url!r}")
+    prods, rc, rm = affiliate_product_detail_get(pid)
+    if not prods:
+        bot.send_message(chat_id, f"❗️לא הצלחתי למשוך פרטי מוצר (resp_code={rc}): {rm}")
+        return True
+
+    row = _map_affiliate_product_to_row(prods[0])
+    MANUAL_SEARCH_SESS[uid] = {
+        "chat_id": chat_id,
+        "q": url,
+        "page": 1,
+        "per_page": 1,
+        "results": [row],
+        "raw_count": 1,
+        "reasons": {},
+        "resp_code": rc,
+        "resp_msg": rm,
+    }
+    _ms_send_current(uid=uid, chat_id=chat_id, as_new=True)
+    return True
+
+
 def handle_manual_product_search_text(m):
     """Handle admin keyword search that fetches affiliate products and adds them to queue.
 
@@ -3835,6 +3884,10 @@ def handle_manual_product_search_text(m):
     uid = m.from_user.id
     chat_id = m.chat.id
     q = (m.text or "").strip()
+    log_info(f"[MS] input uid={uid} chat={chat_id} q={q!r} type={m.chat.type}")
+    if "http://" in q or "https://" in q:
+        if _manual_search_from_url(uid=uid, chat_id=chat_id, url=q):
+            return
 
     # If in group/supergroup, require reply to the prompt message so bot will receive it.
     try:
@@ -4231,11 +4284,6 @@ while True:
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
-        # If another instance is polling (409), exit immediately so only ONE instance stays alive.
-        if ("Conflict: terminated by other getUpdates request" in msg) or ("Error code: 409" in msg) or ("getUpdates request" in msg and "Conflict" in msg):
-            log_error(f"Polling conflict (409): {e}. Exiting process to avoid losing callbacks/buttons.")
-            raise SystemExit(0)
-
-        wait = 5
+        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
         log_error(f"Polling error: {e}. Retrying in {wait}s...")
         time.sleep(wait)
