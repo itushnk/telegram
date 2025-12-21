@@ -3673,8 +3673,6 @@ def inline_menu():
     return kb
 
 # ========= INLINE CALLBACKS =========
-@bot.callback_query_handler(func=lambda c: True)
-
 def _prod_search_menu_text() -> str:
     # Main menu text for product search (manual)
     return (
@@ -3713,6 +3711,7 @@ def _prod_search_menu_kb():
     return kb
 
 
+@bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
 
