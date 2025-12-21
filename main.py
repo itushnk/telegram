@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21refill-diversify-v16")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20currencyfix")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -244,7 +244,6 @@ PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 SCHEDULE_FLAG_FILE      = os.path.join(BASE_DIR, "schedule_enforced.flag")
 CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
-BROADCAST_FLAG_FILE     = os.path.join(BASE_DIR, "broadcast_enabled.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
@@ -1444,10 +1443,6 @@ def post_to_channel(product) -> bool:
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
-    if not is_broadcast_enabled():
-        log_info(f"{source}: broadcast disabled (no send)")
-        return False
-
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
@@ -1498,24 +1493,6 @@ def read_auto_flag():
 def write_auto_flag(value):
     with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
         f.write(value)
-
-
-def read_broadcast_flag():
-    try:
-        with open(BROADCAST_FLAG_FILE, "r", encoding="utf-8") as f:
-            return (f.read() or "").strip() or "off"
-    except Exception:
-        return "off"
-
-def write_broadcast_flag(value: str):
-    with open(BROADCAST_FLAG_FILE, "w", encoding="utf-8") as f:
-        f.write(str(value or "off").strip())
-
-def is_broadcast_enabled() -> bool:
-    return (read_broadcast_flag().strip().lower() in ("1", "true", "yes", "on"))
-
-def set_broadcast_enabled(flag: bool):
-    write_broadcast_flag("on" if flag else "off")
 
 def get_auto_delay():
     now = _now_il().time()
@@ -1821,7 +1798,7 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     }
     payload = _top_call("aliexpress.affiliate.hotproduct.query", biz)
     resp = _extract_resp_result(payload)
-    resp_code = safe_int(resp.get("resp_code"), 200)
+    resp_code = resp.get("resp_code")
     resp_msg = resp.get("resp_msg")
 
     result = resp.get("result") or {}
@@ -1866,16 +1843,10 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     elif AE_KEYWORDS:
         kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS) if k.strip()]
         if kws:
-            mode = (os.environ.get("AE_REFILL_KEYWORD_MODE") or _get_state_str("refill_kw_mode", "random")).strip().lower()
-            if mode in ("rr", "roundrobin", "round-robin", "robin"):
-                idx = _get_state_int("refill_kw_idx", 0)
-                biz["keywords"] = kws[idx % len(kws)]
-                _set_state_str("refill_kw_idx", str(idx + 1))
-            else:
-                biz["keywords"] = random.choice(kws)
+            biz["keywords"] = kws[(page_no - 1) % len(kws)]
     payload = _top_call("aliexpress.affiliate.product.query", biz)
     resp = _extract_resp_result(payload)
-    resp_code = safe_int(resp.get("resp_code"), 200)
+    resp_code = resp.get("resp_code")
     resp_msg = resp.get("resp_msg")
 
     result = resp.get("result") or {}
@@ -1961,28 +1932,12 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
 
 
-def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_selected_categories: bool = False) -> tuple[int, int, int, int, str | None]:
-    """מילוי תור מהממשק Affiliate.
-
+def refill_from_affiliate(max_needed: int, keywords: str | None = None) -> tuple[int, int, int, int, str | None]:
+    """
     מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
-
-    יעדים:
-    - גיוון: איסוף ממספר מילות מפתח בסבב (Round-Robin) כדי לא לקבל "כל הזמן אותו הדבר".
-    - יציבות: TOP לעיתים מחזיר resp_msg='The result is empty' – זה לא שגיאה אלא סוף תוצאות.
-    - סינונים: מכבד MIN_ORDERS / MIN_RATING / FREE_SHIP_ONLY / AE_PRICE_BUCKETS לפני שמכניס לתור.
     """
     if not AE_APP_KEY or not AE_APP_SECRET or not AE_TRACKING_ID:
         return 0, 0, 0, 0, "חסרים AE_APP_KEY/AE_APP_SECRET/AE_TRACKING_ID"
-
-    # snapshot of current filters
-    min_orders = int(MIN_ORDERS or 0)
-    min_rating = float(MIN_RATING or 0.0)
-    free_ship_only = bool(FREE_SHIP_ONLY)
-
-    diversify = str(os.environ.get('AE_REFILL_DIVERSIFY', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
-    kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '6'), 6)
-    pages_per_kw = max(1, safe_int(os.environ.get('AE_REFILL_PAGES_PER_KEYWORD', '1'), 1))
-    max_per_bucket = max(1, safe_int(os.environ.get('AE_REFILL_MAX_PER_BUCKET', '12'), 12))
 
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
@@ -1992,100 +1947,15 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     dup = 0
     skipped_no_link = 0
     skipped_price = 0
-    last_error: str | None = None
+    last_error = None
     last_page = 0
+    last_resp = None
 
-    # -------- helpers --------
-    def _parse_env_keywords() -> list[str]:
-        kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS or "") if k.strip()]
-        # Dedup preserve order
-        out = []
-        seen = set()
-        for k in kws:
-            kk = k.lower().strip()
-            if kk in seen:
-                continue
-            seen.add(kk)
-            out.append(k)
-        return out
-
-    def _choose_keywords_for_cycle() -> list[str | None]:
-        # if explicit keywords passed (manual override) – use only it
-        if keywords and str(keywords).strip():
-            return [str(keywords).strip()]
-        kws = _parse_env_keywords()
-        if not kws:
-            return [None]  # will use hotproduct
-        # sample multiple keywords for diversity
-        if kw_per_cycle <= 0:
-            return kws
-        if len(kws) <= kw_per_cycle:
-            return kws
-        try:
-            return random.sample(kws, kw_per_cycle)
-        except Exception:
-            random.shuffle(kws)
-            return kws[:kw_per_cycle]
-
-    def _bucket_key(kw_used: str | None) -> str:
-        if not kw_used:
-            return 'hot'
-        # stable short bucket label
-        s = re.sub(r"\s+", " ", str(kw_used).strip().lower())
-        s = re.sub(r"[^a-z0-9\- _]", "", s)
-        if len(s) > 40:
-            s = s[:40].rstrip()
-        return s or 'kw'
-
-    def _passes_filters(row: dict) -> bool:
-        nonlocal skipped_price
-        if AE_PRICE_BUCKETS:
-            sale_num = _extract_float(row.get("SalePrice") or "")
-            if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
-                skipped_price += 1
-                return False
-        if min_orders:
-            o = safe_int(row.get("Orders") or "0", 0)
-            if o < min_orders:
-                return False
-        if min_rating:
-            r = _extract_float(row.get("Rating") or "")
-            if r is None or float(r) < min_rating:
-                return False
-        if free_ship_only:
-            # in this bot logic: treat "free ship" threshold as min sale price
-            sale_num = _extract_float(row.get("SalePrice") or "")
-            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-                return False
-        if not row.get("BuyLink"):
-            return False
-        return True
-
-    # -------- categories selected (optional) --------
-    selected_cats = [] if ignore_selected_categories else get_selected_category_ids()
-
-    # candidates: list of tuples(row, bucket)
-    candidates: list[tuple[dict, str]] = []
-    bucket_raw_counts: dict[str, int] = {}
-    bucket_after_filters: dict[str, int] = {}
-
-    def _add_candidate(row: dict, bucket: str):
-        nonlocal dup
-        k = _key_of_row(row)
-        if k in existing_keys:
-            dup += 1
-            return
-        if not _passes_filters(row):
-            return
-        existing_keys.add(k)
-        candidates.append((row, bucket))
-        bucket_after_filters[bucket] = bucket_after_filters.get(bucket, 0) + 1
-
-    # Fetching strategy
-    kw_list = _choose_keywords_for_cycle()
-
+    
+    # Build active filters snapshot
+    selected_cats = get_selected_category_ids()
+    # Distribute evenly if categories selected
     if selected_cats:
-        # distribute max_needed across selected categories, still with keyword variety per category
         n = len(selected_cats)
         base = max_needed // n
         rem = max_needed % n
@@ -2095,190 +1965,216 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
             if need > 0:
                 per_cat.append((cid, need))
 
-        # pages per category is limited
         max_pages_per_cat = max(1, AE_REFILL_MAX_PAGES // max(1, len(per_cat)))
 
         for (cat_id, need_cat) in per_cat:
             got_cat = 0
-            for kw_used in kw_list:
-                if got_cat >= need_cat or len(candidates) >= (max_needed * 5):
-                    break
-                for page_no in range(1, max_pages_per_cat + 1):
-                    last_page = page_no
-                    try:
-                        products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=str(cat_id), keywords=kw_used)
-                        # treat empty as end-of-results
-                        if resp_msg and 'result is empty' in str(resp_msg).lower():
-                            products = []
-                            resp_code = 200
-                    except Exception as e:
-                        last_error = f"category_id={cat_id} kw={kw_used} page={page_no} error={type(e).__name__}: {e}"
-                        break
+            last_page = 0
+            for page_no in range(1, max_pages_per_cat + 1):
+                last_page = page_no
+                try:
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id, keywords=keywords)
+                    last_resp = (resp_code, resp_msg, len(products))
 
                     if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
                         last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
                         break
+
                     if not products:
                         break
 
-                    try:
-                        random.shuffle(products)
-                    except Exception:
-                        pass
-
-                    b = _bucket_key(kw_used) + f"|cat:{cat_id}"
-                    bucket_raw_counts[b] = bucket_raw_counts.get(b, 0) + len(products)
+                    new_rows = []
                     for p in products:
                         row = _map_affiliate_product_to_row(p)
-                        if not row.get('BuyLink'):
+
+                        # Filters
+                        if AE_PRICE_BUCKETS:
+                            sale_num = _extract_float(row.get("SalePrice") or "")
+                            if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                                skipped_price += 1
+                                continue
+
+                        if MIN_ORDERS:
+                            o = safe_int(row.get("Orders") or "0", 0)
+                            if o < int(MIN_ORDERS):
+                                continue
+
+                        if MIN_RATING:
+                            r = _extract_float(row.get("Rating") or "")
+                            if r is None or float(r) < float(MIN_RATING):
+                                continue
+
+                        if FREE_SHIP_ONLY:
+                            sale_num = _extract_float(row.get("SalePrice") or "")
+                            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                                continue
+
+                        if not row.get("BuyLink"):
+                            skipped_no_link += 1
                             continue
-                        if not row.get('BuyLink'):
+
+                        k = _key_of_row(row)
+                        if k in existing_keys:
+                            dup += 1
                             continue
-                        _add_candidate(row, b)
+                        existing_keys.add(k)
+                        new_rows.append(row)
                         got_cat += 1
                         if got_cat >= need_cat:
                             break
-                    if got_cat >= need_cat:
+
+                    # AI enrichment (optional)
+                    if ai_auto_mode() and GPT_ON_REFILL and new_rows:
+                        try:
+                            upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
+                            if err:
+                                logging.warning(f"[AI] enrich warning: {err}")
+                            elif upd:
+                                logging.info(f"[AI] enriched {upd} items on refill")
+                        except Exception as _e:
+                            logging.warning(f"[AI] enrich failed: {_e}")
+                    if new_rows:
+                        with FILE_LOCK:
+                            pending_rows = read_products(PENDING_CSV)
+                            pending_rows.extend(new_rows)
+                            write_products(PENDING_CSV, pending_rows)
+                        added += len(new_rows)
+
+                    if got_cat >= need_cat or added >= max_needed:
                         break
 
-            if got_cat >= need_cat:
-                continue
+                except Exception as e:
+                    last_error = str(e)
+                    break
+
+            if added >= max_needed:
+                break
 
     else:
-        # no categories selected
-        # strategy:
-        # - if we have kw_list with real keywords => query product.query per keyword (pages_per_kw)
-        # - else => use hotproduct
-        for kw_used in kw_list:
-            if len(candidates) >= (max_needed * 5):
-                break
-            for page_no in range(1, pages_per_kw + 1):
-                last_page = page_no
-                try:
-                    if kw_used:
-                        products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None, keywords=kw_used)
-                    else:
-                        products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
-
-                    if resp_msg and 'result is empty' in str(resp_msg).lower():
-                        products = []
-                        resp_code = 200
-                except Exception as e:
-                    last_error = f"kw={kw_used} page={page_no} error={type(e).__name__}: {e}"
-                    continue
+        # No categories selected:
+        # - If admin provided keywords: use affiliate.product.query with those keywords.
+        # - Otherwise: use HotProduct feed (most stable) + optional AE_KEYWORDS fallback.
+        for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
+            last_page = page_no
+            try:
+                if keywords:
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None, keywords=keywords)
+                else:
+                    products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
+                    # Fallback: some accounts/params return empty from hotproduct query.
+                    # If AE_KEYWORDS exists, try affiliate.product.query with rotating keywords.
+                    if (not products) and AE_KEYWORDS:
+                        try:
+                            products2, rc2, rm2 = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
+                            if products2:
+                                products, resp_code, resp_msg = products2, rc2, rm2
+                        except Exception:
+                            pass
+                last_resp = (resp_code, resp_msg, len(products))
 
                 if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
                     last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
-                    continue
+                    break
 
                 if not products:
                     break
 
-                try:
-                    random.shuffle(products)
-                except Exception:
-                    pass
-
-                b = _bucket_key(kw_used)
-                bucket_raw_counts[b] = bucket_raw_counts.get(b, 0) + len(products)
-
+                new_rows = []
                 for p in products:
                     row = _map_affiliate_product_to_row(p)
+
+                    if AE_PRICE_BUCKETS:
+                        sale_num = _extract_float(row.get("SalePrice") or "")
+                        if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                            skipped_price += 1
+                            continue
+
+                    if MIN_ORDERS:
+                        o = safe_int(row.get("Orders") or "0", 0)
+                        if o < int(MIN_ORDERS):
+                            continue
+
+                    if MIN_RATING:
+                        r = _extract_float(row.get("Rating") or "")
+                        if r is None or float(r) < float(MIN_RATING):
+                            continue
+
+                    if FREE_SHIP_ONLY:
+                        sale_num = _extract_float(row.get("SalePrice") or "")
+                        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                            continue
+
                     if not row.get("BuyLink"):
                         skipped_no_link += 1
                         continue
-                    _add_candidate(row, b)
 
-    # -------- Diversified selection into queue --------
-    # group by bucket
-    by_bucket: dict[str, list[dict]] = {}
-    for row, b in candidates:
-        by_bucket.setdefault(b, []).append(row)
+                    k = _key_of_row(row)
+                    if k in existing_keys:
+                        dup += 1
+                        continue
+                    existing_keys.add(k)
+                    new_rows.append(row)
 
-    for b in by_bucket:
-        try:
-            random.shuffle(by_bucket[b])
-        except Exception:
-            pass
+                # AI enrichment (optional)
+                if ai_auto_mode() and GPT_ON_REFILL and new_rows:
+                    try:
+                        upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
+                        if err:
+                            logging.warning(f"[AI] enrich warning: {err}")
+                        elif upd:
+                            logging.info(f"[AI] enriched {upd} items on refill")
+                    except Exception as _e:
+                        logging.warning(f"[AI] enrich failed: {_e}")
+                if new_rows:
+                    with FILE_LOCK:
+                        pending_rows = read_products(PENDING_CSV)
+                        pending_rows.extend(new_rows)
+                        write_products(PENDING_CSV, pending_rows)
+                    added += len(new_rows)
 
-    selected: list[dict] = []
-    selected_counts: dict[str, int] = {b: 0 for b in by_bucket}
-
-    buckets = list(by_bucket.keys())
-    try:
-        random.shuffle(buckets)
-    except Exception:
-        pass
-
-    # If not diversifying, just flatten randomly
-    if not diversify:
-        flat = []
-        for b in buckets:
-            flat.extend(by_bucket[b])
-        try:
-            random.shuffle(flat)
-        except Exception:
-            pass
-        selected = flat[:max_needed]
-    else:
-        # round-robin across buckets
-        progress = True
-        while len(selected) < max_needed and progress:
-            progress = False
-            for b in list(buckets):
-                if len(selected) >= max_needed:
+                if added >= max_needed:
                     break
-                if selected_counts.get(b, 0) >= max_per_bucket:
-                    continue
-                lst = by_bucket.get(b) or []
-                if not lst:
-                    continue
-                row = lst.pop(0)
-                selected.append(row)
-                selected_counts[b] = selected_counts.get(b, 0) + 1
-                progress = True
 
-    # logs for debugging diversity
-    try:
-        top_buckets = sorted(selected_counts.items(), key=lambda x: x[1], reverse=True)
-        logging.info(f"[REFILL] kw_cycle={kw_list} raw_by_bucket={bucket_raw_counts} after_filters={bucket_after_filters} selected={dict(top_buckets)}")
-    except Exception:
-        pass
-
-    # AI enrichment (optional) before writing
-    if ai_auto_mode() and GPT_ON_REFILL and selected:
-        try:
-            upd, err = ai_enrich_rows(selected, reason="refill_from_affiliate")
-            if err:
-                logging.warning(f"[AI] enrich warning: {err}")
-            elif upd:
-                logging.info(f"[AI] enriched {upd} items on refill")
-        except Exception as _e:
-            logging.warning(f"[AI] enrich failed: {_e}")
-
-    if selected:
-        with FILE_LOCK:
-            pending_rows = read_products(PENDING_CSV)
-            pending_rows.extend(selected)
-            write_products(PENDING_CSV, pending_rows)
-        added = len(selected)
+            except Exception as e:
+                last_error = str(e)
+                break
 
     with FILE_LOCK:
         total_after = len(read_products(PENDING_CSV))
 
-    # If we found nothing, provide a helpful message
-    if added == 0 and not last_error:
-        # usually because filters are too strict
-        msg = []
-        if min_orders:
-            msg.append(f"מינימום הזמנות={min_orders}")
-        if min_rating:
-            msg.append(f"מינימום דירוג={min_rating}")
-        if free_ship_only:
-            msg.append("משלוח חינם=פעיל")
-        last_error = "לא נמצאו תוצאות שמתאימות לסינונים" + (" (" + ", ".join(msg) + ")" if msg else "")
-
+    if added == 0 and last_error is None:
+        if skipped_no_link > 0:
+            last_error = (
+                "⚠️ התקבלו מוצרים אבל כולם בלי promotion_link. "
+                "בדרך כלל זה אומר ש-AE_TRACKING_ID לא תקין/לא משויך לחשבון האפילייט שלך. "
+                f"(skipped_no_link={skipped_no_link}, last_resp={last_resp})"
+            )
+        elif last_resp is not None:
+            rc, rm, n = last_resp
+            last_error = f"0 מוצרים (resp_code={rc}, resp_msg={rm}, ship_to={AE_SHIP_TO_COUNTRY}, sort={AE_REFILL_SORT})"
+    # update last stats snapshot
+    try:
+        LAST_REFILL_STATS.update({
+            'added': added,
+            'dup': dup,
+            'skipped_no_link': skipped_no_link,
+            'price_filtered': skipped_price,
+            'last_error': last_error,
+            'last_page': last_page,
+        })
+    except Exception:
+        pass
     return added, dup, total_after, last_page, last_error
+
+# ========= INLINE MENU =========
+PRICE_BUCKET_PRESETS = [
+    ("1-5", "1-5"),
+    ("5-10", "5-10"),
+    ("10-20", "10-20"),
+    ("20-50", "20-50"),
+    ("50+", "50+"),
+]
+
 def _active_price_bucket_ids():
     raw = (AE_PRICE_BUCKETS_RAW or "").strip()
     if not raw:
@@ -2427,7 +2323,6 @@ CAT_LAST_QUERY: dict[int, str] = {}     # uid -> last search query
 CAT_SEARCH_WAIT: dict[int, bool] = {}   # uid -> waiting for text query?
 CAT_SEARCH_CTX: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id)
 
-CAT_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
 # --- Manual PRODUCT search UI state (per admin user) ---
 # This is separate from category search. It lets admins type a keyword
 # and the bot will fetch products from AliExpress Affiliate API and add
@@ -2435,288 +2330,6 @@ CAT_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_me
 PROD_SEARCH_WAIT: dict[int, bool] = {}        # uid -> waiting for keyword text?
 PROD_SEARCH_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
 PROD_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
-
-# --- Set post interval (minutes) prompt state ---
-DELAY_SET_WAIT: dict[int, bool] = {}        # uid -> waiting for minutes text?
-DELAY_SET_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
-DELAY_SET_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
-
-# --- Manual PRODUCT search preview session (per admin user) ---
-# Stores last fetched results for a keyword so you can review what was found BEFORE adding to queue.
-MANUAL_SEARCH_SESS: dict[int, dict] = {}  # uid -> {q, page, per_page, results:[{row,ok,reason}], idx}
-MANUAL_SEARCH_MSG: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id) last preview message
-
-
-def _ms_clear(uid: int):
-    """Clear manual search session and delete last preview message if exists."""
-    try:
-        ctx = MANUAL_SEARCH_MSG.pop(uid, None)
-        if ctx:
-            _safe_delete(ctx[0], ctx[1])
-    except Exception:
-        pass
-    MANUAL_SEARCH_SESS.pop(uid, None)
-
-def _ms_active_filters_text() -> str:
-    parts = []
-    if AE_PRICE_BUCKETS_RAW:
-        parts.append(f"💸 מחיר: {AE_PRICE_BUCKETS_RAW}")
-    if MIN_ORDERS:
-        parts.append(f"📦 מינ' הזמנות: {MIN_ORDERS}")
-    if MIN_RATING:
-        try:
-            parts.append(f"⭐ מינ' דירוג: {float(MIN_RATING):g}%")
-        except Exception:
-            parts.append(f"⭐ מינ' דירוג: {MIN_RATING}%")
-    if FREE_SHIP_ONLY:
-        parts.append(f"🚚 משלוח חינם (>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g})")
-    cats = get_selected_category_ids()
-    if cats:
-        parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
-    return " | ".join(parts) if parts else "ללא"
-
-def _ms_keyword_match(title: str, q: str) -> bool:
-    """Best-effort strictness to reduce unrelated results in manual search."""
-    try:
-        t = (title or "").lower()
-        qq = (q or "").lower().strip()
-        if not qq or not t:
-            return True
-        toks = [x for x in re.split(r"[^\w\u0590-\u05FF]+", qq) if len(x) >= 2]
-        if not toks:
-            toks = [qq]
-        hits = sum(1 for tok in toks if tok in t)
-        need = 1 if len(toks) <= 2 else 2
-        return hits >= need
-    except Exception:
-        return True
-
-def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
-    """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
-    # Price buckets
-    if AE_PRICE_BUCKETS:
-        sale_num = _extract_float(row.get("SalePrice") or "")
-        if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
-            return False, "מחוץ לסינון מחיר"
-    # Orders
-    if MIN_ORDERS:
-        o = safe_int(row.get("Orders") or "0", 0)
-        if o < int(MIN_ORDERS):
-            return False, f"פחות מ-{MIN_ORDERS} הזמנות"
-    # Rating
-    if MIN_RATING:
-        r = _extract_float(row.get("Rating") or "")
-        if r is None or float(r) < float(MIN_RATING):
-            return False, f"דירוג נמוך מ-{MIN_RATING}%"
-    # Free ship only (our heuristic threshold)
-    if FREE_SHIP_ONLY:
-        sale_num = _extract_float(row.get("SalePrice") or "")
-        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-            return False, f"מתחת לסף משלוח חינם ₪{AE_FREE_SHIP_THRESHOLD_ILS:g}"
-    # Buy link
-    if not (row.get("BuyLink") or "").strip():
-        return False, "אין קישור רכישה"
-    return True, ""
-
-def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False) -> dict:
-    """Fetch one page from AliExpress Affiliate API and prepare preview session."""
-    # IMPORTANT: For manual search we default to ALL categories (category_id=None),
-    # so the keyword is the primary selector.
-    cat_id = None
-    if use_selected_categories:
-        cats = get_selected_category_ids()
-        cat_id = cats[0] if cats else None  # keep it simple: first selected
-    products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=q)
-
-    # Map and evaluate
-    results = []
-    raw_count = 0
-    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "free_ship": 0, "other": 0}
-    for p in (products or []):
-        raw_count += 1
-        row = _map_affiliate_product_to_row(p)
-        ok, reason = _ms_eval_row_filters(row)
-        # Extra strictness: reduce unrelated results (keyword must match title)
-        if ok and not _ms_keyword_match(row.get('Title') or '', q):
-            ok, reason = False, "לא תואם מילת החיפוש"
-        if not ok:
-            # bucket reasons (best-effort)
-            if "קישור" in reason:
-                reasons["no_link"] += 1
-            elif "מחיר" in reason:
-                reasons["price"] += 1
-            elif "הזמנות" in reason:
-                reasons["orders"] += 1
-            elif "דירוג" in reason:
-                reasons["rating"] += 1
-            elif "משלוח" in reason:
-                reasons["free_ship"] += 1
-            else:
-                reasons["other"] += 1
-        results.append({"row": row, "ok": ok, "reason": reason})
-
-    sess = {
-        "q": q,
-        "page": page,
-        "per_page": per_page,
-        "idx": 0,
-        "results": results,
-        "raw_count": raw_count,
-        "resp_code": resp_code,
-        "resp_msg": resp_msg,
-        "reasons": reasons,
-        "use_selected_categories": bool(use_selected_categories),
-    }
-    MANUAL_SEARCH_SESS[uid] = sess
-    return sess
-
-def _ms_kb(uid: int) -> 'types.InlineKeyboardMarkup':
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    sess = MANUAL_SEARCH_SESS.get(uid) or {}
-    results = sess.get("results") or []
-    idx = int(sess.get("idx") or 0)
-    idx = max(0, min(idx, max(0, len(results)-1))) if results else 0
-    sess["idx"] = idx
-
-    # nav
-    kb.row(
-        types.InlineKeyboardButton("⬅️", callback_data="ms_prev"),
-        types.InlineKeyboardButton("➡️", callback_data="ms_next"),
-    )
-
-    kb.row(
-        types.InlineKeyboardButton("➕ הוסף לתור", callback_data="ms_add_one"),
-        types.InlineKeyboardButton("➕➕ הוסף את כל הדף", callback_data="ms_add_page"),
-    )
-
-    kb.row(
-        types.InlineKeyboardButton("📄 דף קודם", callback_data="ms_page_prev"),
-        types.InlineKeyboardButton("📄 דף הבא", callback_data="ms_page_next"),
-    )
-
-    kb.row(
-        types.InlineKeyboardButton("🧹 נקה סשן", callback_data="ms_close"),
-        types.InlineKeyboardButton("⬅️ תפריט", callback_data="ms_back"),
-    )
-    return kb
-
-def _ms_caption(uid: int) -> tuple[str, str | None]:
-    """Return (caption, image_url_or_none) for current result."""
-    sess = MANUAL_SEARCH_SESS.get(uid) or {}
-    q = str(sess.get("q") or "").strip()
-    page = int(sess.get("page") or 1)
-    results = sess.get("results") or []
-    if not results:
-        resp_code = sess.get("resp_code")
-        resp_msg = sess.get("resp_msg")
-        reasons = sess.get("reasons") or {}
-        raw_count = int(sess.get("raw_count") or 0)
-        flt = _ms_active_filters_text()
-        info = (
-            f"🔎 חיפוש ידני: <b>{html.escape(q)}</b>\n"
-            f"דף: {page}\n"
-            f"סינונים פעילים: {html.escape(flt)}\n\n"
-        )
-        if raw_count > 0:
-            info += (
-                f"מצאתי {raw_count} תוצאות גולמיות אבל אף אחת לא עברה את הסינונים.\n"
-                f"נפסלו: ללא קישור={reasons.get('no_link',0)} | מחיר={reasons.get('price',0)} | הזמנות={reasons.get('orders',0)} | דירוג={reasons.get('rating',0)} | משלוח={reasons.get('free_ship',0)}\n\n"
-            )
-        info += f"resp_code={resp_code} resp_msg={html.escape(str(resp_msg or ''))}"
-        return info, None
-
-    idx = int(sess.get("idx") or 0)
-    idx = max(0, min(idx, len(results)-1))
-    sess["idx"] = idx
-    item = results[idx]
-    row = item.get("row") or {}
-    ok = bool(item.get("ok"))
-    reason = str(item.get("reason") or "").strip()
-
-    title = str(row.get("Title") or "").strip()
-    if len(title) > 120:
-        title = title[:117] + "…"
-
-    sale = str(row.get("SalePrice") or "").strip()
-    orig = str(row.get("OriginalPrice") or "").strip()
-    rating = str(row.get("Rating") or "").strip()
-    orders = str(row.get("Orders") or "").strip()
-    link = str(row.get("BuyLink") or "").strip()
-    img = str(row.get("ImageURL") or "").strip() or None
-
-    status_line = "✅ עומד בסינונים" if ok else f"🚫 נפסל: {html.escape(reason)}"
-    flt = _ms_active_filters_text()
-
-    caption = (
-        f"🔎 חיפוש ידני: <b>{html.escape(q)}</b>\n"
-        f"תוצאה {idx+1}/{len(results)} | דף {page}\n"
-        f"סינונים פעילים: {html.escape(flt)}\n"
-        f"{status_line}\n\n"
-        f"<b>{html.escape(title)}</b>\n"
-        f"💰 {html.escape(sale)} (מקורי {html.escape(orig)})\n"
-        f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}\n"
-        f"🔗 {html.escape(link)}"
-    )
-    return caption, img
-
-def _ms_show(uid: int, chat_id: int, force_new: bool = True):
-    """Show current manual-search preview item."""
-    cap, img = _ms_caption(uid)
-    kb = _ms_kb(uid)
-
-    # delete previous preview message to keep the chat clean
-    try:
-        prev = MANUAL_SEARCH_MSG.get(uid)
-        if prev and prev[0] == chat_id:
-            _safe_delete(prev[0], prev[1])
-    except Exception:
-        pass
-
-    try:
-        if img:
-            msg = bot.send_photo(chat_id, img, caption=cap, parse_mode="HTML", reply_markup=kb)
-        else:
-            msg = bot.send_message(chat_id, cap, parse_mode="HTML", reply_markup=kb)
-        MANUAL_SEARCH_MSG[uid] = (chat_id, msg.message_id)
-    except Exception as e:
-        # fallback to text
-        msg = bot.send_message(chat_id, cap + f"\n\n(שגיאת תמונה: {e})", parse_mode="HTML", reply_markup=kb)
-        MANUAL_SEARCH_MSG[uid] = (chat_id, msg.message_id)
-
-def _ms_add_rows_to_queue(rows: list[dict]) -> tuple[int, int, int]:
-    """Add rows to pending queue with dedupe. Returns (added, dups, total_after)."""
-    if not rows:
-        with FILE_LOCK:
-            total = len(read_products(PENDING_CSV))
-        return 0, 0, total
-
-    with FILE_LOCK:
-        pending = read_products(PENDING_CSV)
-        existing = {_key_of_row(r) for r in pending}
-        added = 0
-        dups = 0
-        for r in rows:
-            k = _key_of_row(r)
-            if k in existing:
-                dups += 1
-                continue
-            existing.add(k)
-            pending.append(r)
-            added += 1
-        write_products(PENDING_CSV, pending)
-        total = len(pending)
-    return added, dups, total
-
-def _ms_start(uid: int, chat_id: int, q: str):
-    q = (q or "").strip()
-    if not q:
-        bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש.")
-        return
-    # reset session and fetch first page
-    _ms_clear(uid)
-    bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} (שולח ל-AliExpress בדיוק כפי שהזנת)")
-    _ms_fetch_page(uid, q=q, page=1, per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10), use_selected_categories=False)
-    _ms_show(uid, chat_id)
 
 # Keywords used to shrink the category list in "top" mode (Hebrew+English)
 CATEGORY_TOP_KEYWORDS = [
@@ -2811,8 +2424,6 @@ def _categories_menu_kb(page: int = 0, per_page: int = 10, mode: str = "top", ui
         switch_row.append(types.InlineKeyboardButton("📚 כל הקטגוריות", callback_data="fc_all_0"))
     switch_row.append(types.InlineKeyboardButton("🔎 חיפוש", callback_data="fc_search"))
     kb.row(*switch_row[:2]) if len(switch_row) == 2 else kb.row(*switch_row)
-    if mode == "search" and query:
-        kb.row(types.InlineKeyboardButton("🛒 חפש מוצרים למילת החיפוש", callback_data="prod_search_last"))
 
     # Actions
     kb.row(
@@ -2913,28 +2524,7 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
             CAT_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
             kb = types.InlineKeyboardMarkup(row_width=1)
             kb.add(types.InlineKeyboardButton("⬅️ חזרה לקטגוריות", callback_data="fc_menu_0"))
-
-            # Ask for keyword (in groups, user must Reply to this prompt due to privacy mode)
-            try:
-                prompt = bot.send_message(
-                    chat_id,
-                    "🔎 שלח עכשיו מילת חיפוש לסינון קטגוריות (לדוגמה: iPhone / שעון / בית / כלי עבודה).\n"
-                    "טיפ: בקבוצה צריך לעשות *Reply* להודעה הזאת כדי שהבוט יקבל את הטקסט.",
-                    parse_mode="Markdown",
-                    reply_markup=types.ForceReply(selective=True),
-                )
-                CAT_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
-            except Exception:
-                bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש לסינון קטגוריות (לדוגמה: iPhone / שעון / בית / כלי עבודה).")
-
-            safe_edit_message(
-                bot,
-                chat_id=chat_id,
-                message=c.message,
-                new_text="🔎 מחכה למילת חיפוש…",
-                reply_markup=kb,
-                cb_id=None,
-            )
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔎 שלח עכשיו מילת חיפוש לקטגוריה (לדוגמה: iPhone / שעון / בית / כלי עבודה)", reply_markup=kb, cb_id=None)
             return True
 
         # toggle category selection
@@ -3176,16 +2766,12 @@ def inline_menu():
         types.InlineKeyboardButton(f"🔁 המרת $→₪: {conv_state}", callback_data="toggle_usd2ils_convert"),
     )
 
-    bc_state = "פעיל" if is_broadcast_enabled() else "כבוי"
+
     kb.add(
-        types.InlineKeyboardButton(f"🎙️ שידור: {bc_state}", callback_data="toggle_broadcast"),
-    )
-
-
-
-    cur_mins = max(1, int(POST_DELAY_SECONDS // 60))
-    kb.add(
-        types.InlineKeyboardButton(f"⏱️ מרווח פרסום: {cur_mins} דק׳ (עריכה)", callback_data="set_delay_minutes"),
+        types.InlineKeyboardButton("⏱️ דקה", callback_data="delay_60"),
+        types.InlineKeyboardButton("⏱️ 20ד", callback_data="delay_1200"),
+        types.InlineKeyboardButton("⏱️ 25ד", callback_data="delay_1500"),
+        types.InlineKeyboardButton("⏱️ 30ד", callback_data="delay_1800"),
     )
 
     kb.add(
@@ -3196,10 +2782,6 @@ def inline_menu():
 
     kb.add(
         types.InlineKeyboardButton("🔥 מלא מהאפילייט עכשיו", callback_data="refill_now"),
-        types.InlineKeyboardButton("🔥 אפילייט (כל הקטגוריות)", callback_data="refill_now_all"),
-    )
-
-    kb.add(
         types.InlineKeyboardButton("🔎 חיפוש ידני", callback_data="prod_search"),
         types.InlineKeyboardButton("₪ המרת $→₪ (לקובץ הבא)", callback_data="convert_next"),
         types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"),
@@ -3242,32 +2824,6 @@ def on_inline_click(c):
         return
 
     # --- Manual product keyword search ---
-    
-    if data == "prod_search_last":
-        uid = c.from_user.id
-        q = (CAT_LAST_QUERY.get(uid) or "").strip()
-        if not q:
-            bot.answer_callback_query(c.id, "אין מילת חיפוש פעילה.")
-            return
-        bot.answer_callback_query(c.id)
-        _ms_start(uid=uid, chat_id=chat_id, q=q)
-        return
-        bot.answer_callback_query(c.id, "מחפש…")
-        # Run product search immediately and add to queue (no AI)
-        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}")
-        added, dups, total_after, last_page, err = refill_from_affiliate(AE_REFILL_MIN_QUEUE, keywords=q)
-        if err:
-            bot.send_message(chat_id, f"⚠️ החיפוש הסתיים עם הודעה: {err}")
-        bot.send_message(
-            chat_id,
-            f"✅ סיום חיפוש עבור: {q}\n"
-            f"נוספו לתור: {added}\n"
-            f"כפולים שנדחו: {dups}\n"
-            f"סה״כ בתור: {total_after}\n"
-            f"עמוד אחרון שנבדק: {last_page}"
-        )
-        return
-
     if data == "prod_search":
         uid = c.from_user.id
         PROD_SEARCH_WAIT[uid] = True
@@ -3284,87 +2840,6 @@ def on_inline_click(c):
         except Exception:
             # Fallback without ForceReply
             bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח)")
-        bot.answer_callback_query(c.id)
-        return
-
-
-    # --- Manual product search preview callbacks (ms_*) ---
-    if data.startswith("ms_"):
-        uid = c.from_user.id
-        sess = MANUAL_SEARCH_SESS.get(uid)
-        if not sess:
-            bot.answer_callback_query(c.id, "אין סשן חיפוש פעיל.", show_alert=True)
-            return
-
-        q = str(sess.get("q") or "").strip()
-        page = int(sess.get("page") or 1)
-        per_page = int(sess.get("per_page") or 10)
-
-        def _refresh():
-            _ms_show(uid, chat_id)
-
-        if data == "ms_back":
-            bot.answer_callback_query(c.id)
-            _ms_clear(uid)
-            bot.send_message(chat_id, "✅ תפריט ראשי", reply_markup=inline_menu())
-            return
-
-        if data == "ms_close":
-            bot.answer_callback_query(c.id, "נסגר.")
-            _ms_clear(uid)
-            return
-
-        if data == "ms_prev":
-            sess["idx"] = max(0, int(sess.get("idx") or 0) - 1)
-            bot.answer_callback_query(c.id)
-            _refresh()
-            return
-
-        if data == "ms_next":
-            results = sess.get("results") or []
-            sess["idx"] = min(max(0, len(results)-1), int(sess.get("idx") or 0) + 1) if results else 0
-            bot.answer_callback_query(c.id)
-            _refresh()
-            return
-
-        if data == "ms_page_next":
-            bot.answer_callback_query(c.id, "טוען דף הבא…")
-            _ms_fetch_page(uid, q=q, page=page + 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")))
-            _refresh()
-            return
-
-        if data == "ms_page_prev":
-            if page <= 1:
-                bot.answer_callback_query(c.id, "זה כבר הדף הראשון.")
-                return
-            bot.answer_callback_query(c.id, "טוען דף קודם…")
-            _ms_fetch_page(uid, q=q, page=page - 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")))
-            _refresh()
-            return
-
-        if data == "ms_add_one":
-            results = sess.get("results") or []
-            idx = int(sess.get("idx") or 0)
-            if not results:
-                bot.answer_callback_query(c.id, "אין תוצאות להוסיף.", show_alert=True)
-                return
-            idx = max(0, min(idx, len(results)-1))
-            item = results[idx]
-            if not item.get("ok"):
-                bot.answer_callback_query(c.id, f"לא נוסף: {item.get('reason')}", show_alert=True)
-                return
-            row = item.get("row") or {}
-            added, dups, total = _ms_add_rows_to_queue([row])
-            bot.answer_callback_query(c.id, f"נוסף: {added} | כפול: {dups} | בתור: {total}")
-            return
-
-        if data == "ms_add_page":
-            results = sess.get("results") or []
-            ok_rows = [it.get("row") for it in results if it.get("ok") and it.get("row")]
-            added, dups, total = _ms_add_rows_to_queue(ok_rows)
-            bot.answer_callback_query(c.id, f"נוספו: {added} | כפולים: {dups} | בתור: {total}", show_alert=True)
-            return
-
         bot.answer_callback_query(c.id)
         return
 
@@ -3503,9 +2978,6 @@ def on_inline_click(c):
         return
 
     if data == "publish_now":
-        if not is_broadcast_enabled():
-            bot.answer_callback_query(c.id, "⛔ שידור כבוי. הפעל שידור כדי לפרסם.", show_alert=True)
-            return
         ok = send_next_locked("manual")
         if not ok:
             bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
@@ -3642,37 +3114,6 @@ def on_inline_click(c):
         except Exception as e:
             bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
 
-
-    elif data == "toggle_broadcast":
-        new_flag = not is_broadcast_enabled()
-        set_broadcast_enabled(new_flag)
-        # wake loops
-        try:
-            DELAY_EVENT.set()
-        except Exception:
-            pass
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🎛️ עודכן מצב שידור.", reply_markup=inline_menu())
-        bot.answer_callback_query(c.id, "שידור הופעל ✅" if new_flag else "שידור כובה ⛔", show_alert=True)
-        return
-
-    elif data == "set_delay_minutes":
-        uid = c.from_user.id
-        DELAY_SET_WAIT[uid] = True
-        DELAY_SET_CTX[uid] = (chat_id, c.message.message_id)
-        try:
-            prompt = bot.send_message(
-                chat_id,
-                "⏱️ שלח מספר דקות בין פרסום לפרסום (לדוגמה: 20).\n"
-                "טיפ: אם אתה בתוך קבוצה – *תענה/י* להודעה הזאת (Reply) כדי שהבוט יקבל את הטקסט.",
-                parse_mode='Markdown',
-                reply_markup=types.ForceReply(selective=True)
-            )
-            DELAY_SET_PROMPT[uid] = (chat_id, prompt.message_id)
-        except Exception:
-            pass
-        bot.answer_callback_query(c.id)
-        return
-
     elif data == "toggle_auto_mode":
         current = read_auto_flag()
         new_mode = "off" if current == "on" else "on"
@@ -3757,6 +3198,7 @@ def on_inline_click(c):
         msg_txt = "🧹 workfile.csv אופס לריק (נשמרו רק כותרות). התור לא שונה." if ok else "שגיאה במחיקת workfile.csv"
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id)
+
     elif data == "refill_now":
         max_needed = 80
         added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed)
@@ -3766,20 +3208,7 @@ def on_inline_click(c):
             f"כפולים: {dup}\n"
             f"סה\"כ בתור: {total_after}\n"
             f"דף אחרון שנבדק: {last_page}\n"
-            f"שגיאה/מידע: {last_error or 'ללא'}"
-        )
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu(), cb_id=c.id)
-
-    elif data == "refill_now_all":
-        max_needed = 80
-        added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed, ignore_selected_categories=True)
-        text = (
-            "🔥 מילוי מהאפילייט (כל הקטגוריות) הושלם.\n"
-            f"נוספו לתור: {added}\n"
-            f"כפולים: {dup}\n"
-            f"סה\"כ בתור: {total_after}\n"
-            f"דף אחרון שנבדק: {last_page}\n"
-            f"שגיאה/מידע: {last_error or 'ללא'}"
+            f"שגיאה/מידע: {last_error}"
         )
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu(), cb_id=c.id)
 
@@ -3826,42 +3255,12 @@ def handle_category_search_text(m):
     uid = m.from_user.id
     chat_id = m.chat.id
     q = (m.text or "").strip()
-
-    # In groups, require reply to the prompt message (privacy mode)
-    try:
-        chat_type = getattr(m.chat, "type", "") or ""
-    except Exception:
-        chat_type = ""
-
-    prompt_ctx = CAT_SEARCH_PROMPT.get(uid)
-    if chat_type in ("group", "supergroup"):
-        if not (getattr(m, "reply_to_message", None) and prompt_ctx and prompt_ctx[0] == chat_id and m.reply_to_message.message_id == prompt_ctx[1]):
-            bot.reply_to(m, "כדי שהחיפוש יעבוד בקבוצה: לחץ Reply על הודעת החיפוש של הבוט ואז כתוב את מילת החיפוש.")
-            return
-
     # stop waiting even if query is empty
     CAT_SEARCH_WAIT[uid] = False
-
-    # delete the prompt message (if any)
-    if prompt_ctx:
-        try:
-            _safe_delete(prompt_ctx[0], prompt_ctx[1])
-        except Exception:
-            pass
-        CAT_SEARCH_PROMPT.pop(uid, None)
-
     if not q:
         bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש. נסה שוב דרך 🔎 חיפוש בקטגוריות.")
         return
-
     CAT_LAST_QUERY[uid] = q
-
-    # Count matched categories for feedback
-    try:
-        total = len(_filter_categories(get_categories(), mode="search", uid=uid, query=q))
-    except Exception:
-        total = 0
-
     ctx = CAT_SEARCH_CTX.get(uid)
     try:
         if ctx and ctx[0] == chat_id:
@@ -3877,11 +3276,6 @@ def handle_category_search_text(m):
         log_warn(f"[CAT] edit/search menu failed: {e}")
         bot.send_message(chat_id, f"🔎 תוצאות חיפוש לקטגוריה: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q))
 
-    # Explicit feedback
-    if total <= 0:
-        bot.send_message(chat_id, f"❗️לא מצאתי קטגוריות שמתאימות ל: {q}\nנסה מילה אחרת, או לחץ על 🛒 חפש מוצרים למילת החיפוש.")
-    else:
-        bot.send_message(chat_id, f"✅ נמצאו {total} קטגוריות שמתאימות ל: {q}\nאפשר לבחור קטגוריות, או לחץ על 🛒 חפש מוצרים למילת החיפוש.")
 
 # ========= MANUAL PRODUCT SEARCH (text input) =========
 @bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
@@ -3920,70 +3314,50 @@ def handle_manual_product_search_text(m):
         bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש. נסה שוב דרך 🔎 חיפוש ידני.")
         return
 
-    # Start preview session (show found products before adding to queue)
-    _ms_start(uid=uid, chat_id=chat_id, q=q)
-    return
+    # Immediate feedback
+    try:
+        status = bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} ...")
+    except Exception:
+        status = None
+
+    try:
+        max_needed = int(os.environ.get("AE_MANUAL_SEARCH_MAX", "80") or 80)
+        added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed, keywords=q)
+
+        note = ""
+        if not added:
+            note = (
+                "\n\nטיפים אם אין תוצאות:\n"
+                "• נסה מילה באנגלית (AliExpress מחזיר טוב יותר באנגלית)\n"
+                "• בדוק סינונים (מחיר/דירוג/הזמנות/משלוח חינם)\n"
+                "• נסה מילה כללית יותר"
+            )
+
+        text = (
+            "🔎 חיפוש ידני הושלם\n"
+            f"מילת חיפוש: {q}\n"
+            f"נוספו לתור: {added}\n"
+            f"כפולים שנדחו: {dup}\n"
+            f"סה\"כ בתור: {total_after}\n"
+            f"דף אחרון שנבדק: {last_page}\n"
+            f"שגיאה/מידע: {last_error or 'אין'}"
+            f"{note}"
+        )
+
+        if status:
+            safe_edit_message(bot, chat_id=chat_id, message=status, new_text=text, reply_markup=inline_menu(), cb_id=None)
+        else:
+            bot.send_message(chat_id, text, reply_markup=inline_menu())
+    except Exception as e:
+        err = f"❌ שגיאה בחיפוש: {type(e).__name__}: {e}"
+        log_warn(err)
+        if status:
+            safe_edit_message(bot, chat_id=chat_id, message=status, new_text=err, reply_markup=inline_menu(), cb_id=None)
+        else:
+            bot.send_message(chat_id, err, reply_markup=inline_menu())
 
 
 # ========= UPLOAD CSV =========
-
-
-# ========= SET DELAY INPUT (admin text input) =========
-@bot.message_handler(func=lambda m: bool(DELAY_SET_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
-def handle_set_delay_minutes_text(m):
-    uid = m.from_user.id
-    chat_id = m.chat.id
-    txt = (m.text or "").strip()
-
-    # In groups, prefer reply-to the prompt (privacy mode)
-    try:
-        prompt_ctx = DELAY_SET_PROMPT.get(uid)
-        if prompt_ctx and m.chat.type in ("group", "supergroup"):
-            if not (m.reply_to_message and m.reply_to_message.message_id == prompt_ctx[1]):
-                return
-    except Exception:
-        pass
-
-    # Parse minutes
-    try:
-        minutes = int(float(txt))
-    except Exception:
-        bot.send_message(chat_id, "❗️אנא שלח מספר דקות תקין (למשל 20).")
-        return
-
-    minutes = max(1, min(24*60, minutes))
-    seconds = minutes * 60
-
-    try:
-        global POST_DELAY_SECONDS
-        POST_DELAY_SECONDS = seconds
-        save_delay_seconds(POST_DELAY_SECONDS)
-        try:
-            DELAY_EVENT.set()
-        except Exception:
-            pass
-        bot.send_message(chat_id, f"✅ עודכן מרווח פרסום: {minutes} דקות.")
-    except Exception as e:
-        bot.send_message(chat_id, f"❗️שגיאה בעדכון מרווח: {e}")
-
-    DELAY_SET_WAIT.pop(uid, None)
-
-    # cleanup prompt message (best-effort)
-    try:
-        ctx = DELAY_SET_PROMPT.pop(uid, None)
-        if ctx:
-            _safe_delete(ctx[0], ctx[1])
-    except Exception:
-        pass
-
-    # refresh menu message if we have it
-    try:
-        ctx = DELAY_SET_CTX.pop(uid, None)
-        if ctx and ctx[0] == chat_id:
-            safe_edit_message(bot, chat_id=ctx[0], message_id=ctx[1], new_text="🎛️ תפריט עודכן.", reply_markup=inline_menu())
-    except Exception:
-        pass
-
 @bot.message_handler(commands=['upload_source'])
 def cmd_upload_source(msg):
     if not _is_admin(msg):
@@ -4164,7 +3538,7 @@ def cmd_refill_now(msg):
         f"כפולים: {dup}\n"
         f"סה\"כ בתור: {total_after}\n"
         f"דף אחרון שנבדק: {last_page}\n"
-        f"שגיאה/מידע: {last_error or 'ללא'}"
+        f"שגיאה/מידע: {last_error}"
     )
 
 # ========= SENDER LOOP =========
@@ -4174,12 +3548,6 @@ def auto_post_loop():
     init_pending()
 
     while True:
-        # Hard stop: if broadcast is OFF, do not publish
-        if not is_broadcast_enabled():
-            DELAY_EVENT.wait(timeout=60)
-            DELAY_EVENT.clear()
-            continue
-
         if read_auto_flag() == "on":
             delay = get_auto_delay()
             if delay is None or is_quiet_now():
@@ -4223,11 +3591,6 @@ def refill_daemon():
     print("[INFO] Refill daemon started", flush=True)
 
     while True:
-        # Hard stop: if broadcast is OFF, do not refill (prevents immediate fetch after deploy)
-        if not is_broadcast_enabled():
-            time.sleep(60)
-            continue
-
         try:
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
@@ -4241,7 +3604,7 @@ def refill_daemon():
                     f"נוספו לתור: {added}\n"
                     f"כפולים: {dup}\n"
                     f"סה\"כ בתור: {total_after}\n"
-                    f"מידע/שגיאה: {last_error or 'ללא'}"
+                    f"מידע/שגיאה: {last_error}"
                 )
                 notify_admin(msg)
                 print(msg.replace("\n", " | "), flush=True)
@@ -4307,8 +3670,6 @@ except Exception:
 
     if not os.path.exists(AUTO_FLAG_FILE):
         write_auto_flag("on")
-    if not os.path.exists(BROADCAST_FLAG_FILE):
-        write_broadcast_flag("off")
 
     t1 = threading.Thread(target=auto_post_loop, daemon=True)
     t1.start()
