@@ -489,6 +489,7 @@ AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
 # Optional other filters (persisted)
 AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "300") or "300"))
 AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "88") or "88")  # percent (0-100)
+AE_MIN_COMMISSION_DEFAULT = float(os.environ.get("AE_MIN_COMMISSION", "15") or "15")  # percent (0-100)
 AE_FREE_SHIP_ONLY_DEFAULT = (os.environ.get("AE_FREE_SHIP_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
 AE_FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("AE_FREE_SHIP_THRESHOLD_ILS", "38") or "38")  # heuristic
 AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
@@ -496,6 +497,7 @@ AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
 FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("FREE_SHIP_THRESHOLD_ILS", str(AE_FREE_SHIP_THRESHOLD_ILS)) or str(AE_FREE_SHIP_THRESHOLD_ILS))  # alias/backward-compat
 MIN_ORDERS = _get_state_int("min_orders", AE_MIN_ORDERS_DEFAULT)
 MIN_RATING = _get_state_float("min_rating", AE_MIN_RATING_DEFAULT)
+MIN_COMMISSION = _get_state_float("min_commission", AE_MIN_COMMISSION_DEFAULT)
 FREE_SHIP_ONLY = _get_state_bool("free_ship_only", AE_FREE_SHIP_ONLY_DEFAULT)
 CATEGORY_IDS_RAW = _get_state_str("category_ids_raw", AE_CATEGORY_IDS_DEFAULT)
 
@@ -516,6 +518,16 @@ def set_min_rating(v: float):
         v = 0.0
     MIN_RATING = max(0.0, v)
     _set_state_str("min_rating", str(MIN_RATING))
+
+
+def set_min_commission(v: float):
+    global MIN_COMMISSION
+    try:
+        v = float(v)
+    except Exception:
+        v = 0.0
+    MIN_COMMISSION = max(0.0, v)
+    _set_state_str("min_commission", str(MIN_COMMISSION))
 
 def set_free_ship_only(flag: bool):
     global FREE_SHIP_ONLY
@@ -877,6 +889,12 @@ def normalize_row_keys(row):
     out["Title"] = out.get("Title", "") or out.get("Product Desc", "") or out.get("product_title","") or ""
     out["Strengths"] = out.get("Strengths", "") or ""
 
+    # Commission (percent) if available
+    if "CommissionRate" not in out:
+        out["CommissionRate"] = ""
+    cr = str(out.get("CommissionRate") or out.get("commission_rate") or out.get("commissionRate") or out.get("Commission") or "").strip()
+    out["CommissionRate"] = cr
+
     # AI workflow state: raw / approved / rejected / done
     st = str(out.get("AIState", "") or out.get("AiState", "") or out.get("ai_state", "") or "").strip().lower()
     if st not in ("raw", "approved", "rejected", "done"):
@@ -1078,6 +1096,24 @@ def init_pending():
     if not os.path.exists(PENDING_CSV):
         src = read_products(DATA_CSV)
         write_products(PENDING_CSV, src)
+
+
+def _count_ai_states(rows: list[dict]) -> dict:
+    """Count AI workflow states inside pending queue rows."""
+    counts = {"raw": 0, "approved": 0, "done": 0, "rejected": 0, "other": 0}
+    for r in rows or []:
+        st = str((r or {}).get("AIState") or "raw").strip().lower()
+        if st in ("raw", "new", "pending"):
+            counts["raw"] += 1
+        elif st in ("approved", "approve", "to_ai"):
+            counts["approved"] += 1
+        elif st in ("done", "ready", "ai_done"):
+            counts["done"] += 1
+        elif st in ("rejected", "reject"):
+            counts["rejected"] += 1
+        else:
+            counts["other"] += 1
+    return counts
 
 # ---- PRESET HELPERS ----
 def _save_preset(path: str, value):
@@ -1902,6 +1938,37 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         products = [products]
     return products, resp_code, resp_msg
 
+def _format_commission_percent(p: dict) -> str:
+    """Best-effort extract commission rate percent from AliExpress Affiliate product dict.
+    Returns string without % (e.g. "15"). Empty string if unknown.
+    """
+    cand = (
+        p.get("commission_rate") or p.get("commissionRate") or
+        p.get("promotion_rate") or p.get("promotionRate") or
+        p.get("promotion_rate_percent") or p.get("promotionRatePercent") or
+        p.get("commission_rate_percent") or p.get("commissionRatePercent") or
+        p.get("commission") or p.get("commission_percent") or
+        p.get("commissionRateValue")
+    )
+    try:
+        v = _extract_float(str(cand or ""))
+    except Exception:
+        v = None
+    if v is None:
+        return ""
+    # Some APIs return fraction (0.15) instead of percent (15)
+    if 0 < v <= 1.0:
+        v = v * 100.0
+    if v < 0:
+        v = 0.0
+    if v > 200:
+        # sanity: something is off; keep but avoid absurd
+        v = v / 100.0
+    try:
+        return f"{float(v):g}"
+    except Exception:
+        return str(v)
+
 def _map_affiliate_product_to_row(p: dict) -> dict:
     # מחיר מבצע / מקורי - טיפול בטווחים ("1.23-4.56") + מניעת המרה כפולה אם המחיר כבר בש"ח
     sale_raw = (
@@ -1966,6 +2033,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         "Rating": (p.get("evaluate_rate") or "").strip(),
         "Orders": str(p.get("lastest_volume") or "").strip(),
         "BuyLink": buy_link,
+        "CommissionRate": _format_commission_percent(p),
         "CouponCode": "",
         "Opening": "",
         "Strengths": "",
@@ -1992,6 +2060,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     min_orders = int(MIN_ORDERS or 0)
     min_rating = float(MIN_RATING or 0.0)
     free_ship_only = bool(FREE_SHIP_ONLY)
+    min_commission = float(MIN_COMMISSION or 0.0)
 
     diversify = str(os.environ.get('AE_REFILL_DIVERSIFY', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
     kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '6'), 6)
@@ -2065,6 +2134,11 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
         if min_rating:
             r = _extract_float(row.get("Rating") or "")
             if r is None or float(r) < min_rating:
+                return False
+        if min_commission:
+            c = _extract_float(row.get("CommissionRate") or "")
+            c = float(c or 0.0)
+            if c < float(min_commission):
                 return False
         if free_ship_only:
             # in this bot logic: treat "free ship" threshold as min sale price
@@ -2390,7 +2464,8 @@ def get_categories() -> list[dict]:
 
 # ---------- Filter menus ----------
 ORDERS_PRESETS = [0, 10, 50, 100, 300, 500, 1000, 3000, 5000]
-RATING_PRESETS = [0, 80, 85, 90, 92, 94, 95, 97]
+RATING_PRESETS = [0, 80, 85, 88, 90, 92, 94, 95, 97]
+COMMISSION_PRESETS = [0, 7, 10, 15]
 
 def _filters_home_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -2401,6 +2476,7 @@ def _filters_home_kb():
         types.InlineKeyboardButton(f"📦 מינ' הזמנות: {MIN_ORDERS or 0}", callback_data="fo_menu"),
         types.InlineKeyboardButton(f"⭐ מינ' דירוג: {MIN_RATING or 0:g}%", callback_data="fr_menu"),
     )
+    kb.add(types.InlineKeyboardButton(f"💰 מינ' עמלה: {MIN_COMMISSION or 0:g}%", callback_data="fcmm_menu"))
     ship_lbl = "✅" if FREE_SHIP_ONLY else "❌"
     kb.add(types.InlineKeyboardButton(f"🚚 משלוח חינם לישראל: {ship_lbl}", callback_data="fs_toggle"))
 
@@ -2434,6 +2510,17 @@ def _rating_filter_menu_kb():
     kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
     return kb
 
+def _commission_filter_menu_kb():
+    kb = types.InlineKeyboardMarkup(row_width=4)
+    btns = []
+    for v in COMMISSION_PRESETS:
+        mark = "✅ " if float(MIN_COMMISSION or 0) == float(v) else ""
+        btns.append(types.InlineKeyboardButton(f"{mark}{v}%", callback_data=f"fcm_set_{v}"))
+    kb.add(*btns)
+    kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="flt_menu"))
+    return kb
+
+
 
 # --- Category UI state (per admin user) ---
 CAT_VIEW_MODE: dict[int, str] = {}      # uid -> "top" | "all" | "search"
@@ -2456,183 +2543,170 @@ PROD_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_m
 TOPICS_PAGE_SIZE = 8
 
 TOPIC_GROUP_ORDER = [
-    "tools", "home", "electronics", "fashion", "kids", "beauty", "sport", "auto", "pets", "gaming", "office", "outdoor"
+    "tools", "home", "kitchen", "electronics", "phone", "smart_home", "fitness",
+    "fashion", "beauty", "kids", "pets", "car", "outdoor", "travel",
 ]
 
 TOPIC_GROUPS: dict[str, dict] = {
     "tools": {
-        "label": "🧰 כלים ועבודה",
+        "title": "🔧 כלי עבודה",
         "topics": [
-            ("מברגה/מקדחה", "cordless drill"),
-            ("סט ביטים/ראצ'ט", "ratchet screwdriver set"),
-            ("מולטיטול", "multitool pliers"),
-            ("פנס עבודה", "work light flashlight"),
-            ("מד לייזר", "laser distance meter"),
-            ("אקדח ניטים/ריבט", "rivet gun tool"),
-            ("סט מברגים", "screwdriver set"),
-            ("כפפות עבודה", "work gloves"),
-            ("מקדחים/כוסות קידוח", "drill bits hole saw"),
-            ("ארגז/תיק כלים", "tool box organizer"),
-            ("סוללות/מטענים", "power tool battery charger"),
+            {"title": "מקדחות ומברגות", "keywords": ["cordless drill", "impact driver", "electric screwdriver", "מברגה", "מקדחה"]},
+            {"title": "סטים וביטים", "keywords": ["tool set", "socket set", "bit set", "allen key", "ratchet", "סט כלים"]},
+            {"title": "מדידה ולייזר", "keywords": ["laser level", "digital caliper", "tape measure", "distance meter", "מד לייזר"]},
+            {"title": "ריתוך/הלחמה", "keywords": ["soldering iron", "soldering station", "welding", "flux", "הלחמה"]},
+            {"title": "כלי נגרות", "keywords": ["jigsaw", "circular saw", "router", "woodworking", "נגרות"]},
+            {"title": "בטיחות בעבודה", "keywords": ["work gloves", "goggles", "ear protection", "safety mask", "כפפות עבודה"]},
+            {"title": "אביזרי סוללות 18V", "keywords": ["makita battery", "dewalt battery", "18v battery", "charger", "סוללה 18v"]},
+            {"title": "כלים לרכב/מוסך", "keywords": ["jack", "OBD2", "torque wrench", "impact wrench", "מפתח מומנט"]},
+            {"title": "כלי גינון", "keywords": ["pruning shears", "garden tools", "sprayer", "hose nozzle", "גינון"]},
+            {"title": "תיקי כלים ואחסון", "keywords": ["tool bag", "tool box", "organizer", "storage case", "ארגונית"]},
         ],
     },
     "home": {
-        "label": "🏠 לבית ולמטבח",
+        "title": "🏠 לבית",
         "topics": [
-            ("אחסון וארגון", "home storage organizer"),
-            ("גאדג'טים למטבח", "kitchen gadget"),
-            ("ניקיון הבית", "cleaning supplies"),
-            ("מצעים/כריות", "bedding pillow"),
-            ("תאורה לבית", "led lights home"),
-            ("ברזים ואביזרי אמבט", "bathroom faucet accessories"),
-            ("כלי בישול", "cookware pan pot"),
-            ("קופסאות אוכל", "food container bento"),
-            ("מדפים/מתלים", "wall shelf hooks"),
+            {"title": "אחסון וארגון", "keywords": ["storage box", "closet organizer", "drawer organizer", "shelf", "ארגון"]},
+            {"title": "ניקיון", "keywords": ["mop", "microfiber", "vacuum accessory", "cleaning brush", "ניקיון"]},
+            {"title": "טקסטיל לבית", "keywords": ["bedsheet", "blanket", "pillowcase", "curtain", "שמיכה"]},
+            {"title": "תאורה", "keywords": ["LED lamp", "night light", "strip light", "solar light", "תאורה"]},
+            {"title": "חדר רחצה", "keywords": ["shower head", "bathroom shelf", "towel rack", "soap dispenser", "אמבטיה"]},
+            {"title": "כביסה וגיהוץ", "keywords": ["laundry basket", "clothes steamer", "hanger", "lint remover", "כביסה"]},
+            {"title": "גאדג׳טים לבית", "keywords": ["smart plug", "timer switch", "mini fan", "humidifier", "מפזר ריח"]},
+            {"title": "קישוט ומתנות", "keywords": ["decor", "gift", "photo frame", "music box", "קישוט"]},
+            {"title": "תחזוקת בית", "keywords": ["sealant tape", "door stopper", "anti-slip", "repair kit", "תחזוקה"]},
+            {"title": "משרד ביתי", "keywords": ["desk organizer", "monitor stand", "ergonomic", "office", "משרד"]},
+        ],
+    },
+    "kitchen": {
+        "title": "🍳 מטבח",
+        "topics": [
+            {"title": "כלי בישול", "keywords": ["pan", "pot", "non-stick", "cookware", "סיר", "מחבת"]},
+            {"title": "סכינים והשחזה", "keywords": ["kitchen knife", "knife sharpener", "cutting board", "סכין"]},
+            {"title": "אחסון מזון", "keywords": ["food container", "vacuum sealer", "zip bag", "spice jar", "קופסאות"]},
+            {"title": "קפה ותה", "keywords": ["coffee grinder", "espresso", "moka pot", "tea infuser", "קפה"]},
+            {"title": "אפייה", "keywords": ["baking mold", "silicone", "pastry", "cake", "אפייה"]},
+            {"title": "גאדג׳טים למטבח", "keywords": ["chopper", "peeler", "grater", "kitchen gadget", "קולפן"]},
+            {"title": "מוצרי חשמל קטנים", "keywords": ["air fryer", "blender", "toaster", "kettle", "בלנדר"]},
+            {"title": "בר מים/פילטרים", "keywords": ["water filter", "faucet filter", "filter cartridge", "פילטר"]},
         ],
     },
     "electronics": {
-        "label": "💻 אלקטרוניקה",
+        "title": "💻 אלקטרוניקה",
         "topics": [
-            ("אוזניות", "wireless earbuds"),
-            ("מטענים וכבלים", "usb c charger cable"),
-            ("Power Bank", "power bank"),
-            ("מצלמת רכב", "dash cam"),
-            ("תאורה חכמה", "smart led light"),
-            ("אביזרי טלפון", "phone accessories"),
-            ("שעונים חכמים", "smart watch"),
-            ("רמקול בלוטוס", "bluetooth speaker"),
-            ("מצלמת אבטחה", "security camera"),
+            {"title": "אוזניות", "keywords": ["earbuds", "headphones", "ANC", "bluetooth headset", "אוזניות"]},
+            {"title": "מחשבים ואביזרים", "keywords": ["keyboard", "mouse", "usb hub", "ssd", "laptop stand", "מחשב"]},
+            {"title": "מצלמות ואקשן", "keywords": ["dash cam", "action camera", "tripod", "gopro accessory", "מצלמה"]},
+            {"title": "טעינה וכבלים", "keywords": ["charger", "power bank", "type c cable", "gan charger", "מטען"]},
+            {"title": "שמע לבית", "keywords": ["bluetooth speaker", "soundbar", "microphone", "karaoke", "רמקול"]},
+            {"title": "גיימינג", "keywords": ["gamepad", "ps5 accessory", "rgb", "gaming headset", "גיימינג"]},
+            {"title": "מסכים ותושבות", "keywords": ["monitor", "tv mount", "projector", "screen", "תושבת"]},
+            {"title": "חשמל ואלקטרוניקה", "keywords": ["multimeter", "solder", "wire stripper", "electronics kit", "מולטימטר"]},
+        ],
+    },
+    "phone": {
+        "title": "📱 סלולר",
+        "topics": [
+            {"title": "כיסויים ומגנים", "keywords": ["phone case", "screen protector", "magnetic case", "כיסוי"]},
+            {"title": "מטענים מהירים", "keywords": ["gan charger", "fast charger", "car charger", "usb c", "טעינה מהירה"]},
+            {"title": "מעמדים לרכב", "keywords": ["car phone holder", "magnetic mount", "wireless car charger", "מעמד"]},
+            {"title": "אוזניות/מיקרופון", "keywords": ["lapel mic", "wireless mic", "phone microphone", "מיקרופון"]},
+            {"title": "צילום בסלולר", "keywords": ["gimbal", "tripod", "ring light", "selfie stick", "תאורת רינג"]},
+            {"title": "שעונים חכמים", "keywords": ["smart watch", "fitness tracker", "strap", "שעון חכם"]},
+        ],
+    },
+    "smart_home": {
+        "title": "🏡 בית חכם",
+        "topics": [
+            {"title": "חיישנים ואזעקה", "keywords": ["door sensor", "motion sensor", "alarm", "security", "חיישן תנועה"]},
+            {"title": "מצלמות אבטחה", "keywords": ["security camera", "wifi camera", "ip camera", "cctv", "מצלמת אבטחה"]},
+            {"title": "שקעים ומתגים חכמים", "keywords": ["smart plug", "smart switch", "tuya", "zigbee", "שקע חכם"]},
+            {"title": "תאורה חכמה", "keywords": ["smart bulb", "rgb light", "led strip", "smart lamp", "תאורה חכמה"]},
+            {"title": "מנעולים חכמים", "keywords": ["smart lock", "fingerprint lock", "keyless", "מנעול"]},
+            {"title": "אקלים ואוויר", "keywords": ["humidifier", "air purifier", "thermometer", "air quality", "מטהר אוויר"]},
+        ],
+    },
+    "fitness": {
+        "title": "🏃 כושר ובריאות",
+        "topics": [
+            {"title": "ריצה והליכה", "keywords": ["running shoes", "running belt", "hydration", "ריצה"]},
+            {"title": "חדר כושר ביתי", "keywords": ["dumbbell", "resistance band", "pull up bar", "yoga mat", "משקולות"]},
+            {"title": "התאוששות ועיסוי", "keywords": ["massage gun", "foam roller", "stretching", "עיסוי"]},
+            {"title": "מדדים וניטור", "keywords": ["smart band", "blood pressure", "pulse oximeter", "monitor", "מדדים"]},
+            {"title": "אופניים", "keywords": ["cycling", "bike light", "bike phone holder", "helmet", "אופניים"]},
         ],
     },
     "fashion": {
-        "label": "👗 אופנה ואקססוריז",
+        "title": "👗 אופנה",
         "topics": [
-            ("שעונים", "wristwatch"),
-            ("תיקים/ארנקים", "wallet bag"),
-            ("חגורות", "leather belt"),
-            ("משקפי שמש", "sunglasses"),
-            ("נעליים", "shoes sneakers"),
-            ("כפפות חורף", "winter gloves"),
-            ("ג'קטים", "jacket coat"),
-        ],
-    },
-    "kids": {
-        "label": "🧒 ילדים וצעצועים",
-        "topics": [
-            ("LEGO/בריקים", "building blocks bricks"),
-            ("צעצועי שלט", "rc toy car"),
-            ("משחקי חשיבה", "puzzle educational toy"),
-            ("ציוד לבית ספר", "school supplies"),
-            ("תחפושות פורים", "kids costume"),
-            ("דמויות ואקשן", "action figure"),
-            ("משחקי יצירה", "diy craft kit"),
+            {"title": "שעונים", "keywords": ["watch", "wristwatch", "mechanical watch", "strap", "שעון"]},
+            {"title": "תיקים וארנקים", "keywords": ["wallet", "handbag", "backpack", "sling bag", "תיק"]},
+            {"title": "נעליים", "keywords": ["sneakers", "boots", "sandals", "running shoes", "נעליים"]},
+            {"title": "חגורות ואקססוריז", "keywords": ["belt", "cap", "sunglasses", "accessory", "חגורה"]},
+            {"title": "ביגוד חורף", "keywords": ["jacket", "coat", "hoodie", "thermal", "מעיל"]},
+            {"title": "תכשיטים", "keywords": ["necklace", "bracelet", "ring", "jewelry", "תכשיט"]},
         ],
     },
     "beauty": {
-        "label": "💄 יופי וטיפוח",
+        "title": "💄 טיפוח",
         "topics": [
-            ("מכשירי שיער", "hair dryer straightener"),
-            ("טיפוח עור", "skincare serum"),
-            ("מניקור/פדיקור", "nail kit"),
-            ("מכשירי גילוח", "electric shaver"),
-            ("איפור", "makeup"),
-            ("בשמים", "perfume fragrance"),
+            {"title": "טיפוח שיער", "keywords": ["hair dryer", "curling iron", "hair clipper", "shampoo", "שיער"]},
+            {"title": "טיפוח פנים", "keywords": ["skincare", "serum", "face cleanser", "mask", "פנים"]},
+            {"title": "מכשירי יופי", "keywords": ["epilator", "IPL", "facial massager", "led mask", "מכשיר יופי"]},
+            {"title": "ציפורניים", "keywords": ["nail kit", "gel polish", "uv lamp", "manicure", "ציפורניים"]},
+            {"title": "בשמים ומפיצים", "keywords": ["perfume", "fragrance", "essential oil", "diffuser", "בושם"]},
         ],
     },
-    "sport": {
-        "label": "🏃 ספורט ובריאות",
+    "kids": {
+        "title": "🧸 ילדים",
         "topics": [
-            ("נעלי ריצה", "running shoes"),
-            ("כושר ביתי", "fitness equipment"),
-            ("בקבוקי שתייה", "water bottle"),
-            ("שעון ספורט", "sport smartwatch"),
-            ("אופניים/אביזרים", "bicycle accessories"),
-            ("מסאז'ר", "massage gun"),
-        ],
-    },
-    "auto": {
-        "label": "🚗 רכב",
-        "topics": [
-            ("תושבת טלפון", "car phone holder"),
-            ("אביזרי ניקוי", "car cleaning kit"),
-            ("תאורה לרכב", "car led light"),
-            ("קומפרסור נייד", "portable air compressor"),
-            ("כיסוי מושבים", "car seat cover"),
-            ("OBD/דיאגנוסטיקה", "obd2 scanner"),
+            {"title": "צעצועים", "keywords": ["toy", "lego", "building blocks", "puzzle", "צעצוע"]},
+            {"title": "תחפושות פורים", "keywords": ["costume", "cosplay", "mask", "תחפושת פורים", "תחפושת"]},
+            {"title": "חינוך ולמידה", "keywords": ["education", "montessori", "learning toy", "flash card", "למידה"]},
+            {"title": "טיולים עם ילדים", "keywords": ["stroller accessory", "baby carrier", "car seat cover", "טיול"]},
+            {"title": "אומנות ויצירה", "keywords": ["craft", "drawing", "kids art", "sticker", "יצירה"]},
         ],
     },
     "pets": {
-        "label": "🐶 חיות מחמד",
+        "title": "🐾 חיות מחמד",
         "topics": [
-            ("צעצועים לכלבים", "dog toy"),
-            ("קערות ומזרקות מים", "pet water fountain"),
-            ("טיפוח חיות", "pet grooming"),
-            ("רצועות וקולרים", "dog leash collar"),
-            ("חתולים", "cat accessories"),
+            {"title": "כלבים", "keywords": ["dog", "dog leash", "dog bed", "dog toy", "כלב"]},
+            {"title": "חתולים", "keywords": ["cat", "litter box", "cat toy", "scratcher", "חתול"]},
+            {"title": "האכלה וטיפוח", "keywords": ["pet feeder", "grooming", "pet brush", "water fountain", "הזנה"]},
+            {"title": "נסיעות עם חיות", "keywords": ["pet carrier", "car seat", "travel bag", "נסיעות"]},
         ],
     },
-    "gaming": {
-        "label": "🎮 גיימינג",
+    "car": {
+        "title": "🚗 רכב",
         "topics": [
-            ("שלטים", "game controller"),
-            ("אביזרי קונסולות", "ps5 accessory"),
-            ("סטנד/אחסון", "gaming stand organizer"),
-            ("אוזניות גיימינג", "gaming headset"),
-            ("מקלדת/עכבר", "gaming keyboard mouse"),
-        ],
-    },
-    "office": {
-        "label": "🖇️ משרד ולימודים",
-        "topics": [
-            ("ארגונומיה", "ergonomic office"),
-            ("מדפסות ותלת מימד", "3d printer accessory"),
-            ("כתיבה וסידור", "desk organizer"),
-            ("מנורות שולחן", "desk lamp"),
+            {"title": "דאשים ומצלמות דרך", "keywords": ["dash cam", "car camera", "parking monitor", "מצלמת דרך"]},
+            {"title": "אביזרי טעינה לרכב", "keywords": ["car charger", "jump starter", "inverter", "power", "מטען לרכב"]},
+            {"title": "ניקיון רכב", "keywords": ["car vacuum", "detailing", "microfiber", "cleaning", "ניקוי רכב"]},
+            {"title": "מולטימדיה", "keywords": ["carplay", "android auto", "car screen", "stereo", "מולטימדיה"]},
+            {"title": "אביזרי בטיחות", "keywords": ["tire inflator", "tpms", "reflective", "emergency", "בטיחות"]},
         ],
     },
     "outdoor": {
-        "label": "🏕️ שטח וקמפינג",
+        "title": "⛺ חוץ וטיולים",
         "topics": [
-            ("ציוד קמפינג", "camping gear"),
-            ("תאורה לשטח", "camping lantern"),
-            ("סכין כיס / EDC", "edc pocket tool"),
-            ("דיג", "fishing reel"),
-            ("תיקי טיולים", "hiking backpack"),
+            {"title": "קמפינג", "keywords": ["camping", "tent", "sleeping bag", "camp stove", "קמפינג"]},
+            {"title": "דיג", "keywords": ["fishing reel", "fishing rod", "bait", "tackle", "דיג"]},
+            {"title": "אופניים/קורקינט", "keywords": ["scooter", "bike accessory", "helmet", "light", "קורקינט"]},
+            {"title": "תאורה לשטח", "keywords": ["camp lantern", "headlamp", "flashlight", "solar", "פנס"]},
+            {"title": "כלים לטיול", "keywords": ["multitool", "knife", "compass", "water bottle", "כלי"]},
+        ],
+    },
+    "travel": {
+        "title": "✈️ נסיעות",
+        "topics": [
+            {"title": "מזוודות ותיקים", "keywords": ["luggage", "suitcase", "travel backpack", "organizer", "מזוודה"]},
+            {"title": "אוזניות לטיסה", "keywords": ["noise cancelling", "travel headphones", "neck pillow", "טיסה"]},
+            {"title": "מתאמים וחשמל", "keywords": ["travel adapter", "universal plug", "power strip", "מתאם"]},
+            {"title": "אבטחה בנסיעה", "keywords": ["luggage lock", "tracker", "airtag", "security", "מנעול"]},
+            {"title": "קמפינג/טרקים", "keywords": ["hiking", "trekking", "backpack", "waterproof", "טרקים"]},
         ],
     },
 }
-
-def _prod_search_menu_text() -> str:
-    flt = _ms_active_filters_text()
-    cur = _display_currency_code()
-    conv = "כן" if AE_PRICE_CONVERT_USD_TO_ILS else "לא"
-    return (
-        "🔎 <b>חיפוש</b>\n\n"
-        "בחר מצב:\n"
-        "• 🎯 חיפוש פריט ספציפי (תכתוב מילה/ביטוי)\n"
-        "• 📚 חיפוש נושאים (רשימת נושאים מוכנים)\n\n"
-        f"סינונים פעילים: {html.escape(flt)}\n"
-        f"מחיר: מטבע מקור={cur} | המרה $→₪={conv} | שער={USD_TO_ILS_RATE:g}\n"
-    )
-
-def _prod_search_menu_kb() -> 'types.InlineKeyboardMarkup':
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        types.InlineKeyboardButton("🎯 חיפוש פריט ספציפי", callback_data="ps_item"),
-        types.InlineKeyboardButton("📚 חיפוש נושאים", callback_data="ps_topics"),
-    )
-    kb.row(types.InlineKeyboardButton("🎯 סינון מומלץ 300+/88%", callback_data="ps_best"))
-    kb.row(
-        types.InlineKeyboardButton("📦 מינ' הזמנות", callback_data="fo_menu"),
-        types.InlineKeyboardButton("⭐ מינ' דירוג", callback_data="fr_menu"),
-    )
-    kb.row(
-        types.InlineKeyboardButton(f"💱 מטבע מקור: {_display_currency_code()}", callback_data="toggle_price_input_currency"),
-        types.InlineKeyboardButton(f"🔁 המרה $→₪: {'ON' if AE_PRICE_CONVERT_USD_TO_ILS else 'OFF'}", callback_data="toggle_usd2ils_convert"),
-    )
-    kb.row(types.InlineKeyboardButton("🔢 קבע שער USD→ILS", callback_data="ps_set_rate"))
-    kb.row(types.InlineKeyboardButton("⬅️ תפריט ראשי", callback_data="ps_back_main"))
-    return kb
 
 def _ps_groups_kb() -> 'types.InlineKeyboardMarkup':
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -2703,6 +2777,11 @@ def _ms_active_filters_text() -> str:
             parts.append(f"⭐ מינ' דירוג: {float(MIN_RATING):g}%")
         except Exception:
             parts.append(f"⭐ מינ' דירוג: {MIN_RATING}%")
+    if MIN_COMMISSION:
+        try:
+            parts.append(f"💰 מינ' עמלה: {float(MIN_COMMISSION):g}%")
+        except Exception:
+            parts.append(f"💰 מינ' עמלה: {MIN_COMMISSION}%")
     if FREE_SHIP_ONLY:
         parts.append(f"🚚 משלוח חינם (>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g})")
     cats = get_selected_category_ids()
@@ -2751,6 +2830,12 @@ def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
         r = _extract_float(row.get("Rating") or "")
         if r is None or float(r) < float(MIN_RATING):
             return False, f"דירוג נמוך מ-{MIN_RATING}%"
+    # Commission
+    if MIN_COMMISSION:
+        c = _extract_float(row.get("CommissionRate") or "")
+        c = float(c or 0.0)
+        if c < float(MIN_COMMISSION):
+            return False, f"עמלה נמוכה מ-{MIN_COMMISSION:g}%"
     # Free ship only (our heuristic threshold)
     if FREE_SHIP_ONLY:
         sale_num = _extract_float(row.get("SalePrice") or "")
@@ -2774,7 +2859,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     # Map and evaluate
     results = []
     raw_count = 0
-    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "free_ship": 0, "other": 0}
+    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "commission": 0, "free_ship": 0, "other": 0}
     for p in (products or []):
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
@@ -2792,6 +2877,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["orders"] += 1
             elif "דירוג" in reason:
                 reasons["rating"] += 1
+            elif "עמלה" in reason:
+                reasons["commission"] += 1
             elif "משלוח" in reason:
                 reasons["free_ship"] += 1
             else:
@@ -2868,7 +2955,7 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         if raw_count > 0:
             info += (
                 f"מצאתי {raw_count} תוצאות גולמיות אבל אף אחת לא עברה את הסינונים.\n"
-                f"נפסלו: ללא קישור={reasons.get('no_link',0)} | מחיר={reasons.get('price',0)} | הזמנות={reasons.get('orders',0)} | דירוג={reasons.get('rating',0)} | משלוח={reasons.get('free_ship',0)}\n\n"
+                f"נפסלו: ללא קישור={reasons.get('no_link',0)} | מחיר={reasons.get('price',0)} | הזמנות={reasons.get('orders',0)} | דירוג={reasons.get('rating',0)} | עמלה={reasons.get('commission',0)} | משלוח={reasons.get('free_ship',0)}\n\n"
             )
         info += f"resp_code={resp_code} resp_msg={html.escape(str(resp_msg or ''))}"
         return info, None
@@ -2891,6 +2978,22 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
     orig = str(row.get("OriginalPrice") or "").strip()
     rating = str(row.get("Rating") or "").strip()
     orders = str(row.get("Orders") or "").strip()
+    comm = str(row.get("CommissionRate") or "").strip()
+    comm_line = ""
+    try:
+        comm_pct = float(_extract_float(comm) or 0.0)
+    except Exception:
+        comm_pct = 0.0
+    if comm_pct > 0:
+        try:
+            sale_amount = float(_extract_float(clean_price_text(sale) or "") or 0.0)
+        except Exception:
+            sale_amount = 0.0
+        est = sale_amount * (comm_pct / 100.0) if sale_amount > 0 else 0.0
+        if est > 0:
+            comm_line = f"\n💸 עמלה: {comm_pct:g}% | רווח משוער: ₪{est:.2f}"
+        else:
+            comm_line = f"\n💸 עמלה: {comm_pct:g}%"
     link = str(row.get("BuyLink") or "").strip()
     img = str(row.get("ImageURL") or "").strip() or None
 
@@ -2909,7 +3012,8 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         f"{status_line}\n\n"
         f"<b>{html.escape(title)}</b>\n"
         f"💰 {html.escape(sale)} (מקורי {html.escape(orig)})\n"
-        f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}\n"
+        f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}"
+        f"{html.escape(comm_line)}\n"
         f"🔗 {html.escape(link)}"
     )
     return caption, img
@@ -3124,7 +3228,33 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 set_min_rating(val)
             bot.answer_callback_query(c.id, f"עודכן מינ' דירוג ל-{val:g}%")
             safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"⭐ מינימום דירוג באחוזים (כרגע: {MIN_RATING:g}%)", reply_markup=_rating_filter_menu_kb(), cb_id=None)
+            return True        # commission
+        if data == "fcmm_menu":
+            safe_edit_message(
+                bot,
+                chat_id=chat_id,
+                message=c.message,
+                new_text=f"💰 מינימום עמלה (כדי לסנן מוצרים לפי שיעור עמלה)\n(נוכחי: {MIN_COMMISSION:g}%)",
+                reply_markup=_commission_filter_menu_kb(),
+                cb_id=c.id,
+            )
             return True
+        if data.startswith("fcm_set_"):
+            val = float(data.split("_")[-1])
+            with FILE_LOCK:
+                set_min_commission(val)
+            bot.answer_callback_query(c.id, f"עודכן מינ' עמלה ל-{val:g}%")
+            safe_edit_message(
+                bot,
+                chat_id=chat_id,
+                message=c.message,
+                new_text=f"💰 מינימום עמלה\n(נוכחי: {MIN_COMMISSION:g}%)",
+                reply_markup=_commission_filter_menu_kb(),
+                cb_id=None,
+            )
+            return True
+
+
 
         # shipping toggle
         if data == "fs_toggle":
@@ -3332,6 +3462,22 @@ def _ai_caption_for_row(r: dict, pos: int, total: int) -> str:
         meta.append(f"דירוג: {html.escape(rating)}")
     if orders:
         meta.append(f"הזמנות: {html.escape(orders)}")
+    # Commission (percent) + estimated earnings if possible
+    comm = str(r.get("CommissionRate") or "").strip()
+    try:
+        comm_pct = float(_extract_float(comm) or 0.0)
+    except Exception:
+        comm_pct = 0.0
+    if comm_pct > 0:
+        est_txt = ""
+        try:
+            amt = float(_extract_float(clean_price_text(price or "") or "") or 0.0)
+        except Exception:
+            amt = 0.0
+        if amt > 0 and str(price or "").strip().startswith("₪"):
+            est = amt * (comm_pct / 100.0)
+            est_txt = f" (≈₪{est:.2f})"
+        meta.append(f"עמלה: {comm_pct:g}%{est_txt}")
     if meta:
         lines.append(" • ".join(meta))
     lines.append("")
@@ -3542,7 +3688,8 @@ def on_inline_click(c):
         # Apply recommended strict filters for high-quality results
         set_min_orders(300)
         set_min_rating(88.0)
-        bot.answer_callback_query(c.id, "עודכן: מינ׳ 300 הזמנות + 88% דירוג")
+        set_min_commission(15.0)
+        bot.answer_callback_query(c.id, "עודכן: מינ׳ 300 הזמנות + 88% דירוג + 15% עמלה")
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
         return
 
@@ -3841,7 +3988,7 @@ def on_inline_click(c):
             return
         ok = send_next_locked("manual")
         if not ok:
-            bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
+            bot.answer_callback_query(c.id, "אין פריטים בתור או שגיאה בשליחה.", show_alert=True)
             return
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
@@ -3850,6 +3997,7 @@ def on_inline_click(c):
         with FILE_LOCK:
             pending = read_products(PENDING_CSV)
         count = len(pending)
+        counts = _count_ai_states(pending)
         now_il = _now_il()
         schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
         delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
@@ -3857,7 +4005,7 @@ def on_inline_click(c):
         conv_state = "פעיל" if (AE_PRICE_INPUT_CURRENCY == "USD" and AE_PRICE_CONVERT_USD_TO_ILS) else "כבוי"
         currency_line = f"💱 מטבע מקור: {AE_PRICE_INPUT_CURRENCY} | המרה $→₪: {conv_state} | מציג: {_display_currency_code()}"
         if count == 0:
-            text = f"{schedule_line}\n{delay_line}\n{target_line}\n{currency_line}\nאין פוסטים ממתינים ✅"
+            text = f"{schedule_line}\n{delay_line}\n{target_line}\n{currency_line}\nאין פריטים בתור ✅"
         else:
             total_seconds = (count - 1) * POST_DELAY_SECONDS
             eta = now_il + timedelta(seconds=total_seconds)
@@ -3870,7 +4018,10 @@ def on_inline_click(c):
                 f"{delay_line}\n"
                 f"{target_line}\n"
                 f"{currency_line}\n"
-                f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
+                f"📦 סה״כ פריטים בתור: <b>{count}</b>\n"
+                f"🕵️ פריטים לפני אישור: <b>{counts.get('raw',0)}</b>\n"
+                f"✅ מאושרים ל-AI: <b>{counts.get('approved',0)}</b>\n"
+                f"🧠 עברו AI (מוכנים לשידור): <b>{counts.get('done',0)}</b>\n"
                 f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
                 f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
                 f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
@@ -4455,12 +4606,13 @@ def pending_status_cmd(msg):
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
     count = len(pending)
+    counts = _count_ai_states(pending)
     now_il = _now_il()
     schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
     delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
     target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
     if count == 0:
-        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅")
+        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\n{target_line}\nאין פריטים בתור ✅")
         return
     total_seconds = (count - 1) * POST_DELAY_SECONDS
     eta = now_il + timedelta(seconds=total_seconds)
@@ -4468,7 +4620,10 @@ def pending_status_cmd(msg):
     status_line = "🎙️ שידור אפשרי עכשיו" if not is_quiet_now(now_il) else "⏸️ כרגע מחוץ לחלון השידור"
     bot.reply_to(msg,
         f"{schedule_line}\n{status_line}\n{delay_line}\n{target_line}\n"
-        f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
+        f"📦 סה״כ פריטים בתור: <b>{count}</b>\n"
+        f"🕵️ פריטים לפני אישור: <b>{counts.get('raw',0)}</b>\n"
+        f"✅ מאושרים ל-AI: <b>{counts.get('approved',0)}</b>\n"
+        f"🧠 עברו AI (מוכנים לשידור): <b>{counts.get('done',0)}</b>\n"
         f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>",
         parse_mode="HTML"
     )
@@ -4637,7 +4792,7 @@ if __name__ == "__main__":
     log_info(f"[CFG] JOIN_URL={JOIN_URL}")
     log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
     log_info(f"[CFG] PRICE_INPUT_CURRENCY={AE_PRICE_INPUT_CURRENCY} | CONVERT_USD_TO_ILS={AE_PRICE_CONVERT_USD_TO_ILS} | DISPLAY={_display_currency_code()}")
-    log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
+    log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | MIN_COMMISSION={MIN_COMMISSION:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
     log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
 
 
