@@ -3628,6 +3628,45 @@ def inline_menu():
 
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
+
+def _prod_search_menu_text() -> str:
+    # Main menu text for product search (manual)
+    return (
+        "🔎 <b>חיפוש מוצרים</b>\n"
+        "בחר מצב חיפוש, ועדכן סינונים לפי צורך.\n\n"
+        f"📦 מינ׳ הזמנות: <b>{int(MIN_ORDERS)}</b>\n"
+        f"⭐ מינ׳ דירוג: <b>{float(MIN_RATING):g}%</b>\n"
+        f"💰 מינ׳ עמלה: <b>{float(MIN_COMMISSION):g}%</b>\n"
+        f"💱 מטבע מקור: <b>{AE_PRICE_INPUT_CURRENCY}</b> | המרה $→₪: <b>{'כן' if AE_PRICE_CONVERT_USD_TO_ILS else 'לא'}</b>\n"
+        f"🔢 שער USD→ILS: <b>{float(USD_TO_ILS_RATE):g}</b>\n"
+    )
+
+def _prod_search_menu_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("🎯 חיפוש פריט ספציפי", callback_data="ps_item"),
+        types.InlineKeyboardButton("📚 חיפוש נושאים", callback_data="ps_topics"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🎯 סינון מומלץ (300/88/15)", callback_data="ps_best"),
+        types.InlineKeyboardButton("🔁 חפש שוב (שאילתה אחרונה)", callback_data="prod_search_last"),
+    )
+    # quick filters
+    kb.add(
+        types.InlineKeyboardButton("📦 הזמנות", callback_data="f_orders"),
+        types.InlineKeyboardButton("⭐ דירוג", callback_data="f_rating"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💰 עמלה", callback_data="ps_comm"),
+        types.InlineKeyboardButton("💱 מטבע/המרה", callback_data="ps_price_cfg"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🔢 קבע שער", callback_data="ps_set_rate"),
+        types.InlineKeyboardButton("↩️ חזרה לתפריט", callback_data="ps_back_main"),
+    )
+    return kb
+
+
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
 
@@ -3693,6 +3732,88 @@ def on_inline_click(c):
         bot.answer_callback_query(c.id, "עודכן: מינ׳ 300 הזמנות + 88% דירוג + 15% עמלה")
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
         return
+
+    if data == "ps_comm":
+        bot.answer_callback_query(c.id)
+        text = (
+            "💰 <b>סינון לפי עמלה</b>\n"
+            "בחר מינימום עמלה. ברירת מחדל מומלצת: 15%+"
+        )
+        kb = types.InlineKeyboardMarkup(row_width=3)
+        kb.add(
+            types.InlineKeyboardButton("0%", callback_data="ps_comm_0"),
+            types.InlineKeyboardButton("7%+", callback_data="ps_comm_7"),
+            types.InlineKeyboardButton("10%+", callback_data="ps_comm_10"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("15%+", callback_data="ps_comm_15"),
+            types.InlineKeyboardButton("↩️ חזרה", callback_data="ps_back"),
+        )
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=kb, parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data.startswith("ps_comm_"):
+        bot.answer_callback_query(c.id)
+        try:
+            v = float(data.split("_")[-1])
+        except Exception:
+            v = 15.0
+        set_min_commission(v)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_price_cfg":
+        bot.answer_callback_query(c.id)
+        text = (
+            "💱 <b>תצורת מחיר</b>\n"
+            f"מטבע מקור: <b>{AE_PRICE_INPUT_CURRENCY}</b>\n"
+            f"המרה $→₪: <b>{'כן' if AE_PRICE_CONVERT_USD_TO_ILS else 'לא'}</b>\n"
+            f"שער USD→ILS: <b>{float(USD_TO_ILS_RATE):g}</b>"
+        )
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("מטבע: ILS", callback_data="ps_cur_ils"),
+            types.InlineKeyboardButton("מטבע: USD", callback_data="ps_cur_usd"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("המרה: ON", callback_data="ps_conv_on"),
+            types.InlineKeyboardButton("המרה: OFF", callback_data="ps_conv_off"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("🔢 קבע שער", callback_data="ps_set_rate"),
+            types.InlineKeyboardButton("↩️ חזרה", callback_data="ps_back"),
+        )
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=kb, parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_cur_ils":
+        bot.answer_callback_query(c.id)
+        AE_PRICE_INPUT_CURRENCY = "ILS"
+        _set_state_str("price_input_currency", "ILS")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_cur_usd":
+        bot.answer_callback_query(c.id)
+        AE_PRICE_INPUT_CURRENCY = "USD"
+        _set_state_str("price_input_currency", "USD")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_conv_on":
+        bot.answer_callback_query(c.id)
+        AE_PRICE_CONVERT_USD_TO_ILS = True
+        _set_state_str("convert_usd_to_ils", "1")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_conv_off":
+        bot.answer_callback_query(c.id)
+        AE_PRICE_CONVERT_USD_TO_ILS = False
+        _set_state_str("convert_usd_to_ils", "0")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
 
     if data == "ps_set_rate":
         uid = c.from_user.id
