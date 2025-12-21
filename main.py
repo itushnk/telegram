@@ -3637,6 +3637,7 @@ def on_inline_click(c):
 
     data = c.data or ""
     chat_id = c.message.chat.id
+    msg_id = c.message.message_id
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
@@ -4771,6 +4772,63 @@ def refill_daemon():
         time.sleep(AE_REFILL_INTERVAL_SECONDS)
 
 # ========= MAIN =========
+
+# ========= TEXT INPUT ROUTER (for menus that expect typed input) =========
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def on_text_input(m):
+    # Only admins can drive typed inputs
+    if not _is_admin(m):
+        return
+
+    uid = m.from_user.id
+    text = (m.text or "").strip()
+
+    # Allow cancel
+    if text.lower() in ("/cancel", "cancel", "ביטול"):
+        # clear all pending waits for this user
+        PROD_SEARCH_WAIT.pop(uid, None)
+        RATE_SET_WAIT.pop(uid, None)
+        DELAY_SET_WAIT.pop(uid, None)
+        bot.reply_to(m, "בוטל ✅")
+        return
+
+    # 1) USD→ILS rate setter
+    if RATE_SET_WAIT.get(uid):
+        RATE_SET_WAIT.pop(uid, None)
+        try:
+            v = float(text.replace(",", "."))
+            set_usd_to_ils_rate(v)
+            bot.reply_to(m, f"שער עודכן ✅ 1$ = ₪{USD_TO_ILS_RATE:g}")
+        except Exception:
+            bot.reply_to(m, "לא הצלחתי להבין את השער. נסה למשל: 3.70")
+        return
+
+    # 2) Post delay (minutes)
+    if DELAY_SET_WAIT.get(uid):
+        DELAY_SET_WAIT.pop(uid, None)
+        try:
+            minutes = int(float(text))
+            minutes = max(1, min(minutes, 24*60))
+            _set_post_delay_seconds(minutes * 60)
+            bot.reply_to(m, f"מרווח פרסום עודכן ✅ כל {minutes} דקות")
+        except Exception:
+            bot.reply_to(m, "לא הצלחתי להבין. שלח מספר דקות (למשל 20).")
+        return
+
+    # 3) Product search typed query
+    if PROD_SEARCH_WAIT.get(uid):
+        PROD_SEARCH_WAIT.pop(uid, None)
+        query = text
+        try:
+            _run_product_search_flow(m.chat.id, query, strict=True, origin="item")
+        except Exception as e:
+            bot.reply_to(m, f"שגיאה בחיפוש: {e}")
+        return
+
+    # Otherwise ignore (do not spam)
+    return
+
+
 if __name__ == "__main__":
     log_info(f"[BOOT] main.py {CODE_VERSION} fp={_code_fingerprint()} commit={os.environ.get('RAILWAY_GIT_COMMIT_SHA') or os.environ.get('RAILWAY_COMMIT_SHA') or os.environ.get('GIT_COMMIT') or 'n/a'}")
     log_info(f"Instance: {socket.gethostname()}")
