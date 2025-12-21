@@ -1949,15 +1949,25 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     orig_text, orig_is_from = _pick_value(orig_raw)
 
     sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT)
+    
     sale_cur = (
-        (p.get("app_sale_price_currency") if AE_USE_APP_PRICE else None)
-        or p.get("sale_price_currency")
-        or p.get("target_sale_price_currency")
-        or p.get("original_price_currency")
-        or p.get("target_original_price_currency")
-        or ""
+    p.get("target_app_sale_price_currency")
+    or p.get("target_sale_price_currency")
+    or (p.get("app_sale_price_currency") if AE_USE_APP_PRICE else None)
+    or p.get("sale_price_currency")
+    or p.get("original_price_currency")
+    or p.get("target_original_price_currency")
+    or ""
     )
-    orig_cur = (p.get("original_price_currency") or p.get("target_original_price_currency") or p.get("sale_price_currency") or "")
+    orig_cur = (
+    p.get("target_original_price_currency")
+    or p.get("original_price_currency")
+    or p.get("target_sale_price_currency")
+    or p.get("sale_price_currency")
+    or p.get("target_app_sale_price_currency")
+    or (p.get("app_sale_price_currency") if AE_USE_APP_PRICE else None)
+    or ""
+    )
 
     sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT, src_currency=(sale_cur or None))
     orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE_DEFAULT, src_currency=(orig_cur or None))
@@ -2468,29 +2478,58 @@ def _ms_eval_row_filters(row: dict, ignore_global: bool = True) -> tuple[bool, s
     return True, ""
 
 
-_HE_KEYWORD_MAP = [
-    ("שעון חכם", "smartwatch"),
-    ("שעון", "wristwatch"),
-    ("אוזניות", "headphones"),
-    ("מטען", "charger"),
-    ("מטבח", "kitchen gadget"),
-    ("רכב", "car accessories"),
-    ("כלי עבודה", "tools"),
-    ("מקדחה", "drill"),
-    ("נעל", "shoes"),
-    ("תיק", "bag"),
-    ("מצלמה", "camera"),
-    ("כלב", "dog"),
-    ("כלבים", "dog"),
-    ("חתול", "cat"),
-    ("חתולים", "cat"),
+# --- Manual-search keyword normalization (Hebrew -> English) ---
+# NOTE: Order matters: longer / more specific phrases should appear first.
+_HE_PHRASE_MAP = [
+    ("רצועת כלב", "dog leash"),
+    ("רצועה לכלב", "dog leash"),
+    ("קולר לכלב", "dog collar"),
+    ("קולר כלב", "dog collar"),
+    ("חגורה לכלב", "dog harness"),
+    ("רתמה לכלב", "dog harness"),
     ("צעצוע לכלב", "dog toy"),
-    ("חיית מחמד", "pet supplies"),
-    ("שעוני", "wristwatch"),
+    ("צעצועים לכלב", "dog toy"),
+    ("מזון לכלב", "dog food"),
+    ("מיטה לכלב", "dog bed"),
+    ("שעון חכם", "smartwatch"),
     ("שעון יד", "wristwatch"),
-    ("שעונים", "wristwatch"),
+    ("רצועת שעון", "watch band"),
+    ("רצועה לשעון", "watch band"),
+    ("מגן מסך", "screen protector"),
+    ("כיסוי", "case"),
 ]
 
+# Loose word mapping (used when phrase map doesn't match)
+_HE_WORD_MAP = {
+    "כלב": "dog",
+    "כלבים": "dog",
+    "חתול": "cat",
+    "חתולים": "cat",
+    "רצועה": "strap",
+    "רצועת": "strap",
+    "רצוע": "strap",
+    "קולר": "collar",
+    "רתמה": "harness",
+    "חגורה": "harness",
+    "צעצוע": "toy",
+    "צעצועים": "toy",
+    "מיטה": "bed",
+    "מזון": "food",
+    "שעון": "watch",
+    "שעונים": "watch",
+    "חכם": "smart",
+    "אפל": "apple",
+    "אוזניות": "headphones",
+    "מטען": "charger",
+    "מטבח": "kitchen gadget",
+    "רכב": "car accessories",
+    "כלי": "tools",
+    "עבודה": "tools",
+    "מקדחה": "drill",
+    "נעל": "shoes",
+    "תיק": "bag",
+    "מצלמה": "camera",
+}
 
 _MS_TRANSLATE_CACHE: dict[str, str] = {}
 
@@ -2541,44 +2580,125 @@ def _ms_ai_translate_keywords(q: str) -> str:
     return q
 
 def _ms_normalize_keywords(q: str) -> str:
-    """Best-effort mapping of common Hebrew keywords to English for the affiliate API."""
+    """Normalize user query (Hebrew/English) into concise English keywords for the affiliate API.
+
+    Goals:
+    - Preserve modifiers (e.g., 'רצועת כלב' -> 'dog leash', not just 'dog').
+    - Prefer phrase matches, then fall back to token mapping, then optional AI translation.
+    """
     q = (q or "").strip()
     if not q:
         return q
     if "http://" in q or "https://" in q:
         return q
+
+    # If the query contains Hebrew, try phrase/word mapping first.
     if re.search(r"[\u0590-\u05FF]", q):
-        for he, en in _HE_KEYWORD_MAP:
-            if he in q:
+        # phrase map (most specific first)
+        for he, en in _HE_PHRASE_MAP:
+            if he and he in q:
                 return en
+
+        def _he_stem(w: str) -> str:
+            w = (w or "").strip()
+            w = re.sub(r"[^\u0590-\u05FF]", "", w)
+            # strip common prefixes (very conservative)
+            for _ in range(2):
+                if w[:1] in ("ו", "ה", "ב", "כ", "ל", "מ", "ש"):
+                    w = w[1:]
+            # strip common suffixes
+            for suf in ("ים", "ות", "ת"):
+                if w.endswith(suf) and len(w) > len(suf) + 1:
+                    w = w[:-len(suf)]
+            return w
+
+        words = [w for w in re.split(r"\s+", q) if w]
+        toks: list[str] = []
+        for w in words:
+            stem = _he_stem(w)
+            if stem and stem in _HE_WORD_MAP:
+                toks.append(_HE_WORD_MAP[stem])
+                continue
+            if w in _HE_WORD_MAP:
+                toks.append(_HE_WORD_MAP[w])
+
+        # context rules
+        if ("dog" in toks) and ("strap" in toks):
+            toks = ["leash" if t == "strap" else t for t in toks]
+        if ("watch" in toks) and ("strap" in toks):
+            toks = ["band" if t == "strap" else t for t in toks]
+
+        # combine smart+watch -> smartwatch
+        if "smart" in toks and "watch" in toks:
+            toks = [t for t in toks if t not in ("smart", "watch")]
+            toks.insert(0, "smartwatch")
+
+        # dedupe while preserving order
+        seen = set()
+        toks2: list[str] = []
+        for t in toks:
+            t = (t or "").strip().lower()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            toks2.append(t)
+
+        if toks2:
+            return " ".join(toks2[:5])
+
         return _ms_ai_translate_keywords(q)
+
     return q
 
-
-
 def _ms_build_query_variants(kw: str) -> list[str]:
-    kw = (kw or "").strip()
+    kw = (kw or "").strip().lower()
     if not kw:
         return []
-    low = kw.lower().strip()
-    # Common synonym expansions for better relevance
-    if low in ("wristwatch", "watch", "smartwatch"):
-        return ["watch", "wristwatch", "smartwatch", "watch men", "watch women"]
-    if low in ("dog", "cat"):
-        return [low, f"{low} accessories", f"{low} toy", "pet supplies"]
-    # Default: try as-is, plus a "buyer intent" suffix for generic terms
-    if len(low.split()) == 1 and len(low) >= 3:
-        return [kw, f"{kw} best", f"buy {kw}"]
+
+    # Specializations (ordered)
+    if "dog leash" in kw or ("dog" in kw and "leash" in kw):
+        return ["dog leash", "leash for dog", "dog lead", "pet leash"]
+    if "dog collar" in kw or ("dog" in kw and "collar" in kw):
+        return ["dog collar", "pet collar dog", "dog collar adjustable", "dog accessories"]
+    if "dog harness" in kw or ("dog" in kw and "harness" in kw):
+        return ["dog harness", "pet harness dog", "no pull harness dog", "dog accessories"]
+
+    if kw in ("wristwatch", "watch"):
+        return ["wristwatch", "men watch", "women watch", "quartz watch", "luxury watch"]
+    if kw in ("smartwatch", "smart watch"):
+        return ["smartwatch", "fitness smartwatch", "smart watch", "android smartwatch", "ios smartwatch"]
+    if "watch band" in kw or ("watch" in kw and "band" in kw):
+        return ["watch band", "watch strap", "watch bracelet", "replacement watch band"]
+
+    # General fallbacks
+    if any(x in kw for x in ("car", "auto")):
+        return ["car accessories", "car gadget", "car interior accessories", "auto accessories"]
+    if "kitchen" in kw:
+        return ["kitchen gadget", "kitchen tools", "kitchen accessories", "home kitchen"]
+    if "tools" in kw or "drill" in kw:
+        return ["tools", "hand tools", "power tools", "workshop tools"]
+
     return [kw]
 
 def _ms_build_token_set(kw: str) -> set[str]:
-    low = (kw or "").lower()
-    toks = {t for t in re.split(r"\s+", low) if t}
-    # Synonyms
-    if "wristwatch" in toks:
-        toks.add("watch")
-    if "smartwatch" in toks:
-        toks.add("watch")
+    low = (kw or "").lower().strip()
+    toks = {t for t in re.split(r"\W+", low) if t}
+    if "wristwatch" in low:
+        toks.update({"watch", "wristwatch"})
+    if "smartwatch" in low:
+        toks.update({"smartwatch", "watch"})
+    if "dog leash" in low:
+        toks.update({"dog", "leash", "lead"})
+    if "dog collar" in low:
+        toks.update({"dog", "collar"})
+    if "dog harness" in low:
+        toks.update({"dog", "harness"})
+    if "watch band" in low:
+        toks.update({"watch", "band", "strap"})
+    if "car" in toks or "auto" in toks:
+        toks.add("vehicle")
+    if "kitchen" in toks:
+        toks.add("home")
     if "dog" in toks or "cat" in toks:
         toks.add("pet")
     return toks
@@ -2587,14 +2707,27 @@ def _ms_relevance_score(title: str, tokens: set[str]) -> int:
     t = (title or "").lower()
     if not t or not tokens:
         return 0
+
     score = 0
     for tok in tokens:
         if tok and tok in t:
             score += 3
+
     # boost if multiple tokens match
     if score >= 6:
         score += 2
-    return score
+
+    # Penalize common "accessory/noise" terms when the query didn't ask for them
+    noise = {
+        "screen", "protector", "hydrogel", "film",
+        "case", "cover",
+        "phone", "samsung", "iphone",
+    }
+    for bad in noise:
+        if bad in t and bad not in tokens:
+            score -= 3
+
+    return max(score, 0)
 
 def _ms_affiliate_query_with_fallback(uid: int, q: str, kw_norm: str, page: int, per_page: int, cat_id: str | None):
     """Run affiliate queries (possibly multiple variants) and merge unique products."""
