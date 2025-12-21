@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v13")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v14")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -298,7 +298,7 @@ def _parse_keywords_list(raw: str) -> list[str]:
         out.append(p)
     return out
 
-def _choose_refill_keywords() -> list[str]:
+def _choose_refill_keywords(ignore_selected_categories: bool = False) -> list[str]:
     kws = _parse_keywords_list(AE_KEYWORDS)
     if not kws:
         return []
@@ -2063,12 +2063,26 @@ def refill_from_affiliate(
         if current_len >= max_needed:
             return 0, 0, current_len, None, None
 
+
         # Keywords: אם המשתמש העביר מילה – נשתמש בה; אחרת נבחר מרשימת AE_KEYWORDS/קטגוריות.
+        # Build query jobs for variety (mix keywords + optional selected categories)
+        query_jobs: list[dict] = []
         if keywords and str(keywords).strip():
-            kw_list = [str(keywords).strip()]
+            query_jobs = [{"kw": str(keywords).strip(), "cat_id": None}]
         else:
             kw_list = _choose_refill_keywords(ignore_selected_categories=ignore_selected_categories)
+            cat_list = [] if ignore_selected_categories else get_selected_category_ids()
+            for kw in kw_list:
+                query_jobs.append({"kw": kw, "cat_id": None})
+            for cid in cat_list:
+                query_jobs.append({"kw": "", "cat_id": cid})
+            if AE_REFILL_RANDOMIZE:
+                random.shuffle(query_jobs)
+            # limit number of queries this cycle
+            query_jobs = query_jobs[:max(1, AE_REFILL_KEYWORDS_PER_CYCLE)]
 
+        if not query_jobs:
+            return 0, 0, current_len, None, "No keywords/categories configured for refill"
         # sort pool
         sort_pool = [s.strip().upper() for s in re.split(r"[\n,|]+", AE_REFILL_SORT_POOL or "") if s.strip()]
         if not sort_pool:
@@ -2090,7 +2104,9 @@ def refill_from_affiliate(
         except Exception:
             existing_ids = set()
 
-        for kw in kw_list:
+        for job in query_jobs:
+            kw = (job.get("kw") or "").strip()
+            cat_id = job.get("cat_id")
             # random page + random sort
             if AE_REFILL_RANDOMIZE:
                 page_no = random.randint(1, max(1, AE_REFILL_RANDOM_PAGE_MAX))
@@ -2103,7 +2119,8 @@ def refill_from_affiliate(
 
             try:
                 products, resp_code, resp_msg = affiliate_product_query(
-                    keywords=kw,
+                    category_id=cat_id,
+                    keywords=(kw or None),
                     page_no=page_no,
                     page_size=50,
                     sort=eff_sort,
@@ -2375,6 +2392,20 @@ def _ms_active_filters_text() -> str:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
     return " | ".join(parts) if parts else "ללא"
 
+
+
+
+def _eval_row_filters(row: dict) -> tuple[bool, str]:
+    """Global row filters used by the refill/queue pipeline.
+
+    If the admin selected any strict filters (free shipping / min orders / min rating),
+    we always apply them.
+
+    Otherwise, AE_REFILL_IGNORE_GLOBAL_FILTERS can relax filtering to increase variety.
+    """
+    strict = bool(FREE_SHIP_ONLY) or (int(MIN_ORDERS or 0) > 0) or (float(MIN_RATING or 0) > 0)
+    ignore_global = bool(AE_REFILL_IGNORE_GLOBAL_FILTERS) and not strict
+    return _ms_eval_row_filters(row, ignore_global=ignore_global)
 def _ms_eval_row_filters(row: dict, ignore_global: bool = True) -> tuple[bool, str]:
     """Return (ok, reason_if_not_ok) for manual search preview.
 
@@ -2849,7 +2880,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
         score = _ms_relevance_score(str(p.get("product_title", "")), tokens)
-        ok, reason = _ms_eval_row_filters(row, ignore_global=True)
+        ok, reason = _ms_eval_row_filters(row, ignore_global=False)
         if not ok:
             # bucket reasons (best-effort)
             if "קישור" in reason:
@@ -3146,6 +3177,9 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
         uid = getattr(getattr(c, 'from_user', None), 'id', None) or getattr(getattr(getattr(c, 'message', None), 'from_user', None), 'id', 0)
+        # legacy alias used by some buttons
+        if data == "filters":
+            data = "flt_menu"
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -3318,26 +3352,42 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
             return True
 
-        if data == "fc_sync":
-            _ = get_categories(force=True)
-            mode = CAT_VIEW_MODE.get(uid, "top")
-            if mode == "all":
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=None)
-            elif mode == "search":
-                q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=None)
-            else:
-                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
-            return True
 
+        if data == "fc_sync":
+            try:
+                bot.answer_callback_query(c.id, "מסנכרן קטגוריות...", show_alert=False)
+            except Exception:
+                pass
+            try:
+                _ = get_categories(force=True)
+                mode = CAT_VIEW_MODE.get(uid, "top")
+                if mode == "all":
+                    safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=None)
+                elif mode == "search":
+                    q = (CAT_LAST_QUERY.get(uid) or "").strip()
+                    safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=None)
+                else:
+                    safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
+            except Exception as e:
+                try:
+                    bot.answer_callback_query(c.id, f"⚠️ שגיאה בסנכרון: {e}", show_alert=True)
+                except Exception:
+                    pass
+            return True
 
     except Exception as e:
         try:
-            bot.answer_callback_query(c.id, f"שגיאה: {e}", show_alert=True)
+            logger.exception(f"[FILTERS] callback error: {e}")
+        except Exception:
+            pass
+        try:
+            bot.answer_callback_query(c.id, f"⚠️ שגיאה: {e}", show_alert=True)
         except Exception:
             pass
         return True
+
     return False
+
 
 # ========= AI REVIEW / APPROVAL UI =========
 AI_REVIEW_CTX: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id) of last review photo/message
