@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v14")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20currencyfix")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -255,20 +255,17 @@ USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.
 # and whether to convert USD→ILS for display.
 AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
 AE_PRICE_INPUT_CURRENCY = (_get_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY_DEFAULT) or AE_PRICE_INPUT_CURRENCY_DEFAULT).strip().upper()
-if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS", "AUTO"):
+if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
     AE_PRICE_INPUT_CURRENCY = "USD"
 
 AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
 
 def _display_currency_code() -> str:
-    # If the input is already ILS, show ILS.
+    # If input is already ILS, never convert again.
     if AE_PRICE_INPUT_CURRENCY == "ILS":
         return "ILS"
-    # AUTO: infer per-product currency when possible; display depends on convert flag.
-    if AE_PRICE_INPUT_CURRENCY == "AUTO":
-        return "ILS" if AE_PRICE_CONVERT_USD_TO_ILS else "USD"
-    # USD
+    # Input is USD: convert only when enabled
     return "ILS" if AE_PRICE_CONVERT_USD_TO_ILS else "USD"
 
 def _display_currency_suffix_he() -> str:
@@ -285,29 +282,6 @@ AE_PRICE_INT_IS_CENTS = (os.environ.get("AE_PRICE_INT_IS_CENTS", "1") or "1").st
 AE_PRICE_PICK_MODE = (os.environ.get("AE_PRICE_PICK_MODE", "min") or "min").strip().lower()
 
 AE_KEYWORDS = (os.environ.get("AE_KEYWORDS", "") or "").strip()
-
-def _parse_keywords_list(raw: str) -> list[str]:
-    parts = [p.strip() for p in re.split(r"[\n,|]+", raw or "") if p.strip()]
-    seen=set()
-    out=[]
-    for p in parts:
-        k=p.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(p)
-    return out
-
-def _choose_refill_keywords(ignore_selected_categories: bool = False) -> list[str]:
-    kws = _parse_keywords_list(AE_KEYWORDS)
-    if not kws:
-        return []
-    if not AE_REFILL_RANDOMIZE:
-        return kws
-    kws2 = list(kws)
-    random.shuffle(kws2)
-    k = min(len(kws2), max(1, AE_REFILL_KEYWORDS_PER_CYCLE))
-    return kws2[:k]
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
@@ -321,7 +295,8 @@ _default_candidates = [
     "https://api-sg.aliexpress.com/sync",       # Newer AliExpress gateway (/sync)
     "https://api.taobao.com/router/rest",        # Overseas (US)
     "https://gw.api.taobao.com/router/rest",     # Legacy gateway
-        # "https://de-api.aliexpress.com/router/rest", # EU gateway (often returns isv.appkey-not-exists)
+    "https://eco.taobao.com/router/rest",        # Alt/legacy
+    # "https://de-api.aliexpress.com/router/rest", # EU gateway (often returns isv.appkey-not-exists)
 ]
 
 AE_TOP_URL_CANDIDATES = []
@@ -352,7 +327,6 @@ AE_TARGET_CURRENCY = "USD"
 # =================== AI (OpenAI) — “לתת חיים למוצרים” ===================
 # הפעלה/כיבוי:
 GPT_ENABLED = (os.environ.get("GPT_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
-GPT_TRANSLATE_SEARCH = (os.environ.get("GPT_TRANSLATE_SEARCH", "0") or "0").strip().lower() in ("1","true","yes","on")
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
 OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
 
@@ -489,14 +463,6 @@ AE_REFILL_MIN_QUEUE = int(os.environ.get("AE_REFILL_MIN_QUEUE", "30") or "30")
 AE_REFILL_MAX_PAGES = int(os.environ.get("AE_REFILL_MAX_PAGES", "3") or "3")
 AE_REFILL_PAGE_SIZE = int(os.environ.get("AE_REFILL_PAGE_SIZE", "50") or "50")
 AE_REFILL_SORT = (os.environ.get("AE_REFILL_SORT", "LAST_VOLUME_DESC") or "LAST_VOLUME_DESC").strip().upper()
-# Randomized refill across keywords (helps avoid always pulling the same top items)
-AE_REFILL_RANDOMIZE = (os.environ.get("AE_REFILL_RANDOMIZE", "1") or "1").strip().lower() in ("1","true","yes","on")
-AE_REFILL_KEYWORDS_PER_CYCLE = int(os.environ.get("AE_REFILL_KEYWORDS_PER_CYCLE", "6") or "6")
-AE_REFILL_RANDOM_PAGE_MAX = int(os.environ.get("AE_REFILL_RANDOM_PAGE_MAX", "3") or "3")  # sample pages 1..N
-AE_REFILL_SORT_POOL = (os.environ.get("AE_REFILL_SORT_POOL", "") or "").strip()
-# If set to 0, refill applies MIN_ORDERS/MIN_RATING/FREE_SHIP_ONLY. Default: 1 (refill is for variety)
-AE_REFILL_IGNORE_GLOBAL_FILTERS = (os.environ.get("AE_REFILL_IGNORE_GLOBAL_FILTERS", "1") or "1").strip().lower() in ("1","true","yes","on")
-
 
 # Optional price filtering (ILS buckets) for refill results.
 # Example: AE_PRICE_BUCKETS=1-5,5-10,10-20,20-50,50+
@@ -596,7 +562,6 @@ DELAY_EVENT = threading.Event()
 EXPECTING_TARGET = {}      # dict[user_id] = "public"|"private"
 EXPECTING_UPLOAD = set()   # user_ids שמצפים ל-CSV
 FILE_LOCK = threading.Lock()
-queue_lock = threading.Lock()  # protects queue_items mutations (refill/manual/send)
 
 # ========= SINGLE INSTANCE LOCK =========
 def acquire_single_instance_lock(lock_path: str):
@@ -769,13 +734,15 @@ def usd_to_ils(price_text: str, rate: float) -> str:
 
 
 
-def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float, src_currency: str | None = None) -> str:
+def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str:
     """Normalize incoming price text to what we display in the post.
 
-    - src_currency (when provided) overrides AE_PRICE_INPUT_CURRENCY per product.
-    - If AE_PRICE_INPUT_CURRENCY=AUTO and src_currency is missing, we try to infer currency from the raw text.
-    - Integer-cents normalization is applied when AE_PRICE_INT_IS_CENTS is ON, and also with a conservative heuristic
-      for very large integers (helps when the affiliate API returns cents without the flag being set).
+    Rules:
+    - If AE_PRICE_INPUT_CURRENCY=ILS → treat input as ILS and NEVER convert.
+    - If input is USD:
+        - If AE_PRICE_CONVERT_USD_TO_ILS is ON → convert USD→ILS using usd_to_ils_rate.
+        - If OFF → keep USD as-is (no conversion).
+    - Cents-as-integer normalization (AE_PRICE_INT_IS_CENTS) is applied in both modes.
     """
     if price_text is None:
         return ""
@@ -785,33 +752,20 @@ def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float, src_cu
     if num is None:
         return ""
 
-    # Normalize integer-cents when configured (or when clearly looks like cents)
-    if raw_clean and raw_clean.isdigit():
+    # Normalize integer-cents when configured
+    if AE_PRICE_INT_IS_CENTS and raw_clean and raw_clean.isdigit():
         try:
             ival = int(raw_clean)
-            if AE_PRICE_INT_IS_CENTS or (ival >= 10000 and ival <= 10000000):
+            if ival >= 1000 and ival <= 10000000:
                 num = ival / 100.0
         except Exception:
             pass
 
-    cur = (src_currency or "").strip().upper()
-
-    # AUTO inference from raw string when currency is unknown
-    if not cur and AE_PRICE_INPUT_CURRENCY == "AUTO":
-        up = raw.upper()
-        if "ILS" in up or "NIS" in up or "₪" in raw:
-            cur = "ILS"
-        elif "$" in raw or "USD" in up:
-            cur = "USD"
-
-    if not cur:
-        cur = AE_PRICE_INPUT_CURRENCY
-
     # If input currency is ILS, do not convert
-    if cur in ("ILS", "NIS"):
+    if AE_PRICE_INPUT_CURRENCY == "ILS":
         return _format_money(float(num), PRICE_DECIMALS)
 
-    # Treat all other currencies like USD for display logic
+    # Input is USD
     if not AE_PRICE_CONVERT_USD_TO_ILS:
         return _format_money(float(num), PRICE_DECIMALS)
 
@@ -820,6 +774,7 @@ def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float, src_cu
     except Exception:
         pass
     return _format_money(float(num), PRICE_DECIMALS)
+
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -1833,9 +1788,9 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
         "page_no": page_no,
         "page_size": page_size,
         "sort": AE_REFILL_SORT,
-        "target_currency": (target_currency_override or AE_TARGET_CURRENCY),
-        "target_language": (target_language_override or AE_TARGET_LANGUAGE),
-        "target_currency": (target_currency_override or AE_TARGET_CURRENCY),
+        "target_currency": AE_TARGET_CURRENCY,
+        "target_language": AE_TARGET_LANGUAGE,
+        "target_currency": AE_TARGET_CURRENCY,
         "tracking_id": AE_TRACKING_ID,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "fields": "product_id,product_title,product_main_image_url,promotion_link,sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url",
@@ -1843,7 +1798,7 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     }
     payload = _top_call("aliexpress.affiliate.hotproduct.query", biz)
     resp = _extract_resp_result(payload)
-    resp_code = resp.get("resp_code")
+    resp_code = safe_int(resp.get("resp_code"), 200)
     resp_msg = resp.get("resp_msg")
 
     result = resp.get("result") or {}
@@ -1859,32 +1814,22 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     return products, resp_code, resp_msg
 
 
-
-def affiliate_product_query(
-    page_no: int,
-    page_size: int,
-    category_id: str | None = None,
-    keywords: str | None = None,
-    sort: str | None = None,
-    target_language_override: str | None = None,
-    target_currency_override: str | None = None,
-) -> tuple[list[dict], int | None, str | None]:
+def affiliate_product_query(page_no: int, page_size: int, category_id: str | None = None, keywords: str | None = None) -> tuple[list[dict], int | None, str | None]:
     """Affiliate product query with optional category filter.
 
     Notes:
     - If `keywords` is provided, it is sent as-is to TOP.
-    - Otherwise, if AE_KEYWORDS exists, it can randomize keywords (AE_REFILL_RANDOMIZE) to avoid repetitive results.
-    - `sort` overrides AE_REFILL_SORT for this call.
+    - Otherwise, if AE_KEYWORDS exists, it rotates keywords to avoid repetitive results.
     """
-    fields = "product_id,product_title,product_main_image_url,product_small_image_urls,app_sale_price,original_price,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
+    fields = "product_id,product_title,product_main_image_url,promotion_link,promotion_url,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
     biz = {
         "tracking_id": AE_TRACKING_ID,
         "page_no": str(page_no),
         "page_size": str(page_size),
-        "sort": (sort or AE_REFILL_SORT),
+        "sort": AE_REFILL_SORT,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
-        "target_currency": (target_currency_override or AE_TARGET_CURRENCY),
-        "target_language": (target_language_override or AE_TARGET_LANGUAGE),
+        "target_currency": AE_TARGET_CURRENCY,
+        "target_language": AE_TARGET_LANGUAGE,
         "fields": fields,
         "platform_product_type": "ALL",
     }
@@ -1892,50 +1837,26 @@ def affiliate_product_query(
         biz["category_ids"] = str(category_id).strip()
 
     # Manual keywords override (e.g., admin "manual search")
-    if keywords is not None and str(keywords).strip():
+    if keywords:
         biz["keywords"] = str(keywords).strip()
-    # Otherwise use env keywords (if provided)
+    # Otherwise rotate env keywords (if provided)
     elif AE_KEYWORDS:
-        kws = _parse_keywords_list(AE_KEYWORDS)
+        kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS) if k.strip()]
         if kws:
-            if AE_REFILL_RANDOMIZE:
-                biz["keywords"] = random.choice(kws)
+            mode = (os.environ.get("AE_REFILL_KEYWORD_MODE") or _get_state_str("refill_kw_mode", "random")).strip().lower()
+            if mode in ("rr", "roundrobin", "round-robin", "robin"):
+                idx = _get_state_int("refill_kw_idx", 0)
+                biz["keywords"] = kws[idx % len(kws)]
+                _set_state_str("refill_kw_idx", str(idx + 1))
             else:
-                biz["keywords"] = kws[(page_no - 1) % len(kws)]
-
+                biz["keywords"] = random.choice(kws)
     payload = _top_call("aliexpress.affiliate.product.query", biz)
     resp = _extract_resp_result(payload)
-    resp_code = resp.get("resp_code")
-    resp_msg = resp.get("resp_msg")
-
-    result = resp.get("result") or {}
-    products = (result.get("products") or {}).get("product") or []
-    if isinstance(products, dict):
-        products = [products]
-    return list(products), (int(resp_code) if str(resp_code).isdigit() else None), (str(resp_msg) if resp_msg else None)
-
-
-def affiliate_product_detail_get(product_ids: str, fields: str | None = None) -> tuple[list[dict], int | None, str | None]:
-    """Fetch product details by product_ids (comma-separated).
-
-    Useful for exact matches when admin provides a product URL.
-    """
-    biz = {
-        "tracking_id": AE_TRACKING_ID,
-        "target_language": (target_language_override or AE_TARGET_LANGUAGE),
-        "country": AE_SHIP_TO_COUNTRY,
-        "product_ids": str(product_ids).strip(),
-        "fields": fields
-        or "product_id,product_title,product_main_image_url,sale_price,original_price,sale_price_currency,original_price_currency,app_sale_price,app_sale_price_currency,product_detail_url,promotion_link,product_video_url,evaluate_rate,lastest_volume",
-    }
-    payload = _top_call("aliexpress.affiliate.productdetail.get", biz)
-    resp = _extract_resp_result(payload)
-    resp_code = resp.get("resp_code")
+    resp_code = safe_int(resp.get("resp_code"), 200)
     resp_msg = resp.get("resp_msg")
 
     result = resp.get("result") or {}
     products = result.get("products") or result.get("product_list") or []
-
     if isinstance(products, dict) and "product" in products:
         products = products.get("product") or []
     if products is None:
@@ -1944,21 +1865,14 @@ def affiliate_product_detail_get(product_ids: str, fields: str | None = None) ->
         products = [products]
     return products, resp_code, resp_msg
 
-
 def _map_affiliate_product_to_row(p: dict) -> dict:
     # מחיר מבצע / מקורי - טיפול בטווחים ("1.23-4.56") + מניעת המרה כפולה אם המחיר כבר בש"ח
-    # Prefer target_* prices if present (often more accurate for the target market)
     sale_raw = (
-        p.get("target_app_sale_price")
-        or p.get("target_sale_price")
-        or (
-            p.get("app_sale_price")
-            if AE_USE_APP_PRICE
-            else (p.get("sale_price") or p.get("app_sale_price"))
-        )
-        or ""
-    )
-    orig_raw = (p.get("target_original_price") or p.get("original_price") or "")
+        p.get("app_sale_price")
+        if AE_USE_APP_PRICE
+        else (p.get("sale_price") or p.get("app_sale_price"))
+    ) or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
+    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
 
     def _pick_value(raw_val):
         s = str(raw_val or "").strip()
@@ -1990,28 +1904,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     orig_text, orig_is_from = _pick_value(orig_raw)
 
     sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT)
-    
-    sale_cur = (
-    p.get("target_app_sale_price_currency")
-    or p.get("target_sale_price_currency")
-    or (p.get("app_sale_price_currency") if AE_USE_APP_PRICE else None)
-    or p.get("sale_price_currency")
-    or p.get("original_price_currency")
-    or p.get("target_original_price_currency")
-    or ""
-    )
-    orig_cur = (
-    p.get("target_original_price_currency")
-    or p.get("original_price_currency")
-    or p.get("target_sale_price_currency")
-    or p.get("sale_price_currency")
-    or p.get("target_app_sale_price_currency")
-    or (p.get("app_sale_price_currency") if AE_USE_APP_PRICE else None)
-    or ""
-    )
-
-    sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT, src_currency=(sale_cur or None))
-    orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE_DEFAULT, src_currency=(orig_cur or None))
+    orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE_DEFAULT)
 
     product_id = str(p.get("product_id", "")).strip()
 
@@ -2045,162 +1938,265 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
 
 
-
-def refill_from_affiliate(
-    max_needed: int = AE_REFILL_MIN_QUEUE,
-    keywords: str | None = None,
-    ignore_selected_categories: bool = False,
-) -> tuple[int, int, int, int | None, str | None]:
-    """ממלא את pending.csv מה-AliExpress Affiliate עד שמגיעים ל-max_needed.
-
-    מחזיר:
-      (added_count, dup_count, total_after, last_page, last_error)
+def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_selected_categories: bool = False) -> tuple[int, int, int, int, str | None]:
     """
-    try:
-        with FILE_LOCK:
-            pending_rows = read_products(PENDING_CSV)
-        current_len = len(pending_rows)
-        if current_len >= max_needed:
-            return 0, 0, current_len, None, None
+    מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
+    """
+    if not AE_APP_KEY or not AE_APP_SECRET or not AE_TRACKING_ID:
+        return 0, 0, 0, 0, "חסרים AE_APP_KEY/AE_APP_SECRET/AE_TRACKING_ID"
 
+    with FILE_LOCK:
+        pending_rows = read_products(PENDING_CSV)
+        existing_keys = {_key_of_row(r) for r in pending_rows}
 
-        # Keywords: אם המשתמש העביר מילה – נשתמש בה; אחרת נבחר מרשימת AE_KEYWORDS/קטגוריות.
-        # Build query jobs for variety (mix keywords + optional selected categories)
-        query_jobs: list[dict] = []
-        if keywords and str(keywords).strip():
-            query_jobs = [{"kw": str(keywords).strip(), "cat_id": None}]
-        else:
-            kw_list = _choose_refill_keywords(ignore_selected_categories=ignore_selected_categories)
-            cat_list = [] if ignore_selected_categories else get_selected_category_ids()
-            for kw in kw_list:
-                query_jobs.append({"kw": kw, "cat_id": None})
-            for cid in cat_list:
-                query_jobs.append({"kw": "", "cat_id": cid})
-            if AE_REFILL_RANDOMIZE:
-                random.shuffle(query_jobs)
-            # limit number of queries this cycle
-            query_jobs = query_jobs[:max(1, AE_REFILL_KEYWORDS_PER_CYCLE)]
+    added = 0
+    dup = 0
+    skipped_no_link = 0
+    skipped_price = 0
+    last_error = None
+    last_page = 0
+    last_resp = None
 
-        if not query_jobs:
-            return 0, 0, current_len, None, "No keywords/categories configured for refill"
-        # sort pool
-        sort_pool = [s.strip().upper() for s in re.split(r"[\n,|]+", AE_REFILL_SORT_POOL or "") if s.strip()]
-        if not sort_pool:
-            sort_pool = [AE_REFILL_SORT]
+    
+    # Build active filters snapshot
+    selected_cats = [] if ignore_selected_categories else get_selected_category_ids()
+    # Distribute evenly if categories selected
+    if selected_cats:
+        n = len(selected_cats)
+        base = max_needed // n
+        rem = max_needed % n
+        per_cat = []
+        for i, cid in enumerate(selected_cats):
+            need = base + (1 if i < rem else 0)
+            if need > 0:
+                per_cat.append((cid, need))
 
-        collected_rows: list[dict] = []
-        dup_count = 0
-        added_count = 0
-        last_page: int | None = None
-        last_error: str | None = None
+        max_pages_per_cat = max(1, AE_REFILL_MAX_PAGES // max(1, len(per_cat)))
 
-        # snapshot existing ids for quicker dedup while collecting
-        try:
-            existing_ids = set(
-                str(r.get("ProductId") or r.get("ItemId") or "")
-                for r in pending_rows
-                if str(r.get("ProductId") or r.get("ItemId") or "").strip()
-            )
-        except Exception:
-            existing_ids = set()
-
-        for job in query_jobs:
-            kw = (job.get("kw") or "").strip()
-            cat_id = job.get("cat_id")
-            # random page + random sort
-            if AE_REFILL_RANDOMIZE:
-                page_no = random.randint(1, max(1, AE_REFILL_RANDOM_PAGE_MAX))
-                eff_sort = random.choice(sort_pool)
-            else:
-                page_no = 1
-                eff_sort = sort_pool[0]
-
-            last_page = page_no
-
-            try:
-                products, resp_code, resp_msg = affiliate_product_query(
-                    category_id=cat_id,
-                    keywords=(kw or None),
-                    page_no=page_no,
-                    page_size=50,
-                    sort=eff_sort,
-                )
-            except Exception as e:
-                last_error = f"affiliate_product_query exception: {e}"
-                continue
-
-            if resp_code != 200:
-                last_error = resp_msg or f"HTTP {resp_code}"
-                continue
-
-            if not products:
-                continue
-
-            for prod in products:
-                row = _map_affiliate_product_to_row(prod)
-                if not row:
-                    continue
-
-                # filters (global)
-                ok, _reason = _eval_row_filters(row)
-                if not ok:
-                    continue
-
-                pid = str(row.get("ProductId") or row.get("ItemId") or "").strip()
-                if pid and pid in existing_ids:
-                    dup_count += 1
-                    continue
-
-                collected_rows.append(row)
-                if pid:
-                    existing_ids.add(pid)
-
-                # stop collecting if we have plenty
-                if len(collected_rows) >= max(50, (max_needed - current_len) * 2):
+        for (cat_id, need_cat) in per_cat:
+            got_cat = 0
+            last_page = 0
+            for page_no in range(1, max_pages_per_cat + 1):
+                last_page = page_no
+                try:
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id, keywords=keywords)
+                    last_resp = (resp_code, resp_msg, len(products))
+                    # Some TOP responses use resp_msg='The result is empty' with non-200 resp_code; treat as no-more-results
+                    if resp_msg and 'result is empty' in str(resp_msg).lower():
+                        resp_code = 200
+                except Exception as e:
+                    last_error = f"category_id={cat_id} page={page_no} error={type(e).__name__}: {e}"
                     break
 
-            if len(collected_rows) >= max(50, (max_needed - current_len) * 2):
+                if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
+                    last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
+                    break
+
+                if not products:
+                    break
+
+                    new_rows = []
+                    for p in products:
+                        row = _map_affiliate_product_to_row(p)
+
+                        # Filters
+                        if AE_PRICE_BUCKETS:
+                            sale_num = _extract_float(row.get("SalePrice") or "")
+                            if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                                skipped_price += 1
+                                continue
+
+                        if MIN_ORDERS:
+                            o = safe_int(row.get("Orders") or "0", 0)
+                            if o < int(MIN_ORDERS):
+                                continue
+
+                        if MIN_RATING:
+                            r = _extract_float(row.get("Rating") or "")
+                            if r is None or float(r) < float(MIN_RATING):
+                                continue
+
+                        if FREE_SHIP_ONLY:
+                            sale_num = _extract_float(row.get("SalePrice") or "")
+                            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                                continue
+
+                        if not row.get("BuyLink"):
+                            skipped_no_link += 1
+                            continue
+
+                        k = _key_of_row(row)
+                        if k in existing_keys:
+                            dup += 1
+                            continue
+                        existing_keys.add(k)
+                        new_rows.append(row)
+                        got_cat += 1
+                        if got_cat >= need_cat:
+                            break
+
+                    # AI enrichment (optional)
+                    if ai_auto_mode() and GPT_ON_REFILL and new_rows:
+                        try:
+                            upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
+                            if err:
+                                logging.warning(f"[AI] enrich warning: {err}")
+                            elif upd:
+                                logging.info(f"[AI] enriched {upd} items on refill")
+                        except Exception as _e:
+                            logging.warning(f"[AI] enrich failed: {_e}")
+                    if new_rows:
+                        with FILE_LOCK:
+                            pending_rows = read_products(PENDING_CSV)
+                            pending_rows.extend(new_rows)
+                            write_products(PENDING_CSV, pending_rows)
+                        added += len(new_rows)
+
+                    if got_cat >= need_cat or added >= max_needed:
+                        break
+
+
+            if added >= max_needed:
                 break
 
-        if AE_REFILL_RANDOMIZE and collected_rows:
-            random.shuffle(collected_rows)
-
-        # Persist: append until max_needed
-        with FILE_LOCK:
-            pending_rows = read_products(PENDING_CSV)
-            existing_ids2 = set()
+    else:
+        # No categories selected:
+        # - If admin provided keywords: use affiliate.product.query with those keywords.
+        # - Otherwise: use HotProduct feed (most stable) + optional AE_KEYWORDS fallback.
+        for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
+            last_page = page_no
             try:
-                for r in pending_rows:
-                    pid = str(r.get("ProductId") or r.get("ItemId") or "").strip()
-                    if pid:
-                        existing_ids2.add(pid)
-            except Exception:
-                pass
+                if keywords:
+                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None, keywords=keywords)
+                else:
+                    if AE_KEYWORDS:
+                        # Prefer product.query with (random/rr) keywords for variety
+                        products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
+                    else:
+                        products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
+                last_resp = (resp_code, resp_msg, len(products))
 
-            for row in collected_rows:
-                if len(pending_rows) >= max_needed:
+                # Some TOP responses use resp_msg='The result is empty' with non-200 resp_code; treat as no-more-results
+                if resp_msg and 'result is empty' in str(resp_msg).lower():
+                    resp_code = 200
+
+
+                if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
+                    last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
                     break
-                pid = str(row.get("ProductId") or row.get("ItemId") or "").strip()
-                if pid and pid in existing_ids2:
-                    dup_count += 1
-                    continue
-                pending_rows.append(row)
-                if pid:
-                    existing_ids2.add(pid)
-                added_count += 1
 
-            # אופציונלי: ערבוב התור כולו בתחילת ריצה כדי להימנע מ"אותו פריט ראשון"
-            if AE_REFILL_RANDOMIZE and added_count > 0:
-                if (os.environ.get("AE_SHUFFLE_QUEUE_ON_REFILL", "0") or "0").strip().lower() in ("1","true","yes","on"):
-                    random.shuffle(pending_rows)
+                if not products:
+                    break
 
-            write_products(PENDING_CSV, pending_rows)
-            total_after = len(pending_rows)
+                # Shuffle to avoid always same ordering (TOP sort can be deterministic)
+                try:
+                    random.shuffle(products)
+                except Exception:
+                    pass
 
-        return added_count, dup_count, total_after, last_page, last_error
+                new_rows = []
+                for p in products:
+                    row = _map_affiliate_product_to_row(p)
 
-    except Exception as e:
-        return 0, 0, 0, None, f"refill_from_affiliate exception: {e}"
+                    if AE_PRICE_BUCKETS:
+                        sale_num = _extract_float(row.get("SalePrice") or "")
+                        if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                            skipped_price += 1
+                            continue
+
+                    if MIN_ORDERS:
+                        o = safe_int(row.get("Orders") or "0", 0)
+                        if o < int(MIN_ORDERS):
+                            continue
+
+                    if MIN_RATING:
+                        r = _extract_float(row.get("Rating") or "")
+                        if r is None or float(r) < float(MIN_RATING):
+                            continue
+
+                    if FREE_SHIP_ONLY:
+                        sale_num = _extract_float(row.get("SalePrice") or "")
+                        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                            continue
+
+                    if not row.get("BuyLink"):
+                        skipped_no_link += 1
+                        continue
+
+                    k = _key_of_row(row)
+                    if k in existing_keys:
+                        dup += 1
+                        continue
+                    existing_keys.add(k)
+                    new_rows.append(row)
+
+                # AI enrichment (optional)
+                if ai_auto_mode() and GPT_ON_REFILL and new_rows:
+                    try:
+                        upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
+                        if err:
+                            logging.warning(f"[AI] enrich warning: {err}")
+                        elif upd:
+                            logging.info(f"[AI] enriched {upd} items on refill")
+                    except Exception as _e:
+                        logging.warning(f"[AI] enrich failed: {_e}")
+                if new_rows:
+                    with FILE_LOCK:
+                        pending_rows = read_products(PENDING_CSV)
+                        pending_rows.extend(new_rows)
+                        write_products(PENDING_CSV, pending_rows)
+                    added += len(new_rows)
+
+                if added >= max_needed:
+                    break
+
+            except Exception as e:
+                last_error = str(e)
+                break
+
+    with FILE_LOCK:
+        total_after = len(read_products(PENDING_CSV))
+
+    if added == 0 and last_error is None:
+        if skipped_no_link > 0:
+            last_error = (
+                "⚠️ התקבלו מוצרים אבל כולם בלי promotion_link. "
+                "בדרך כלל זה אומר ש-AE_TRACKING_ID לא תקין/לא משויך לחשבון האפילייט שלך. "
+                f"(skipped_no_link={skipped_no_link}, last_resp={last_resp})"
+            )
+        elif last_resp is not None:
+            rc, rm, n = last_resp
+            last_error = f"0 מוצרים (resp_code={rc}, resp_msg={rm}, ship_to={AE_SHIP_TO_COUNTRY}, sort={AE_REFILL_SORT})"
+    # Treat 'The result is empty' as a normal end-of-pages signal (not an error)
+    try:
+        if last_error and 'result is empty' in str(last_error).lower():
+            last_error = None if added > 0 else 'אין תוצאות שמתאימות לסינונים שנבחרו. נסה להוריד מינ׳ הזמנות/דירוג או לבטל משלוח חינם.'
+    except Exception:
+        pass
+
+    # update last stats snapshot
+    try:
+        LAST_REFILL_STATS.update({
+            'added': added,
+            'dup': dup,
+            'skipped_no_link': skipped_no_link,
+            'price_filtered': skipped_price,
+            'last_error': last_error,
+            'last_page': last_page,
+        })
+    except Exception:
+        pass
+    return added, dup, total_after, last_page, last_error
+
+# ========= INLINE MENU =========
+PRICE_BUCKET_PRESETS = [
+    ("1-5", "1-5"),
+    ("5-10", "5-10"),
+    ("10-20", "10-20"),
+    ("20-50", "20-50"),
+    ("50+", "50+"),
+]
+
 def _active_price_bucket_ids():
     raw = (AE_PRICE_BUCKETS_RAW or "").strip()
     if not raw:
@@ -2392,468 +2388,32 @@ def _ms_active_filters_text() -> str:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
     return " | ".join(parts) if parts else "ללא"
 
-
-
-
-def _eval_row_filters(row: dict) -> tuple[bool, str]:
-    """Global row filters used by the refill/queue pipeline.
-
-    If the admin selected any strict filters (free shipping / min orders / min rating),
-    we always apply them.
-
-    Otherwise, AE_REFILL_IGNORE_GLOBAL_FILTERS can relax filtering to increase variety.
-    """
-    strict = bool(FREE_SHIP_ONLY) or (int(MIN_ORDERS or 0) > 0) or (float(MIN_RATING or 0) > 0)
-    ignore_global = bool(AE_REFILL_IGNORE_GLOBAL_FILTERS) and not strict
-    return _ms_eval_row_filters(row, ignore_global=ignore_global)
-def _ms_eval_row_filters(row: dict, ignore_global: bool = True) -> tuple[bool, str]:
-    """Return (ok, reason_if_not_ok) for manual search preview.
-
-    ignore_global=True means we DO NOT apply global queue filters (MIN_ORDERS/MIN_RATING/FREE_SHIP_ONLY),
-    because manual search is primarily about relevance. Refill still respects the global filters.
-    """
-    # Price buckets still apply (user intentionally set them)
+def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
+    """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
+    # Price buckets
     if AE_PRICE_BUCKETS:
         sale_num = _extract_float(row.get("SalePrice") or "")
         if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
             return False, "מחוץ לסינון מחיר"
-
-    if not ignore_global:
-        # Orders
-        if MIN_ORDERS:
-            o = safe_int(row.get("Orders") or "0", 0)
-            if o < int(MIN_ORDERS):
-                return False, f"פחות מ-{MIN_ORDERS} הזמנות"
-        # Rating
-        if MIN_RATING:
-            r = _extract_float(row.get("Rating") or "")
-            if r is None or float(r) < float(MIN_RATING):
-                return False, f"מתחת ל-{MIN_RATING}% דירוג"
-        # Free shipping
-        if FREE_SHIP_ONLY:
-            fs = str(row.get("FreeShipping") or "").strip().lower() in ("1","true","yes","on","y","כן")
-            if not fs:
-                return False, "לא משלוח חינם"
-        # Free shipping threshold
-        if AE_FREE_SHIP_THRESHOLD_ILS:
-            sale_num = _extract_float(row.get("SalePrice") or "")
-            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-                return False, f"מתחת לסף משלוח חינם ₪{AE_FREE_SHIP_THRESHOLD_ILS:g}"
-
-    # Must have buy link
+    # Orders
+    if MIN_ORDERS:
+        o = safe_int(row.get("Orders") or "0", 0)
+        if o < int(MIN_ORDERS):
+            return False, f"פחות מ-{MIN_ORDERS} הזמנות"
+    # Rating
+    if MIN_RATING:
+        r = _extract_float(row.get("Rating") or "")
+        if r is None or float(r) < float(MIN_RATING):
+            return False, f"דירוג נמוך מ-{MIN_RATING}%"
+    # Free ship only (our heuristic threshold)
+    if FREE_SHIP_ONLY:
+        sale_num = _extract_float(row.get("SalePrice") or "")
+        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+            return False, f"מתחת לסף משלוח חינם ₪{AE_FREE_SHIP_THRESHOLD_ILS:g}"
+    # Buy link
     if not (row.get("BuyLink") or "").strip():
         return False, "אין קישור רכישה"
     return True, ""
-
-
-# --- Manual-search keyword normalization (Hebrew -> English) ---
-# NOTE: Order matters: longer / more specific phrases should appear first.
-_HE_PHRASE_MAP = [
-    ("רצועת כלב", "dog leash"),
-    ("רצועה לכלב", "dog leash"),
-    ("קולר לכלב", "dog collar"),
-    ("קולר כלב", "dog collar"),
-    ("חגורה לכלב", "dog harness"),
-    ("רתמה לכלב", "dog harness"),
-    ("צעצוע לכלב", "dog toy"),
-    ("צעצועים לכלב", "dog toy"),
-    ("מזון לכלב", "dog food"),
-    ("מיטה לכלב", "dog bed"),
-    ("שעון חכם", "smartwatch"),
-    ("שעון יד", "wristwatch"),
-    ("רצועת שעון", "watch band"),
-    ("רצועה לשעון", "watch band"),
-    ("מגן מסך", "screen protector"),
-    ("כיסוי", "case"),
-]
-
-# Loose word mapping (used when phrase map doesn't match)
-_HE_WORD_MAP = {
-    "כלב": "dog",
-    "כלבים": "dog",
-    "חתול": "cat",
-    "חתולים": "cat",
-    "רצועה": "strap",
-    "רצועת": "strap",
-    "רצוע": "strap",
-    "קולר": "collar",
-    "רתמה": "harness",
-    "חגורה": "harness",
-    "צעצוע": "toy",
-    "צעצועים": "toy",
-    "מיטה": "bed",
-    "מזון": "food",
-    "שעון": "watch",
-    "שעונים": "watch",
-    "חכם": "smart",
-    "אפל": "apple",
-    "אוזניות": "headphones",
-    "מטען": "charger",
-    "מטבח": "kitchen gadget",
-    "רכב": "car accessories",
-    "כלי": "tools",
-    "עבודה": "tools",
-    "מקדחה": "drill",
-    "נעל": "shoes",
-    "תיק": "bag",
-    "מצלמה": "camera",
-}
-
-def _ms_extract_device_model(q: str) -> str:
-    """Extract device/model tokens from Hebrew/English query to improve precision in manual search."""
-    t = (q or "").strip()
-    if not t:
-        return ""
-    t_low = t.lower()
-
-    # Apple Watch
-    if ("אפל" in t and "ווטש" in t) or ("apple watch" in t_low):
-        return "Apple Watch"
-
-    # iPhone
-    m1 = re.search(r"(?:אייפון|iphone)\s*(\d{1,2})", t_low)
-    if m1:
-        return f"iPhone {m1.group(1)}"
-
-    # Samsung Galaxy
-    if ("גלקסי" in t) or ("galaxy" in t_low) or ("סמסונג" in t):
-        # A series (A55 etc)
-        mA = re.search(r"\b(a)\s*([0-9]{2})\b", t_low)
-        if mA:
-            return f"Samsung Galaxy A{mA.group(2)}"
-        mS = re.search(r"(?:גלקסי|galaxy)\s*(?:s\s*)?(\d{1,2})", t_low)
-        if mS:
-            return f"Samsung Galaxy S{mS.group(1)}"
-        mS2 = re.search(r"\b(s)\s*(\d{1,2})\b", t_low)
-        if mS2:
-            return f"Samsung Galaxy S{mS2.group(2)}"
-
-    return ""
-
-_MS_TRANSLATE_CACHE: dict[str, str] = {}
-
-def _ms_ai_translate_keywords(q: str) -> str:
-    """Translate Hebrew query to short English keywords using OpenAI (optional).
-    Enabled only when GPT_TRANSLATE_SEARCH=1 and GPT is configured.
-    """
-    q = (q or "").strip()
-    if not q:
-        return q
-    if not GPT_TRANSLATE_SEARCH:
-        return q
-    if not (GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None):
-        return q
-    if q in _MS_TRANSLATE_CACHE:
-        return _MS_TRANSLATE_CACHE[q]
-    try:
-        client = _get_openai_client()
-        prompt = (
-            "Translate the following Hebrew shopping search query to concise English keywords "
-            "(max 6 words) suitable for AliExpress search. Output ONLY the keywords, no quotes, no punctuation.\n"
-            f"Query: {q}"
-        )
-        text_out = ""
-        if hasattr(client, "responses") and hasattr(client.responses, "create"):
-            r = client.responses.create(
-                model=OPENAI_MODEL_EFFECTIVE,
-                input=[{"role": "user", "content": prompt}],
-                max_output_tokens=20,
-            )
-            text_out = (getattr(r, "output_text", "") or "").strip()
-        else:
-            r = client.chat.completions.create(
-                model=OPENAI_MODEL_EFFECTIVE,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=20,
-                temperature=0.2,
-            )
-            text_out = (((r.choices or [None])[0]).message.content or "").strip()
-        text_out = re.sub(r"[^A-Za-z0-9\s\-]", " ", text_out).strip()
-        text_out = re.sub(r"\s{2,}", " ", text_out)
-        if text_out:
-            _MS_TRANSLATE_CACHE[q] = text_out
-            return text_out
-    except Exception as e:
-        log_warn(f"[MS] translate failed: {e}")
-    _MS_TRANSLATE_CACHE[q] = q
-    return q
-
-def _ms_normalize_keywords(q: str) -> str:
-    """Normalize manual-search query for AliExpress.
-
-    AliExpress search works best with concise English keywords.
-
-    Strategy:
-    - If query contains Hebrew: apply a built-in Hebrew→English phrase map + extract common device models.
-    - Optionally (recommended): if GPT_TRANSLATE_SEARCH=1, use OpenAI to translate the full Hebrew query into
-      short English shopping keywords.
-    - Always append detected model tokens (Galaxy S10 / iPhone 15 / Apple Watch...) to improve precision.
-
-    Returns: English keyword string (no URLs).
-    """
-    q_raw = (q or "").strip()
-    if not q_raw:
-        return ""
-
-    # Keep URLs intact (handled elsewhere)
-    if "http://" in q_raw or "https://" in q_raw:
-        return q_raw
-
-    s = q_raw.strip()
-    has_he = (re.search(r"[֐-׿]", s) is not None)
-
-    # ---- model / brand extraction (Hebrew + mixed) ----
-    extras: list[str] = []
-
-    # Samsung Galaxy (גלקסי 10 / גלקסי S10 / Galaxy S10)
-    m = re.search(r"(?:גלקסי|galaxy)\s*(?:s\s*)?(\d{1,2})", s, re.I)
-    if m:
-        num = m.group(1)
-        extras.append(f"Samsung Galaxy S{num}")
-
-    # iPhone (אייפון 15)
-    m = re.search(r"(?:אייפון|iphone)\s*(\d{1,2})", s, re.I)
-    if m:
-        extras.append(f"iPhone {m.group(1)}")
-
-    # Apple Watch
-    if re.search(r"(?:אפל\s*ווטש|apple\s*watch)", s, re.I):
-        extras.append("Apple Watch")
-
-    # Common brands
-    if re.search(r"(?:שיאומי|xiaomi|redmi|poco)", s, re.I):
-        extras.append("Xiaomi")
-    if re.search(r"(?:סמסונג|samsung)", s, re.I):
-        extras.append("Samsung")
-
-    # ---- Hebrew phrase map (longest first) ----
-    # NOTE: keep keys in Hebrew EXACTLY as users type them; we'll also try minor variants.
-    phrase_map = {
-        "רצועת כלב": "dog leash",
-        "קולר לכלב": "dog collar",
-        "צעצוע לכלב": "dog toy",
-        "צעצועים לכלב": "dog toys",
-        "ציוד לכלב": "dog accessories",
-        "חתול": "cat",
-        "לחתול": "cat",
-        "צעצוע לחתול": "cat toy",
-        "ציוד לחתול": "cat accessories",
-
-        "מגן מסך": "screen protector",
-        "מגן מסך לגלקסי": "screen protector Samsung Galaxy",
-        "מגן מסך לאייפון": "screen protector iPhone",
-        "כיסוי": "case",
-        "כיסוי לטלפון": "phone case",
-        "קייס": "case",
-        "מטען": "charger",
-        "מטען מהיר": "fast charger",
-        "מטען לרכב": "car charger",
-        "כבל": "cable",
-        "כבל טעינה": "charging cable",
-        "אוזניות": "headphones",
-        "אוזניות בלוטוס": "bluetooth headphones",
-        "רמקול": "speaker",
-        "רמקול בלוטוס": "bluetooth speaker",
-
-        "שעון": "wristwatch",
-        "שעון יד": "wristwatch",
-        "שעון חכם": "smartwatch",
-        "שעון אפל": "Apple Watch",
-
-        "מחשב נייד": "laptop",
-        "טאבלט": "tablet",
-        "מקלדת": "keyboard",
-        "עכבר": "mouse",
-        "עכבר אלחוטי": "wireless mouse",
-        "מסך": "monitor",
-
-        "כלי עבודה": "tools",
-        "מברגה": "cordless drill",
-        "מקדחה": "drill",
-        "מסור": "saw",
-
-        "מטבח": "kitchen gadgets",
-        "גאדג'ט": "gadget",
-        "גאדגטים": "gadgets",
-        "תאורה": "lighting",
-        "לד": "LED",
-
-        "גיימינג": "gaming",
-        "שלט": "controller",
-        "פלייסטיישן": "PlayStation",
-
-        "נעליים": "shoes",
-        "נעלי ריצה": "running shoes",
-        "תיק": "bag",
-        "תיק גב": "backpack",
-    }
-
-    kw = s
-
-    if has_he:
-        # Apply phrase replacements (prefer longer keys first)
-        for he in sorted(phrase_map.keys(), key=len, reverse=True):
-            if he in kw:
-                kw = kw.replace(he, phrase_map[he])
-
-        # Drop remaining Hebrew fragments (keep numbers/latin)
-        kw_clean = re.sub(r"[֐-׿]+", " ", kw)
-        kw_clean = re.sub(r"\s{2,}", " ", kw_clean).strip()
-
-        # Optional: use AI translation for better coverage (recommended for ANY Hebrew query)
-        kw_ai = ""
-        if GPT_TRANSLATE_SEARCH:
-            kw_ai = _ms_ai_translate_keywords(s)
-            kw_ai = (kw_ai or "").strip()
-
-        # Decide: prefer AI output if it looks non-trivial
-        kw = kw_clean
-        if kw_ai and (len(kw.split()) < 2 or kw.lower() in (s.lower(), kw_clean.lower())):
-            kw = kw_ai
-
-    # Append extracted model tokens to improve precision
-    for e in extras:
-        if e and e.lower() not in kw.lower():
-            kw = (kw + " " + e).strip()
-
-    kw = re.sub(r"\s{2,}", " ", kw).strip()
-    if not kw:
-        # last resort: remove Hebrew and keep what's left
-        kw = re.sub(r"[֐-׿]+", " ", s).strip()
-
-    return kw
-def _ms_build_query_variants(kw_norm: str) -> list[str]:
-    """Build a small list of keyword variants for manual search.
-
-    Goal: increase recall without drifting to unrelated items.
-    """
-    kw = (kw_norm or "").strip()
-    if not kw:
-        return []
-    variants: list[str] = []
-
-    def add(s: str):
-        s2 = re.sub(r"\s{2,}", " ", (s or "").strip())
-        if s2 and s2.lower() not in {v.lower() for v in variants}:
-            variants.append(s2)
-
-    add(kw)
-
-    low = kw.lower()
-
-    # try removing very common stopwords
-    base = re.sub(r"\b(for|with|and|the|a|an|of)\b", " ", kw, flags=re.I)
-    base = re.sub(r"\s{2,}", " ", base).strip()
-    if base and base.lower() != low:
-        add(base)
-
-    # extract model-ish suffix (keep it to preserve precision)
-    model = ""
-    m = re.search(r"(galaxy\s*[as]?\s*\d+|iphone\s*\d+|ipad\s*\w+|watch\s*\d+|s\d{1,2}\b|note\s*\d+)", low)
-    if m:
-        model = m.group(0).strip()
-
-    # targeted synonym expansions (safe)
-    syn = {
-        "screen protector": ["tempered glass screen protector", "protective screen film"],
-        "phone case": ["protective phone case", "cover case"],
-        "case": ["phone case", "protective case", "cover case"],
-        "charger": ["fast charger", "usb charger", "charging adapter"],
-        "charging cable": ["usb cable", "type c cable", "lightning cable"],
-        "wireless mouse": ["bluetooth mouse", "2.4g wireless mouse"],
-        "running shoes": ["sport shoes", "athletic shoes"],
-        "dog leash": ["pet leash", "dog lead", "leash for dog"],
-        "dog collar": ["pet collar", "collar for dog"],
-        "smartwatch": ["smart watch", "fitness tracker"],
-        "wristwatch": ["watch", "men watch", "women watch"],
-    }
-
-    for k, arr in syn.items():
-        if k in low:
-            for s in arr:
-                if model and model not in s.lower():
-                    add(f"{s} {model}")
-                else:
-                    add(s)
-
-    # if we detected a model, add a couple of re-ordered variants
-    if model:
-        # ensure the model appears at the end as well
-        if model not in low.split():
-            add(f"{kw} {model}")
-        # model-first variant (some APIs like it)
-        add(f"{model} {kw}")
-
-    return variants[:8]
-def _ms_build_token_set(kw: str) -> set[str]:
-    low = (kw or "").lower().strip()
-    toks = {t for t in re.split(r"\W+", low) if t}
-    if "wristwatch" in low:
-        toks.update({"watch", "wristwatch"})
-    if "smartwatch" in low:
-        toks.update({"smartwatch", "watch"})
-    if "dog leash" in low:
-        toks.update({"dog", "leash", "lead"})
-    if "dog collar" in low:
-        toks.update({"dog", "collar"})
-    if "dog harness" in low:
-        toks.update({"dog", "harness"})
-    if "watch band" in low:
-        toks.update({"watch", "band", "strap"})
-    if "car" in toks or "auto" in toks:
-        toks.add("vehicle")
-    if "kitchen" in toks:
-        toks.add("home")
-    if "dog" in toks or "cat" in toks:
-        toks.add("pet")
-    return toks
-
-def _ms_relevance_score(title: str, tokens: set[str]) -> int:
-    t = (title or "").lower()
-    if not t or not tokens:
-        return 0
-
-    score = 0
-    for tok in tokens:
-        if tok and tok in t:
-            score += 3
-
-    # boost if multiple tokens match
-    if score >= 6:
-        score += 2
-
-    # Penalize common "accessory/noise" terms when the query didn't ask for them
-    noise = {
-        "screen", "protector", "hydrogel", "film",
-        "case", "cover",
-        "phone", "samsung", "iphone",
-    }
-    for bad in noise:
-        if bad in t and bad not in tokens:
-            score -= 3
-
-    return max(score, 0)
-
-def _ms_affiliate_query_with_fallback(uid: int, q: str, kw_norm: str, page: int, per_page: int, cat_id: str | None):
-    """Run affiliate queries (possibly multiple variants) and merge unique products."""
-    variants = _ms_build_query_variants(kw_norm)
-    seen: set[str] = set()
-    merged: list[dict] = []
-    resp_code, resp_msg = None, None
-    for kw_try in variants:
-        prods, rc, rm = affiliate_product_query(keywords=kw_try, page_no=page, page_size=per_page, category_id=cat_id, target_language_override=(os.environ.get("AE_MANUAL_SEARCH_TARGET_LANGUAGE", "EN") or "EN").strip().upper(), target_currency_override=AE_TARGET_CURRENCY)
-        resp_code, resp_msg = rc, rm
-        raw_n = len(prods or [])
-        log_info(f"[MS] fetch uid={uid} page={page} per={per_page} q={q!r} kw={kw_try!r} norm={kw_norm!r} cat_id={cat_id} resp_code={rc} raw={raw_n}")
-        for p in (prods or []):
-            pid = str(p.get("product_id", "")).strip()
-            if pid and pid not in seen:
-                seen.add(pid)
-                merged.append(p)
-        # Stop if we already have enough candidates
-        if len(merged) >= max(per_page * 2, 20):
-            break
-    return merged, resp_code, resp_msg
 
 def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False) -> dict:
     """Fetch one page from AliExpress Affiliate API and prepare preview session."""
@@ -2863,14 +2423,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     if use_selected_categories:
         cats = get_selected_category_ids()
         cat_id = cats[0] if cats else None  # keep it simple: first selected
-    kw = _ms_normalize_keywords(q)
-
-    # If it's still a URL, this path should have been handled earlier; keep it safe.
-    if "http://" in kw or "https://" in kw:
-        return {"q": q, "page": page, "per_page": per_page, "items": [], "raw": 0, "resp_code": None, "resp_msg": "URL query not supported here"}
-
-    products, resp_code, resp_msg = _ms_affiliate_query_with_fallback(uid, q, kw, page, per_page, cat_id)
-    tokens = _ms_build_token_set(kw)
+    products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=q)
 
     # Map and evaluate
     results = []
@@ -2879,8 +2432,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     for p in (products or []):
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
-        score = _ms_relevance_score(str(p.get("product_title", "")), tokens)
-        ok, reason = _ms_eval_row_filters(row, ignore_global=False)
+        ok, reason = _ms_eval_row_filters(row)
         if not ok:
             # bucket reasons (best-effort)
             if "קישור" in reason:
@@ -2895,14 +2447,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["free_ship"] += 1
             else:
                 reasons["other"] += 1
-        results.append({"row": row, "ok": ok, "reason": reason, "score": score})
-    # Prefer relevant results: if we have any score>0, drop score==0 items.
-    if any((r.get("score", 0) or 0) > 0 for r in results):
-        results = [r for r in results if (r.get("score", 0) or 0) > 0]
-
-    # Sort by relevance score, then by filter pass
-    results.sort(key=lambda r: ((r.get("score", 0) or 0), 1 if r.get("ok") else 0), reverse=True)
-
+        results.append({"row": row, "ok": ok, "reason": reason})
 
     sess = {
         "q": q,
@@ -3177,9 +2722,6 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
     """Return True if handled."""
     try:
         uid = getattr(getattr(c, 'from_user', None), 'id', None) or getattr(getattr(getattr(c, 'message', None), 'from_user', None), 'id', 0)
-        # legacy alias used by some buttons
-        if data == "filters":
-            data = "flt_menu"
         # home
         if data == "flt_menu":
             txt = "🧰 סינונים\nבחר מה לשנות:"
@@ -3352,42 +2894,26 @@ def handle_filters_callback(c, data: str, chat_id: int) -> bool:
                 safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🎲 נבחרה קטגוריה רנדומלית:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
             return True
 
-
         if data == "fc_sync":
-            try:
-                bot.answer_callback_query(c.id, "מסנכרן קטגוריות...", show_alert=False)
-            except Exception:
-                pass
-            try:
-                _ = get_categories(force=True)
-                mode = CAT_VIEW_MODE.get(uid, "top")
-                if mode == "all":
-                    safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=None)
-                elif mode == "search":
-                    q = (CAT_LAST_QUERY.get(uid) or "").strip()
-                    safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=None)
-                else:
-                    safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
-            except Exception as e:
-                try:
-                    bot.answer_callback_query(c.id, f"⚠️ שגיאה בסנכרון: {e}", show_alert=True)
-                except Exception:
-                    pass
+            _ = get_categories(force=True)
+            mode = CAT_VIEW_MODE.get(uid, "top")
+            if mode == "all":
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="all", uid=uid), cb_id=None)
+            elif mode == "search":
+                q = (CAT_LAST_QUERY.get(uid) or "").strip()
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"🔄 סונכרן! תוצאות חיפוש: {q}", reply_markup=_categories_menu_kb(0, mode="search", uid=uid, query=q), cb_id=None)
+            else:
+                safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🔄 סונכרן! בחר קטגוריות:", reply_markup=_categories_menu_kb(0, mode="top", uid=uid), cb_id=None)
             return True
+
 
     except Exception as e:
         try:
-            logger.exception(f"[FILTERS] callback error: {e}")
-        except Exception:
-            pass
-        try:
-            bot.answer_callback_query(c.id, f"⚠️ שגיאה: {e}", show_alert=True)
+            bot.answer_callback_query(c.id, f"שגיאה: {e}", show_alert=True)
         except Exception:
             pass
         return True
-
     return False
-
 
 # ========= AI REVIEW / APPROVAL UI =========
 AI_REVIEW_CTX: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id) of last review photo/message
@@ -3597,65 +3123,46 @@ def on_inline_click(c):
     if not _is_admin(c):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
         return
-    data = (c.data or "")
-    chat_id = c.message.chat.id
 
-    # Quick-search buttons (manual search) - no typing needed
-    if data.startswith("msq:"):
-        uid = c.from_user.id
-        q = data.split(":", 1)[1].strip()
-        log_info(f"[MS] quick uid={uid} chat={chat_id} q={q!r}")
-        try:
-            _ms_start(uid=uid, chat_id=chat_id, q=q)
-            _ms_show(uid, chat_id)
-            try:
-                bot.answer_callback_query(c.id, "מחפש…")
-            except Exception:
-                pass
-        except Exception as e:
-            log_error(f"[MS] quick error: {e}")
-            try:
-                bot.answer_callback_query(c.id, "שגיאה בחיפוש", show_alert=True)
-            except Exception:
-                pass
-        return
+    data = c.data or ""
+    chat_id = c.message.chat.id
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
         return
 
     # --- Manual product keyword search ---
+    
     if data == "prod_search_last":
         uid = c.from_user.id
         q = (CAT_LAST_QUERY.get(uid) or "").strip()
         if not q:
             bot.answer_callback_query(c.id, "אין מילת חיפוש פעילה.")
             return
-        try:
-            bot.answer_callback_query(c.id, "מחפש…")
-        except Exception:
-            pass
+        bot.answer_callback_query(c.id)
         _ms_start(uid=uid, chat_id=chat_id, q=q)
-        _ms_show(uid, chat_id)
         return
-
+        bot.answer_callback_query(c.id, "מחפש…")
+        # Run product search immediately and add to queue (no AI)
+        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}")
+        added, dups, total_after, last_page, err = refill_from_affiliate(AE_REFILL_MIN_QUEUE, keywords=q)
+        if err:
+            bot.send_message(chat_id, f"⚠️ החיפוש הסתיים עם הודעה: {err}")
+        bot.send_message(
+            chat_id,
+            f"✅ סיום חיפוש עבור: {q}\n"
+            f"נוספו לתור: {added}\n"
+            f"כפולים שנדחו: {dups}\n"
+            f"סה״כ בתור: {total_after}\n"
+            f"עמוד אחרון שנבדק: {last_page}"
+        )
+        return
 
     if data == "prod_search":
         uid = c.from_user.id
-        log_info(f"[MS] prompt prod_search uid={uid} chat={c.message.chat.id}")
         PROD_SEARCH_WAIT[uid] = True
         PROD_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
         try:
-
-            kbq = types.InlineKeyboardMarkup(row_width=2)
-            kbq.add(
-                types.InlineKeyboardButton("⌚ שעון", callback_data="msq:wristwatch"),
-                types.InlineKeyboardButton("⌚🤖 שעון חכם", callback_data="msq:smartwatch"),
-                types.InlineKeyboardButton("🎧 אוזניות", callback_data="msq:wireless earbuds"),
-                types.InlineKeyboardButton("🚗 אביזרי רכב", callback_data="msq:car accessories"),
-                types.InlineKeyboardButton("🍳 מטבח", callback_data="msq:kitchen gadget"),
-                types.InlineKeyboardButton("🧰 כלי עבודה", callback_data="msq:tools"),
-            )
             prompt = bot.send_message(
                 chat_id,
                 "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח).\n"
@@ -4115,7 +3622,7 @@ def on_inline_click(c):
             f"כפולים: {dup}\n"
             f"סה\"כ בתור: {total_after}\n"
             f"דף אחרון שנבדק: {last_page}\n"
-            f"שגיאה/מידע: {last_error}"
+            f"שגיאה/מידע: {last_error or 'ללא'}"
         )
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu(), cb_id=c.id)
 
@@ -4128,7 +3635,7 @@ def on_inline_click(c):
             f"כפולים: {dup}\n"
             f"סה\"כ בתור: {total_after}\n"
             f"דף אחרון שנבדק: {last_page}\n"
-            f"שגיאה/מידע: {last_error}"
+            f"שגיאה/מידע: {last_error or 'ללא'}"
         )
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=inline_menu(), cb_id=c.id)
 
@@ -4233,62 +3740,6 @@ def handle_category_search_text(m):
         bot.send_message(chat_id, f"✅ נמצאו {total} קטגוריות שמתאימות ל: {q}\nאפשר לבחור קטגוריות, או לחץ על 🛒 חפש מוצרים למילת החיפוש.")
 
 # ========= MANUAL PRODUCT SEARCH (text input) =========
-def _extract_product_id_from_url(url: str) -> str | None:
-    if not url:
-        return None
-    u = str(url).strip()
-    m = re.search(r"/item/(\d+)\.html", u)
-    if m:
-        return m.group(1)
-    m = re.search(r"productId=(\d+)", u, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    # last resort: first long number
-    m = re.search(r"(\d{10,})", u)
-    if m:
-        return m.group(1)
-    return None
-
-def _resolve_aliexpress_url(url: str, timeout: int = 12) -> str:
-    """Resolve s.click / short AliExpress links to the final URL."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
-        return str(r.url or url)
-    except Exception:
-        return str(url)
-
-def _manual_search_from_url(uid: int, chat_id: int, url: str) -> bool:
-    """Try to fetch exact product via URL. Returns True if handled."""
-    final_url = _resolve_aliexpress_url(url)
-    pid = _extract_product_id_from_url(final_url)
-    if not pid:
-        log_warn(f"[MS] URL provided but product_id not found. url={url!r} final={final_url!r}")
-        bot.send_message(chat_id, "❗️לא הצלחתי לזהות מזהה מוצר מהקישור. נסה להדביק קישור מלא של מוצר (item/XXXX.html).")
-        return True
-
-    log_info(f"[MS] URL -> product_id={pid} | final={final_url!r}")
-    prods, rc, rm = affiliate_product_detail_get(pid)
-    if not prods:
-        bot.send_message(chat_id, f"❗️לא הצלחתי למשוך פרטי מוצר (resp_code={rc}): {rm}")
-        return True
-
-    row = _map_affiliate_product_to_row(prods[0])
-    MANUAL_SEARCH_SESS[uid] = {
-        "chat_id": chat_id,
-        "q": url,
-        "page": 1,
-        "per_page": 1,
-        "results": [row],
-        "raw_count": 1,
-        "reasons": {},
-        "resp_code": rc,
-        "resp_msg": rm,
-    }
-    _ms_send_current(uid=uid, chat_id=chat_id, as_new=True)
-    return True
-
-
 @bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
 def handle_manual_product_search_text(m):
     """Handle admin keyword search that fetches affiliate products and adds them to queue.
@@ -4299,10 +3750,6 @@ def handle_manual_product_search_text(m):
     uid = m.from_user.id
     chat_id = m.chat.id
     q = (m.text or "").strip()
-    log_info(f"[MS] input uid={uid} chat={chat_id} q={q!r} type={m.chat.type}")
-    if "http://" in q or "https://" in q:
-        if _manual_search_from_url(uid=uid, chat_id=chat_id, url=q):
-            return
 
     # If in group/supergroup, require reply to the prompt message so bot will receive it.
     try:
@@ -4515,7 +3962,7 @@ def cmd_refill_now(msg):
         f"כפולים: {dup}\n"
         f"סה\"כ בתור: {total_after}\n"
         f"דף אחרון שנבדק: {last_page}\n"
-        f"שגיאה/מידע: {last_error}"
+        f"שגיאה/מידע: {last_error or 'ללא'}"
     )
 
 # ========= SENDER LOOP =========
@@ -4581,7 +4028,7 @@ def refill_daemon():
                     f"נוספו לתור: {added}\n"
                     f"כפולים: {dup}\n"
                     f"סה\"כ בתור: {total_after}\n"
-                    f"מידע/שגיאה: {last_error}"
+                    f"מידע/שגיאה: {last_error or 'ללא'}"
                 )
                 notify_admin(msg)
                 print(msg.replace("\n", " | "), flush=True)
@@ -4699,10 +4146,6 @@ while True:
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
-        if "Conflict: terminated by other getUpdates request" in msg:
-            log_error("Polling conflict (409): another instance is running. This instance will sleep and exit to avoid losing callbacks/search replies.")
-            time.sleep(3600)
-            sys.exit(0)
-        wait = 5
+        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
         log_error(f"Polling error: {e}. Retrying in {wait}s...")
         time.sleep(wait)
