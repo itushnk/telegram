@@ -3199,61 +3199,48 @@ def on_inline_click(c):
     if not _is_admin(c):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
         return
-
-    data = c.data         # Quick-search buttons (manual search) - no typing needed
-        if data and data.startswith("msq:"):
-            uid = c.from_user.id
-            chat_id = c.message.chat.id
-            q = data.split(":", 1)[1].strip()
-            log_info(f"[MS] quick uid={uid} chat={chat_id} q={q!r}")
-            try:
-                _ms_start(uid=uid, chat_id=chat_id, q=q)
-                _ms_show(uid, chat_id)
-            except Exception as e:
-                log_error(f"[MS] quick error: {e}")
-                try:
-                    bot.answer_callback_query(c.id, "שגיאה בחיפוש", show_alert=True)
-                except Exception:
-                    pass
-            else:
-                try:
-                    bot.answer_callback_query(c.id, "מחפש…")
-                except Exception:
-                    pass
-            return
-or ""
+    data = (c.data or "")
     chat_id = c.message.chat.id
+
+    # Quick-search buttons (manual search) - no typing needed
+    if data.startswith("msq:"):
+        uid = c.from_user.id
+        q = data.split(":", 1)[1].strip()
+        log_info(f"[MS] quick uid={uid} chat={chat_id} q={q!r}")
+        try:
+            _ms_start(uid=uid, chat_id=chat_id, q=q)
+            _ms_show(uid, chat_id)
+            try:
+                bot.answer_callback_query(c.id, "מחפש…")
+            except Exception:
+                pass
+        except Exception as e:
+            log_error(f"[MS] quick error: {e}")
+            try:
+                bot.answer_callback_query(c.id, "שגיאה בחיפוש", show_alert=True)
+            except Exception:
+                pass
+        return
 
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
         return
 
     # --- Manual product keyword search ---
-    
     if data == "prod_search_last":
         uid = c.from_user.id
         q = (CAT_LAST_QUERY.get(uid) or "").strip()
         if not q:
             bot.answer_callback_query(c.id, "אין מילת חיפוש פעילה.")
             return
-        bot.answer_callback_query(c.id)
+        try:
+            bot.answer_callback_query(c.id, "מחפש…")
+        except Exception:
+            pass
         _ms_start(uid=uid, chat_id=chat_id, q=q)
+        _ms_show(uid, chat_id)
         return
-        bot.answer_callback_query(c.id, "מחפש…")
-        # Run product search immediately and add to queue (no AI)
-        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}")
-        added, dups, total_after, last_page, err = refill_from_affiliate(AE_REFILL_MIN_QUEUE, keywords=q)
-        if err:
-            bot.send_message(chat_id, f"⚠️ החיפוש הסתיים עם הודעה: {err}")
-        bot.send_message(
-            chat_id,
-            f"✅ סיום חיפוש עבור: {q}\n"
-            f"נוספו לתור: {added}\n"
-            f"כפולים שנדחו: {dups}\n"
-            f"סה״כ בתור: {total_after}\n"
-            f"עמוד אחרון שנבדק: {last_page}"
-        )
-        return
+
 
     if data == "prod_search":
         uid = c.from_user.id
