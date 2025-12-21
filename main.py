@@ -259,6 +259,9 @@ if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
     AE_PRICE_INPUT_CURRENCY = "USD"
 
 AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+_raw_usd2ils = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip()
+if re.fullmatch(r"\d+(?:\.\d+)?", _raw_usd2ils) and _raw_usd2ils not in ("0","1"):
+    log_warn(f"[CFG] AE_PRICE_CONVERT_USD_TO_ILS should be 0/1, got '{_raw_usd2ils}'. Put the number in USD_TO_ILS_RATE instead.")
 AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
 
 def _display_currency_code() -> str:
@@ -2393,29 +2396,6 @@ def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
         return False, "אין קישור רכישה"
     return True, ""
 
-_MS_WORD_RE = re.compile(r"[A-Za-z0-9\u0590-\u05FF]+", re.UNICODE)
-
-def _ms_keyword_tokens(q: str) -> list[str]:
-    toks = [t.strip().lower() for t in _MS_WORD_RE.findall(q or "") if len(t.strip()) >= 2]
-    # de-dup while preserving order
-    out: list[str] = []
-    for t in toks:
-        if t not in out:
-            out.append(t)
-    return out
-
-def _ms_title_matches_query(title: str, q: str) -> bool:
-    toks = _ms_keyword_tokens(q)
-    if not toks:
-        return True
-    t = _norm(title)
-    hits = sum(1 for tok in toks if tok in t)
-    if len(toks) == 1:
-        return hits >= 1
-    # multi-token: require at least 60% tokens OR at least 2 hits
-    need = max(2, int(math.ceil(len(toks) * 0.6)))
-    return hits >= need
-
 def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False) -> dict:
     """Fetch one page from AliExpress Affiliate API and prepare preview session."""
     # IMPORTANT: For manual search we default to ALL categories (category_id=None),
@@ -2426,33 +2406,14 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         cat_id = cats[0] if cats else None  # keep it simple: first selected
     products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=q)
 
-    # Pre-map rows (so we can do keyword relevance filtering)
-    mapped_rows: list[dict] = []
-    for p in (products or []):
-        try:
-            mapped_rows.append(_map_affiliate_product_to_row(p))
-        except Exception:
-            continue
-
-    # Keyword relevance filter:
-    # If we can find *any* match in this page, we filter out non-matching titles.
-    any_kw_match = any(_ms_title_matches_query((r.get("Title") or ""), q) for r in mapped_rows)
-
-    # Evaluate against active filters
+    # Map and evaluate
     results = []
     raw_count = 0
-    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "free_ship": 0, "other": 0, "keyword": 0}
-    for row in mapped_rows:
+    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "free_ship": 0, "other": 0}
+    for p in (products or []):
         raw_count += 1
-
+        row = _map_affiliate_product_to_row(p)
         ok, reason = _ms_eval_row_filters(row)
-
-        # Apply keyword relevance only if it helps (i.e., at least one title matched on this page)
-        if ok and any_kw_match and not _ms_title_matches_query((row.get("Title") or ""), q):
-            ok = False
-            reason = "לא תואם למילת החיפוש"
-            reasons["keyword"] += 1
-
         if not ok:
             # bucket reasons (best-effort)
             if "קישור" in reason:
@@ -2465,12 +2426,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["rating"] += 1
             elif "משלוח" in reason:
                 reasons["free_ship"] += 1
-            elif "מילת החיפוש" in reason:
-                # already counted in 'keyword'
-                pass
             else:
                 reasons["other"] += 1
-
         results.append({"row": row, "ok": ok, "reason": reason})
 
     sess = {
@@ -2480,10 +2437,9 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         "idx": 0,
         "results": results,
         "raw_count": raw_count,
-        "reasons": reasons,
         "resp_code": resp_code,
         "resp_msg": resp_msg,
-        "kw_filter_applied": bool(any_kw_match),
+        "reasons": reasons,
         "use_selected_categories": bool(use_selected_categories),
     }
     MANUAL_SEARCH_SESS[uid] = sess
@@ -2531,12 +2487,10 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         reasons = sess.get("reasons") or {}
         raw_count = int(sess.get("raw_count") or 0)
         flt = _ms_active_filters_text()
-        kw = "פעיל ✅" if sess.get("kw_filter_applied") else "כבוי"
         info = (
             f"🔎 חיפוש ידני: <b>{html.escape(q)}</b>\n"
             f"דף: {page}\n"
-            f"סינונים פעילים: {html.escape(flt)}\n"
-            f"🎯 סינון רלוונטיות: {html.escape(kw)}\n\n"
+            f"סינונים פעילים: {html.escape(flt)}\n\n"
         )
         if raw_count > 0:
             info += (
@@ -3200,7 +3154,7 @@ def on_inline_click(c):
             PROD_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
         except Exception:
             # Fallback without ForceReply
-            bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח)")
+            bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח)\n📌 בקבוצות אפשר גם: /search <מילת חיפוש>")
         bot.answer_callback_query(c.id)
         return
 
@@ -3719,7 +3673,7 @@ def handle_category_search_text(m):
     prompt_ctx = CAT_SEARCH_PROMPT.get(uid)
     if chat_type in ("group", "supergroup"):
         if not (getattr(m, "reply_to_message", None) and prompt_ctx and prompt_ctx[0] == chat_id and m.reply_to_message.message_id == prompt_ctx[1]):
-            bot.reply_to(m, "כדי שהחיפוש יעבוד בקבוצה: לחץ Reply על הודעת החיפוש של הבוט ואז כתוב את מילת החיפוש.")
+            bot.reply_to(m, "כדי שהחיפוש יעבוד בקבוצה: לחץ Reply על הודעת החיפוש של הבוט ואז כתוב את מילת החיפוש.\nאפשר גם תמיד: /search <מילת חיפוש>")
             return
 
     # stop waiting even if query is empty
@@ -3766,6 +3720,33 @@ def handle_category_search_text(m):
     else:
         bot.send_message(chat_id, f"✅ נמצאו {total} קטגוריות שמתאימות ל: {q}\nאפשר לבחור קטגוריות, או לחץ על 🛒 חפש מוצרים למילת החיפוש.")
 
+
+# ========= MANUAL PRODUCT SEARCH (command) =========
+@bot.message_handler(commands=['search', 's', 'find'])
+def cmd_manual_product_search(m):
+    """Manual product search that works even in groups (privacy mode) via /search <keywords>."""
+    if not _is_admin(m):
+        try:
+            bot.reply_to(m, "אין הרשאה.")
+        except Exception:
+            pass
+        return
+
+    uid = getattr(getattr(m, "from_user", None), "id", None)
+    if not uid:
+        bot.reply_to(m, "שגיאה בזיהוי משתמש.")
+        return
+
+    text = (m.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(m, "🔎 שימוש: /search מילת חיפוש\nלדוגמה: /search iphone case")
+        return
+
+    q = parts[1].strip()
+    _ms_start(uid=uid, chat_id=m.chat.id, q=q)
+
+
 # ========= MANUAL PRODUCT SEARCH (text input) =========
 @bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
 def handle_manual_product_search_text(m):
@@ -3786,8 +3767,11 @@ def handle_manual_product_search_text(m):
 
     prompt_ctx = PROD_SEARCH_PROMPT.get(uid)
     if chat_type in ("group", "supergroup"):
+        if not prompt_ctx:
+            bot.reply_to(m, "נראה שהבוט אותחל מחדש ואין הודעת חיפוש פעילה. בקבוצה הכי בטוח להשתמש בפקודה: /search <מילת חיפוש>")
+            return
         if not (getattr(m, "reply_to_message", None) and prompt_ctx and prompt_ctx[0] == chat_id and m.reply_to_message.message_id == prompt_ctx[1]):
-            bot.reply_to(m, "כדי שהחיפוש יעבוד בקבוצה: לחץ Reply על הודעת החיפוש של הבוט ואז כתוב את מילת החיפוש.")
+            bot.reply_to(m, "כדי שהחיפוש יעבוד בקבוצה: לחץ Reply על הודעת החיפוש של הבוט ואז כתוב את מילת החיפוש.\nאפשר גם תמיד: /search <מילת חיפוש>")
             return
 
     # Clear wait state
