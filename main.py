@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v7")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v9")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -330,6 +330,7 @@ AE_TARGET_CURRENCY = "USD"
 # =================== AI (OpenAI) — “לתת חיים למוצרים” ===================
 # הפעלה/כיבוי:
 GPT_ENABLED = (os.environ.get("GPT_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
+GPT_TRANSLATE_SEARCH = (os.environ.get("GPT_TRANSLATE_SEARCH", "0") or "0").strip().lower() in ("1","true","yes","on")
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
 OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
 
@@ -1905,12 +1906,18 @@ def affiliate_product_detail_get(product_ids: str, fields: str | None = None) ->
 
 def _map_affiliate_product_to_row(p: dict) -> dict:
     # מחיר מבצע / מקורי - טיפול בטווחים ("1.23-4.56") + מניעת המרה כפולה אם המחיר כבר בש"ח
+    # Prefer target_* prices if present (often more accurate for the target market)
     sale_raw = (
-        p.get("app_sale_price")
-        if AE_USE_APP_PRICE
-        else (p.get("sale_price") or p.get("app_sale_price"))
-    ) or p.get("target_app_sale_price") or p.get("target_sale_price") or ""
-    orig_raw = p.get("original_price") or p.get("target_original_price") or ""
+        p.get("target_app_sale_price")
+        or p.get("target_sale_price")
+        or (
+            p.get("app_sale_price")
+            if AE_USE_APP_PRICE
+            else (p.get("sale_price") or p.get("app_sale_price"))
+        )
+        or ""
+    )
+    orig_raw = (p.get("target_original_price") or p.get("original_price") or "")
 
     def _pick_value(raw_val):
         s = str(raw_val or "").strip()
@@ -2041,7 +2048,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
                     new_rows = []
                     for p in products:
                         row = _map_affiliate_product_to_row(p)
-
+        
                         # Filters
                         if AE_PRICE_BUCKETS:
                             sale_num = _extract_float(row.get("SalePrice") or "")
@@ -2473,7 +2480,65 @@ _HE_KEYWORD_MAP = [
     ("נעל", "shoes"),
     ("תיק", "bag"),
     ("מצלמה", "camera"),
+    ("כלב", "dog"),
+    ("כלבים", "dog"),
+    ("חתול", "cat"),
+    ("חתולים", "cat"),
+    ("צעצוע לכלב", "dog toy"),
+    ("חיית מחמד", "pet supplies"),
+    ("שעוני", "wristwatch"),
+    ("שעון יד", "wristwatch"),
+    ("שעונים", "wristwatch"),
 ]
+
+
+_MS_TRANSLATE_CACHE: dict[str, str] = {}
+
+def _ms_ai_translate_keywords(q: str) -> str:
+    """Translate Hebrew query to short English keywords using OpenAI (optional).
+    Enabled only when GPT_TRANSLATE_SEARCH=1 and GPT is configured.
+    """
+    q = (q or "").strip()
+    if not q:
+        return q
+    if not GPT_TRANSLATE_SEARCH:
+        return q
+    if not (GPT_ENABLED and OPENAI_API_KEY and OpenAI is not None):
+        return q
+    if q in _MS_TRANSLATE_CACHE:
+        return _MS_TRANSLATE_CACHE[q]
+    try:
+        client = _get_openai_client()
+        prompt = (
+            "Translate the following Hebrew shopping search query to concise English keywords "
+            "(max 6 words) suitable for AliExpress search. Output ONLY the keywords, no quotes, no punctuation.\n"
+            f"Query: {q}"
+        )
+        text_out = ""
+        if hasattr(client, "responses") and hasattr(client.responses, "create"):
+            r = client.responses.create(
+                model=OPENAI_MODEL_EFFECTIVE,
+                input=[{"role": "user", "content": prompt}],
+                max_output_tokens=20,
+            )
+            text_out = (getattr(r, "output_text", "") or "").strip()
+        else:
+            r = client.chat.completions.create(
+                model=OPENAI_MODEL_EFFECTIVE,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=20,
+                temperature=0.2,
+            )
+            text_out = (((r.choices or [None])[0]).message.content or "").strip()
+        text_out = re.sub(r"[^A-Za-z0-9\s\-]", " ", text_out).strip()
+        text_out = re.sub(r"\s{2,}", " ", text_out)
+        if text_out:
+            _MS_TRANSLATE_CACHE[q] = text_out
+            return text_out
+    except Exception as e:
+        log_warn(f"[MS] translate failed: {e}")
+    _MS_TRANSLATE_CACHE[q] = q
+    return q
 
 def _ms_normalize_keywords(q: str) -> str:
     """Best-effort mapping of common Hebrew keywords to English for the affiliate API."""
@@ -2486,8 +2551,71 @@ def _ms_normalize_keywords(q: str) -> str:
         for he, en in _HE_KEYWORD_MAP:
             if he in q:
                 return en
+        return _ms_ai_translate_keywords(q)
     return q
 
+
+
+def _ms_build_query_variants(kw: str) -> list[str]:
+    kw = (kw or "").strip()
+    if not kw:
+        return []
+    low = kw.lower().strip()
+    # Common synonym expansions for better relevance
+    if low in ("wristwatch", "watch", "smartwatch"):
+        return ["watch", "wristwatch", "smartwatch", "watch men", "watch women"]
+    if low in ("dog", "cat"):
+        return [low, f"{low} accessories", f"{low} toy", "pet supplies"]
+    # Default: try as-is, plus a "buyer intent" suffix for generic terms
+    if len(low.split()) == 1 and len(low) >= 3:
+        return [kw, f"{kw} best", f"buy {kw}"]
+    return [kw]
+
+def _ms_build_token_set(kw: str) -> set[str]:
+    low = (kw or "").lower()
+    toks = {t for t in re.split(r"\s+", low) if t}
+    # Synonyms
+    if "wristwatch" in toks:
+        toks.add("watch")
+    if "smartwatch" in toks:
+        toks.add("watch")
+    if "dog" in toks or "cat" in toks:
+        toks.add("pet")
+    return toks
+
+def _ms_relevance_score(title: str, tokens: set[str]) -> int:
+    t = (title or "").lower()
+    if not t or not tokens:
+        return 0
+    score = 0
+    for tok in tokens:
+        if tok and tok in t:
+            score += 3
+    # boost if multiple tokens match
+    if score >= 6:
+        score += 2
+    return score
+
+def _ms_affiliate_query_with_fallback(uid: int, q: str, kw_norm: str, page: int, per_page: int, cat_id: str | None):
+    """Run affiliate queries (possibly multiple variants) and merge unique products."""
+    variants = _ms_build_query_variants(kw_norm)
+    seen: set[str] = set()
+    merged: list[dict] = []
+    resp_code, resp_msg = None, None
+    for kw_try in variants:
+        prods, rc, rm = affiliate_product_query(page, per_page, category_id=cat_id, keywords=kw_try)
+        resp_code, resp_msg = rc, rm
+        raw_n = len(prods or [])
+        log_info(f"[MS] fetch uid={uid} page={page} per={per_page} q={q!r} kw={kw_try!r} norm={kw_norm!r} cat_id={cat_id} resp_code={rc} raw={raw_n}")
+        for p in (prods or []):
+            pid = str(p.get("product_id", "")).strip()
+            if pid and pid not in seen:
+                seen.add(pid)
+                merged.append(p)
+        # Stop if we already have enough candidates
+        if len(merged) >= max(per_page * 2, 20):
+            break
+    return merged, resp_code, resp_msg
 
 def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False) -> dict:
     """Fetch one page from AliExpress Affiliate API and prepare preview session."""
@@ -2498,8 +2626,13 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         cats = get_selected_category_ids()
         cat_id = cats[0] if cats else None  # keep it simple: first selected
     kw = _ms_normalize_keywords(q)
-    products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=kw)
-    log_info(f"[MS] fetch uid={uid} page={page} per={per_page} q={q!r} kw={kw!r} cat_id={cat_id} resp_code={resp_code} raw={(len(products or []))}")
+
+    # If it's still a URL, this path should have been handled earlier; keep it safe.
+    if "http://" in kw or "https://" in kw:
+        return {"q": q, "page": page, "per_page": per_page, "items": [], "raw": 0, "resp_code": None, "resp_msg": "URL query not supported here"}
+
+    products, resp_code, resp_msg = _ms_affiliate_query_with_fallback(uid, q, kw, page, per_page, cat_id)
+    tokens = _ms_build_token_set(kw)
 
     # Map and evaluate
     results = []
@@ -2508,6 +2641,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     for p in (products or []):
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
+        score = _ms_relevance_score(str(p.get("product_title", "")), tokens)
         ok, reason = _ms_eval_row_filters(row, ignore_global=True)
         if not ok:
             # bucket reasons (best-effort)
@@ -2523,7 +2657,14 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["free_ship"] += 1
             else:
                 reasons["other"] += 1
-        results.append({"row": row, "ok": ok, "reason": reason})
+        results.append({"row": row, "ok": ok, "reason": reason, "score": score})
+    # Prefer relevant results: if we have any score>0, drop score==0 items.
+    if any((r.get("score", 0) or 0) > 0 for r in results):
+        results = [r for r in results if (r.get("score", 0) or 0) > 0]
+
+    # Sort by relevance score, then by filter pass
+    results.sort(key=lambda r: ((r.get("score", 0) or 0), 1 if r.get("ok") else 0), reverse=True)
+
 
     sess = {
         "q": q,
