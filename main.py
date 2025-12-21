@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v9")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v12")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -596,6 +596,7 @@ DELAY_EVENT = threading.Event()
 EXPECTING_TARGET = {}      # dict[user_id] = "public"|"private"
 EXPECTING_UPLOAD = set()   # user_ids שמצפים ל-CSV
 FILE_LOCK = threading.Lock()
+queue_lock = threading.Lock()  # protects queue_items mutations (refill/manual/send)
 
 # ========= SINGLE INSTANCE LOCK =========
 def acquire_single_instance_lock(lock_path: str):
@@ -2557,132 +2558,149 @@ def _ms_ai_translate_keywords(q: str) -> str:
     return q
 
 def _ms_normalize_keywords(q: str) -> str:
-    """Normalize user query (Hebrew/English) into concise English keywords for the affiliate API.
+    """Normalize manual-search query for AliExpress.
 
-    Goals:
-    - Preserve modifiers (e.g., 'רצועת כלב' -> 'dog leash', not just 'dog').
-    - Prefer phrase matches, then fall back to token mapping, then optional AI translation.
+    AliExpress search works best with concise English keywords.
+
+    Strategy:
+    - If query contains Hebrew: apply a built-in Hebrew→English phrase map + extract common device models.
+    - Optionally (recommended): if GPT_TRANSLATE_SEARCH=1, use OpenAI to translate the full Hebrew query into
+      short English shopping keywords.
+    - Always append detected model tokens (Galaxy S10 / iPhone 15 / Apple Watch...) to improve precision.
+
+    Returns: English keyword string (no URLs).
     """
-    q = (q or "").strip()
-    if not q:
-        return q
-    if "http://" in q or "https://" in q:
-        return q
+    q_raw = (q or "").strip()
+    if not q_raw:
+        return ""
 
-    # If the query contains Hebrew, try phrase/word mapping first.
-    if re.search(r"[\u0590-\u05FF]", q):
-        # phrase map (most specific first)
-        for he, en in _HE_PHRASE_MAP:
-            if he and he in q:
-                model = _ms_extract_device_model(q)
-                return (en + (' ' + model if model else '')).strip()
+    # Keep URLs intact (handled elsewhere)
+    if "http://" in q_raw or "https://" in q_raw:
+        return q_raw
 
-        def _he_stem(w: str) -> str:
-            w = (w or "").strip()
-            w = re.sub(r"[^\u0590-\u05FF]", "", w)
-            # strip common prefixes (very conservative)
-            for _ in range(2):
-                if w[:1] in ("ו", "ה", "ב", "כ", "ל", "מ", "ש"):
-                    w = w[1:]
-            # strip common suffixes
-            for suf in ("ים", "ות", "ת"):
-                if w.endswith(suf) and len(w) > len(suf) + 1:
-                    w = w[:-len(suf)]
-            return w
+    s = q_raw.strip()
+    has_he = (re.search(r"[֐-׿]", s) is not None)
 
-        words = [w for w in re.split(r"\s+", q) if w]
-        toks: list[str] = []
-        for w in words:
-            stem = _he_stem(w)
-            if stem and stem in _HE_WORD_MAP:
-                toks.append(_HE_WORD_MAP[stem])
-                continue
-            if w in _HE_WORD_MAP:
-                toks.append(_HE_WORD_MAP[w])
+    # ---- model / brand extraction (Hebrew + mixed) ----
+    extras: list[str] = []
 
-        # context rules
-        if ("dog" in toks) and ("strap" in toks):
-            toks = ["leash" if t == "strap" else t for t in toks]
-        if ("watch" in toks) and ("strap" in toks):
-            toks = ["band" if t == "strap" else t for t in toks]
+    # Samsung Galaxy (גלקסי 10 / גלקסי S10 / Galaxy S10)
+    m = re.search(r"(?:גלקסי|galaxy)\s*(?:s\s*)?(\d{1,2})", s, re.I)
+    if m:
+        num = m.group(1)
+        extras.append(f"Samsung Galaxy S{num}")
 
-        # combine smart+watch -> smartwatch
-        if "smart" in toks and "watch" in toks:
-            toks = [t for t in toks if t not in ("smart", "watch")]
-            toks.insert(0, "smartwatch")
+    # iPhone (אייפון 15)
+    m = re.search(r"(?:אייפון|iphone)\s*(\d{1,2})", s, re.I)
+    if m:
+        extras.append(f"iPhone {m.group(1)}")
 
-        # dedupe while preserving order
-        seen = set()
-        toks2: list[str] = []
-        for t in toks:
-            t = (t or "").strip().lower()
-            if not t or t in seen:
-                continue
-            seen.add(t)
-            toks2.append(t)
+    # Apple Watch
+    if re.search(r"(?:אפל\s*ווטש|apple\s*watch)", s, re.I):
+        extras.append("Apple Watch")
 
-        if toks2:
-            model = _ms_extract_device_model(q)
-            base = " ".join(toks2[:5])
-            return (base + (" " + model if model else "")).strip()
+    # Common brands
+    if re.search(r"(?:שיאומי|xiaomi|redmi|poco)", s, re.I):
+        extras.append("Xiaomi")
+    if re.search(r"(?:סמסונג|samsung)", s, re.I):
+        extras.append("Samsung")
 
-        return _ms_ai_translate_keywords(q)
+    # ---- Hebrew phrase map (longest first) ----
+    # NOTE: keep keys in Hebrew EXACTLY as users type them; we'll also try minor variants.
+    phrase_map = {
+        "רצועת כלב": "dog leash",
+        "קולר לכלב": "dog collar",
+        "צעצוע לכלב": "dog toy",
+        "צעצועים לכלב": "dog toys",
+        "ציוד לכלב": "dog accessories",
+        "חתול": "cat",
+        "לחתול": "cat",
+        "צעצוע לחתול": "cat toy",
+        "ציוד לחתול": "cat accessories",
 
-    return q
+        "מגן מסך": "screen protector",
+        "מגן מסך לגלקסי": "screen protector Samsung Galaxy",
+        "מגן מסך לאייפון": "screen protector iPhone",
+        "כיסוי": "case",
+        "כיסוי לטלפון": "phone case",
+        "קייס": "case",
+        "מטען": "charger",
+        "מטען מהיר": "fast charger",
+        "מטען לרכב": "car charger",
+        "כבל": "cable",
+        "כבל טעינה": "charging cable",
+        "אוזניות": "headphones",
+        "אוזניות בלוטוס": "bluetooth headphones",
+        "רמקול": "speaker",
+        "רמקול בלוטוס": "bluetooth speaker",
 
+        "שעון": "wristwatch",
+        "שעון יד": "wristwatch",
+        "שעון חכם": "smartwatch",
+        "שעון אפל": "Apple Watch",
 
-def _ms_build_query_variants(kw: str) -> list[str]:
-    kw = (kw or "").strip().lower()
+        "מחשב נייד": "laptop",
+        "טאבלט": "tablet",
+        "מקלדת": "keyboard",
+        "עכבר": "mouse",
+        "עכבר אלחוטי": "wireless mouse",
+        "מסך": "monitor",
+
+        "כלי עבודה": "tools",
+        "מברגה": "cordless drill",
+        "מקדחה": "drill",
+        "מסור": "saw",
+
+        "מטבח": "kitchen gadgets",
+        "גאדג'ט": "gadget",
+        "גאדגטים": "gadgets",
+        "תאורה": "lighting",
+        "לד": "LED",
+
+        "גיימינג": "gaming",
+        "שלט": "controller",
+        "פלייסטיישן": "PlayStation",
+
+        "נעליים": "shoes",
+        "נעלי ריצה": "running shoes",
+        "תיק": "bag",
+        "תיק גב": "backpack",
+    }
+
+    kw = s
+
+    if has_he:
+        # Apply phrase replacements (prefer longer keys first)
+        for he in sorted(phrase_map.keys(), key=len, reverse=True):
+            if he in kw:
+                kw = kw.replace(he, phrase_map[he])
+
+        # Drop remaining Hebrew fragments (keep numbers/latin)
+        kw_clean = re.sub(r"[֐-׿]+", " ", kw)
+        kw_clean = re.sub(r"\s{2,}", " ", kw_clean).strip()
+
+        # Optional: use AI translation for better coverage (recommended for ANY Hebrew query)
+        kw_ai = ""
+        if GPT_TRANSLATE_SEARCH:
+            kw_ai = _ms_ai_translate_keywords(s)
+            kw_ai = (kw_ai or "").strip()
+
+        # Decide: prefer AI output if it looks non-trivial
+        kw = kw_clean
+        if kw_ai and (len(kw.split()) < 2 or kw.lower() in (s.lower(), kw_clean.lower())):
+            kw = kw_ai
+
+    # Append extracted model tokens to improve precision
+    for e in extras:
+        if e and e.lower() not in kw.lower():
+            kw = (kw + " " + e).strip()
+
+    kw = re.sub(r"\s{2,}", " ", kw).strip()
     if not kw:
-        return []
+        # last resort: remove Hebrew and keep what's left
+        kw = re.sub(r"[֐-׿]+", " ", s).strip()
 
-    # If the normalized keyword contains a device model, try structured variants first
-    m_iph = re.search(r"iphone\s*(\d{1,2})", kw)
-    m_gal_s = re.search(r"galaxy\s*s\s*(\d{1,2})", kw)
-    m_gal_a = re.search(r"galaxy\s*a\s*(\d{2})", kw)
-    model = None
-    if m_iph:
-        model = f"iphone {m_iph.group(1)}"
-    elif m_gal_s:
-        model = f"galaxy s{m_gal_s.group(1)}"
-    elif m_gal_a:
-        model = f"galaxy a{m_gal_a.group(1)}"
-
-    if model:
-        if "screen protector" in kw:
-            return [f"{model} screen protector", f"screen protector for {model}", kw]
-        if "case" in kw or "cover" in kw:
-            return [f"{model} case", f"case for {model}", kw]
-        if "watch band" in kw or "watch strap" in kw:
-            return [f"{model} band", f"band for {model}", kw]
-        return [kw, f"{model} accessories", model]
-
-    # Specializations (ordered)
-    if "dog leash" in kw or ("dog" in kw and "leash" in kw):
-        return ["dog leash", "leash for dog", "dog lead", "pet leash"]
-    if "dog collar" in kw or ("dog" in kw and "collar" in kw):
-        return ["dog collar", "pet collar dog", "dog collar adjustable", "dog accessories"]
-    if "dog harness" in kw or ("dog" in kw and "harness" in kw):
-        return ["dog harness", "pet harness dog", "no pull harness dog", "dog accessories"]
-
-    if kw in ("wristwatch", "watch"):
-        return ["wristwatch", "men watch", "women watch", "quartz watch", "luxury watch"]
-    if kw in ("smartwatch", "smart watch"):
-        return ["smartwatch", "fitness smartwatch", "smart watch", "android smartwatch", "ios smartwatch"]
-    if "watch band" in kw or ("watch" in kw and "band" in kw):
-        return ["watch band", "watch strap", "watch bracelet", "replacement watch band"]
-
-    # General fallbacks
-    if any(x in kw for x in ("car", "auto")):
-        return ["car accessories", "car gadget", "car interior accessories", "auto accessories"]
-    if "kitchen" in kw:
-        return ["kitchen gadget", "kitchen tools", "kitchen accessories", "home kitchen"]
-    if "tools" in kw or "drill" in kw:
-        return ["tools", "hand tools", "power tools", "workshop tools"]
-
-    return [kw]
-
-
+    return kw
 def _ms_build_token_set(kw: str) -> set[str]:
     low = (kw or "").lower().strip()
     toks = {t for t in re.split(r"\W+", low) if t}
