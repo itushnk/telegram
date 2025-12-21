@@ -1884,6 +1884,10 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     if not isinstance(products, list):
         products = [products]
 
+    try:
+        _logger.info(f"[AE] affiliate_product_query page={page_no} size={page_size} kw='{(keywords or '').strip()}' cat='{(str(category_id or '')).strip()}' resp_code={resp_code} resp_msg='{resp_msg}' products={len(products)}")
+    except Exception:
+        pass
     return products, resp_code, resp_msg
 
 
@@ -1894,7 +1898,43 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
     - If `keywords` is provided, it is sent as-is to TOP.
     - Otherwise, if AE_KEYWORDS exists, it rotates keywords to avoid repetitive results.
     """
-    fields = "product_id,product_title,product_main_image_url,promotion_link,promotion_url,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
+    fields = ",".join([
+
+        "product_id",
+
+        "product_title",
+
+        "product_main_image_url",
+
+        "product_detail_url",
+
+        "product_video_url",
+
+        "original_price",
+
+        "sale_price",
+
+        "app_sale_price",
+
+        "target_original_price",
+
+        "target_sale_price",
+
+        "target_app_sale_price",
+
+        "discount",
+
+        "evaluate_rate",
+
+        "lastest_volume",
+
+        "promotion_link",
+
+        "commission_rate",
+
+        "promotion_rate",
+
+    ])
     biz = {
         "tracking_id": AE_TRACKING_ID,
         "page_no": str(page_no),
@@ -2899,6 +2939,12 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         "strict_match": bool(not relaxed_match),
         "relaxed_match": bool(relaxed_match),
     }
+    # Debug log (helps diagnose empty results / filters)
+    try:
+        ok_count = sum(1 for it in results if it.get("ok"))
+    except Exception:
+        ok_count = 0
+    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match}")
     MANUAL_SEARCH_SESS[uid] = sess
     return sess
 
