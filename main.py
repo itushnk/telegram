@@ -189,6 +189,18 @@ def log_error(msg: str):
         except Exception:
             pass
 
+def log_warn(msg: str):
+    """Warning logger (some newer handlers call log_warn)."""
+    try:
+        _logger.warning(msg)
+    except Exception:
+        try:
+            print(f"[WARN] {msg}", flush=True)
+        except Exception:
+            pass
+
+
+
 def log_exc(msg: str):
     try:
         _logger.exception(msg)
@@ -709,6 +721,23 @@ def _extract_float(s: str):
     if not m:
         return None
     return float(m.group(1).replace(",", "."))
+
+
+def _commission_percent(v):
+    """Normalize commission rate to percent (0-100).
+    Some APIs return 0.15 for 15%, others return 15. This makes it consistent.
+    """
+    f = _extract_float(v)
+    if f is None:
+        return None
+    try:
+        f = float(f)
+    except Exception:
+        return None
+    if 0 < f <= 1.0:
+        f *= 100.0
+    return f
+
 
 def _format_money(num: float, decimals: int) -> str:
     """Format number with fixed decimals (Excel/Telegram friendly)."""
@@ -2176,7 +2205,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
             if r is None or float(r) < min_rating:
                 return False
         if min_commission:
-            c = _extract_float(row.get("CommissionRate") or "")
+            c = _commission_percent(row.get("CommissionRate") or "")
             c = float(c or 0.0)
             if c < float(min_commission):
                 return False
@@ -2872,7 +2901,7 @@ def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
             return False, f"דירוג נמוך מ-{MIN_RATING}%"
     # Commission
     if MIN_COMMISSION:
-        c = _extract_float(row.get("CommissionRate") or "")
+        c = _commission_percent(row.get("CommissionRate") or "")
         c = float(c or 0.0)
         if c < float(MIN_COMMISSION):
             return False, f"עמלה נמוכה מ-{MIN_COMMISSION:g}%"
