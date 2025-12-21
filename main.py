@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v12")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v13")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -1833,9 +1833,9 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
         "page_no": page_no,
         "page_size": page_size,
         "sort": AE_REFILL_SORT,
-        "target_currency": AE_TARGET_CURRENCY,
-        "target_language": AE_TARGET_LANGUAGE,
-        "target_currency": AE_TARGET_CURRENCY,
+        "target_currency": (target_currency_override or AE_TARGET_CURRENCY),
+        "target_language": (target_language_override or AE_TARGET_LANGUAGE),
+        "target_currency": (target_currency_override or AE_TARGET_CURRENCY),
         "tracking_id": AE_TRACKING_ID,
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "fields": "product_id,product_title,product_main_image_url,promotion_link,sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url",
@@ -1866,6 +1866,8 @@ def affiliate_product_query(
     category_id: str | None = None,
     keywords: str | None = None,
     sort: str | None = None,
+    target_language_override: str | None = None,
+    target_currency_override: str | None = None,
 ) -> tuple[list[dict], int | None, str | None]:
     """Affiliate product query with optional category filter.
 
@@ -1881,8 +1883,8 @@ def affiliate_product_query(
         "page_size": str(page_size),
         "sort": (sort or AE_REFILL_SORT),
         "ship_to_country": AE_SHIP_TO_COUNTRY,
-        "target_currency": AE_TARGET_CURRENCY,
-        "target_language": AE_TARGET_LANGUAGE,
+        "target_currency": (target_currency_override or AE_TARGET_CURRENCY),
+        "target_language": (target_language_override or AE_TARGET_LANGUAGE),
         "fields": fields,
         "platform_product_type": "ALL",
     }
@@ -1920,7 +1922,7 @@ def affiliate_product_detail_get(product_ids: str, fields: str | None = None) ->
     """
     biz = {
         "tracking_id": AE_TRACKING_ID,
-        "target_language": AE_TARGET_LANGUAGE,
+        "target_language": (target_language_override or AE_TARGET_LANGUAGE),
         "country": AE_SHIP_TO_COUNTRY,
         "product_ids": str(product_ids).strip(),
         "fields": fields
@@ -2044,156 +2046,144 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
 
 
-def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_selected_categories: bool = False) -> tuple[int, int, int, str | None]:
+def refill_from_affiliate(
+    max_needed: int = AE_REFILL_MIN_QUEUE,
+    keywords: str | None = None,
+    ignore_selected_categories: bool = False,
+) -> tuple[int, int, int, int | None, str | None]:
+    """ממלא את pending.csv מה-AliExpress Affiliate עד שמגיעים ל-max_needed.
+
+    מחזיר:
+      (added_count, dup_count, total_after, last_page, last_error)
     """
-    מחזיר: (added, duplicates, total_queue, info_or_error)
-    - ממלא תור מפריטי AliExpress Affiliate API.
-    - מנסה לגוון אוטומטית (רנדומלי בין נושאים) כדי לא לקבל תמיד את אותם מוצרים.
-    """
-    if max_needed <= 0:
-        return (0, 0, len(queue_items), None)
+    try:
+        with FILE_LOCK:
+            pending_rows = read_products(PENDING_CSV)
+        current_len = len(pending_rows)
+        if current_len >= max_needed:
+            return 0, 0, current_len, None, None
 
-    selected_cats = [] if ignore_selected_categories else get_selected_category_ids()
-    # distribute need across categories; if none -> single bucket
-    per_cat: list[tuple[str | None, int]] = [(None, max_needed)]
-    if selected_cats:
-        n = len(selected_cats)
-        base = max_needed // n
-        rem = max_needed % n
-        per_cat = []
-        for i, cid in enumerate(selected_cats):
-            need = base + (1 if i < rem else 0)
-            if need > 0:
-                per_cat.append((cid, need))
-        if not per_cat:
-            per_cat = [(None, max_needed)]
+        # Keywords: אם המשתמש העביר מילה – נשתמש בה; אחרת נבחר מרשימת AE_KEYWORDS/קטגוריות.
+        if keywords and str(keywords).strip():
+            kw_list = [str(keywords).strip()]
+        else:
+            kw_list = _choose_refill_keywords(ignore_selected_categories=ignore_selected_categories)
 
-    max_pages_per_cat = max(1, AE_REFILL_MAX_PAGES // max(1, len(per_cat)))
-    # Randomized keywords for this refill cycle
-    cycle_kws = _choose_refill_keywords()
-    if not cycle_kws and keywords:
-        cycle_kws = [keywords]
+        # sort pool
+        sort_pool = [s.strip().upper() for s in re.split(r"[\n,|]+", AE_REFILL_SORT_POOL or "") if s.strip()]
+        if not sort_pool:
+            sort_pool = [AE_REFILL_SORT]
 
-    sort_pool = [s.strip().upper() for s in re.split(r"[\n,|]+", AE_REFILL_SORT_POOL or "") if s.strip()]
-    added = 0
-    duplicates = 0
-    skipped_no_link = 0
-    skipped_price = 0
-    last_error: str | None = None
-    last_resp: tuple[int | None, str | None, int, str | None, str | None, int | None] | None = None  # (code,msg,raw,kw,sort,page)
+        collected_rows: list[dict] = []
+        dup_count = 0
+        added_count = 0
+        last_page: int | None = None
+        last_error: str | None = None
 
-    # We accumulate new rows and shuffle before enqueue to improve variety
-    collected_rows: list[dict] = []
+        # snapshot existing ids for quicker dedup while collecting
+        try:
+            existing_ids = set(
+                str(r.get("ProductId") or r.get("ItemId") or "")
+                for r in pending_rows
+                if str(r.get("ProductId") or r.get("ItemId") or "").strip()
+            )
+        except Exception:
+            existing_ids = set()
 
-    for (cat_id, need_cat) in per_cat:
-        if added >= max_needed:
-            break
+        for kw in kw_list:
+            # random page + random sort
+            if AE_REFILL_RANDOMIZE:
+                page_no = random.randint(1, max(1, AE_REFILL_RANDOM_PAGE_MAX))
+                eff_sort = random.choice(sort_pool)
+            else:
+                page_no = 1
+                eff_sort = sort_pool[0]
 
-        # try a few pages; when randomize enabled, we randomly sample within a small range
-        for _ in range(1, max_pages_per_cat + 1):
-            if added >= max_needed:
+            last_page = page_no
+
+            try:
+                products, resp_code, resp_msg = affiliate_product_query(
+                    keywords=kw,
+                    page_no=page_no,
+                    page_size=50,
+                    sort=eff_sort,
+                )
+            except Exception as e:
+                last_error = f"affiliate_product_query exception: {e}"
+                continue
+
+            if resp_code != 200:
+                last_error = resp_msg or f"HTTP {resp_code}"
+                continue
+
+            if not products:
+                continue
+
+            for prod in products:
+                row = _map_affiliate_product_to_row(prod)
+                if not row:
+                    continue
+
+                # filters (global)
+                ok, _reason = _eval_row_filters(row)
+                if not ok:
+                    continue
+
+                pid = str(row.get("ProductId") or row.get("ItemId") or "").strip()
+                if pid and pid in existing_ids:
+                    dup_count += 1
+                    continue
+
+                collected_rows.append(row)
+                if pid:
+                    existing_ids.add(pid)
+
+                # stop collecting if we have plenty
+                if len(collected_rows) >= max(50, (max_needed - current_len) * 2):
+                    break
+
+            if len(collected_rows) >= max(50, (max_needed - current_len) * 2):
                 break
 
-            page_no = _ if not AE_REFILL_RANDOMIZE else random.randint(1, max(1, AE_REFILL_RANDOM_PAGE_MAX))
-            eff_sort = AE_REFILL_SORT
-            if sort_pool:
-                eff_sort = random.choice(sort_pool)
+        if AE_REFILL_RANDOMIZE and collected_rows:
+            random.shuffle(collected_rows)
 
-            # If we have explicit cycle keywords – fetch per keyword; otherwise let API choose/rotate
-            kw_list = cycle_kws if cycle_kws else [None]
-            for kw_one in kw_list:
-                if added >= max_needed:
+        # Persist: append until max_needed
+        with FILE_LOCK:
+            pending_rows = read_products(PENDING_CSV)
+            existing_ids2 = set()
+            try:
+                for r in pending_rows:
+                    pid = str(r.get("ProductId") or r.get("ItemId") or "").strip()
+                    if pid:
+                        existing_ids2.add(pid)
+            except Exception:
+                pass
+
+            for row in collected_rows:
+                if len(pending_rows) >= max_needed:
                     break
-
-                kw_str = (kw_one or "").strip() if kw_one is not None else None
-                products: list[dict] = []
-                resp_code: int | None = None
-                resp_msg: str | None = None
-                try:
-                    products, resp_code, resp_msg = affiliate_product_query(
-                        page_no,
-                        AE_REFILL_PAGE_SIZE,
-                        category_id=cat_id,
-                        keywords=kw_str,
-                        sort=eff_sort,
-                    )
-                    last_resp = (resp_code, resp_msg, len(products), kw_str, eff_sort, page_no)
-                except Exception as e:
-                    last_error = f"{type(e).__name__}: {e}"
+                pid = str(row.get("ProductId") or row.get("ItemId") or "").strip()
+                if pid and pid in existing_ids2:
+                    dup_count += 1
                     continue
+                pending_rows.append(row)
+                if pid:
+                    existing_ids2.add(pid)
+                added_count += 1
 
-                # stop conditions
-                if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
-                    last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
-                    break
-                if not products:
-                    continue
+            # אופציונלי: ערבוב התור כולו בתחילת ריצה כדי להימנע מ"אותו פריט ראשון"
+            if AE_REFILL_RANDOMIZE and added_count > 0:
+                if (os.environ.get("AE_SHUFFLE_QUEUE_ON_REFILL", "0") or "0").strip().lower() in ("1","true","yes","on"):
+                    random.shuffle(pending_rows)
 
-                for p in products:
-                    if added >= max_needed:
-                        break
-                    row = _map_affiliate_product_to_row(p)
+            write_products(PENDING_CSV, pending_rows)
+            total_after = len(pending_rows)
 
-                    # Filters (price buckets always apply)
-                    if AE_PRICE_BUCKETS:
-                        sale_num = _extract_float(row.get("SalePrice") or "")
-                        if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
-                            skipped_price += 1
-                            continue
+        return added_count, dup_count, total_after, last_page, last_error
 
-                    # Global filters (optionally ignored for refill variety)
-                    if (not AE_REFILL_IGNORE_GLOBAL_FILTERS) and MIN_ORDERS:
-                        o = safe_int(row.get("Orders") or "0", 0)
-                        if o < int(MIN_ORDERS):
-                            continue
-
-                    if (not AE_REFILL_IGNORE_GLOBAL_FILTERS) and MIN_RATING:
-                        r = _extract_float(row.get("Rating") or "")
-                        if r is None or float(r) < float(MIN_RATING):
-                            continue
-
-                    if (not AE_REFILL_IGNORE_GLOBAL_FILTERS) and FREE_SHIP_ONLY:
-                        sale_num = _extract_float(row.get("SalePrice") or "")
-                        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-                            continue
-
-                    if not row.get("BuyLink"):
-                        skipped_no_link += 1
-                        continue
-
-                    # Dedup on ProductId
-                    pid = str(row.get("ProductId") or "").strip()
-                    if not pid:
-                        continue
-                    if is_duplicate_product(pid):
-                        duplicates += 1
-                        continue
-
-                    remember_product(pid)
-                    collected_rows.append(row)
-                    added += 1
-                    if added >= max_needed:
-                        break
-
-    # Shuffle before enqueue for more variety (and to avoid always same first item)
-    if collected_rows and AE_REFILL_RANDOMIZE:
-        random.shuffle(collected_rows)
-
-    with queue_lock:
-        for row in collected_rows:
-            queue_items.append(row)
-        _save_queue()
-
-    info = None
-    if last_error:
-        info = last_error
-    elif last_resp:
-        code0, msg0, raw0, kw0, sort0, pg0 = last_resp
-        info = f"resp_code={code0} raw={raw0} kw={kw0} sort={sort0} page={pg0} skip_nolink={skipped_no_link} skip_price={skipped_price}"
-
-    return (added, duplicates, len(queue_items), info)
-
-
+    except Exception as e:
+        return 0, 0, 0, None, f"refill_from_affiliate exception: {e}"
 def _active_price_bucket_ids():
     raw = (AE_PRICE_BUCKETS_RAW or "").strip()
     if not raw:
@@ -2701,6 +2691,69 @@ def _ms_normalize_keywords(q: str) -> str:
         kw = re.sub(r"[֐-׿]+", " ", s).strip()
 
     return kw
+def _ms_build_query_variants(kw_norm: str) -> list[str]:
+    """Build a small list of keyword variants for manual search.
+
+    Goal: increase recall without drifting to unrelated items.
+    """
+    kw = (kw_norm or "").strip()
+    if not kw:
+        return []
+    variants: list[str] = []
+
+    def add(s: str):
+        s2 = re.sub(r"\s{2,}", " ", (s or "").strip())
+        if s2 and s2.lower() not in {v.lower() for v in variants}:
+            variants.append(s2)
+
+    add(kw)
+
+    low = kw.lower()
+
+    # try removing very common stopwords
+    base = re.sub(r"\b(for|with|and|the|a|an|of)\b", " ", kw, flags=re.I)
+    base = re.sub(r"\s{2,}", " ", base).strip()
+    if base and base.lower() != low:
+        add(base)
+
+    # extract model-ish suffix (keep it to preserve precision)
+    model = ""
+    m = re.search(r"(galaxy\s*[as]?\s*\d+|iphone\s*\d+|ipad\s*\w+|watch\s*\d+|s\d{1,2}\b|note\s*\d+)", low)
+    if m:
+        model = m.group(0).strip()
+
+    # targeted synonym expansions (safe)
+    syn = {
+        "screen protector": ["tempered glass screen protector", "protective screen film"],
+        "phone case": ["protective phone case", "cover case"],
+        "case": ["phone case", "protective case", "cover case"],
+        "charger": ["fast charger", "usb charger", "charging adapter"],
+        "charging cable": ["usb cable", "type c cable", "lightning cable"],
+        "wireless mouse": ["bluetooth mouse", "2.4g wireless mouse"],
+        "running shoes": ["sport shoes", "athletic shoes"],
+        "dog leash": ["pet leash", "dog lead", "leash for dog"],
+        "dog collar": ["pet collar", "collar for dog"],
+        "smartwatch": ["smart watch", "fitness tracker"],
+        "wristwatch": ["watch", "men watch", "women watch"],
+    }
+
+    for k, arr in syn.items():
+        if k in low:
+            for s in arr:
+                if model and model not in s.lower():
+                    add(f"{s} {model}")
+                else:
+                    add(s)
+
+    # if we detected a model, add a couple of re-ordered variants
+    if model:
+        # ensure the model appears at the end as well
+        if model not in low.split():
+            add(f"{kw} {model}")
+        # model-first variant (some APIs like it)
+        add(f"{model} {kw}")
+
+    return variants[:8]
 def _ms_build_token_set(kw: str) -> set[str]:
     low = (kw or "").lower().strip()
     toks = {t for t in re.split(r"\W+", low) if t}
@@ -2757,7 +2810,7 @@ def _ms_affiliate_query_with_fallback(uid: int, q: str, kw_norm: str, page: int,
     merged: list[dict] = []
     resp_code, resp_msg = None, None
     for kw_try in variants:
-        prods, rc, rm = affiliate_product_query(page, per_page, category_id=cat_id, keywords=kw_try)
+        prods, rc, rm = affiliate_product_query(keywords=kw_try, page_no=page, page_size=per_page, category_id=cat_id, target_language_override=(os.environ.get("AE_MANUAL_SEARCH_TARGET_LANGUAGE", "EN") or "EN").strip().upper(), target_currency_override=AE_TARGET_CURRENCY)
         resp_code, resp_msg = rc, rm
         raw_n = len(prods or [])
         log_info(f"[MS] fetch uid={uid} page={page} per={per_page} q={q!r} kw={kw_try!r} norm={kw_norm!r} cat_id={cat_id} resp_code={rc} raw={raw_n}")
