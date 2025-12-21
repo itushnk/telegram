@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20currencyfix")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21searchfix-v7")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -3200,7 +3200,28 @@ def on_inline_click(c):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
         return
 
-    data = c.data or ""
+    data = c.data         # Quick-search buttons (manual search) - no typing needed
+        if data and data.startswith("msq:"):
+            uid = c.from_user.id
+            chat_id = c.message.chat.id
+            q = data.split(":", 1)[1].strip()
+            log_info(f"[MS] quick uid={uid} chat={chat_id} q={q!r}")
+            try:
+                _ms_start(uid=uid, chat_id=chat_id, q=q)
+                _ms_show(uid, chat_id)
+            except Exception as e:
+                log_error(f"[MS] quick error: {e}")
+                try:
+                    bot.answer_callback_query(c.id, "שגיאה בחיפוש", show_alert=True)
+                except Exception:
+                    pass
+            else:
+                try:
+                    bot.answer_callback_query(c.id, "מחפש…")
+                except Exception:
+                    pass
+            return
+or ""
     chat_id = c.message.chat.id
 
     # Handle filter menus / callbacks
@@ -3240,6 +3261,16 @@ def on_inline_click(c):
         PROD_SEARCH_WAIT[uid] = True
         PROD_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
         try:
+
+            kbq = types.InlineKeyboardMarkup(row_width=2)
+            kbq.add(
+                types.InlineKeyboardButton("⌚ שעון", callback_data="msq:wristwatch"),
+                types.InlineKeyboardButton("⌚🤖 שעון חכם", callback_data="msq:smartwatch"),
+                types.InlineKeyboardButton("🎧 אוזניות", callback_data="msq:wireless earbuds"),
+                types.InlineKeyboardButton("🚗 אביזרי רכב", callback_data="msq:car accessories"),
+                types.InlineKeyboardButton("🍳 מטבח", callback_data="msq:kitchen gadget"),
+                types.InlineKeyboardButton("🧰 כלי עבודה", callback_data="msq:tools"),
+            )
             prompt = bot.send_message(
                 chat_id,
                 "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח).\n"
@@ -3817,8 +3848,6 @@ def handle_category_search_text(m):
         bot.send_message(chat_id, f"✅ נמצאו {total} קטגוריות שמתאימות ל: {q}\nאפשר לבחור קטגוריות, או לחץ על 🛒 חפש מוצרים למילת החיפוש.")
 
 # ========= MANUAL PRODUCT SEARCH (text input) =========
-@bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
-
 def _extract_product_id_from_url(url: str) -> str | None:
     if not url:
         return None
@@ -3875,6 +3904,7 @@ def _manual_search_from_url(uid: int, chat_id: int, url: str) -> bool:
     return True
 
 
+@bot.message_handler(func=lambda m: bool(PROD_SEARCH_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
 def handle_manual_product_search_text(m):
     """Handle admin keyword search that fetches affiliate products and adds them to queue.
 
@@ -4284,6 +4314,10 @@ while True:
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
-        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+        if "Conflict: terminated by other getUpdates request" in msg:
+            log_error("Polling conflict (409): another instance is running. This instance will sleep and exit to avoid losing callbacks/search replies.")
+            time.sleep(3600)
+            sys.exit(0)
+        wait = 5
         log_error(f"Polling error: {e}. Retrying in {wait}s...")
         time.sleep(wait)
