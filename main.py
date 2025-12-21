@@ -244,6 +244,7 @@ PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 SCHEDULE_FLAG_FILE      = os.path.join(BASE_DIR, "schedule_enforced.flag")
 CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
+BROADCAST_FLAG_FILE     = os.path.join(BASE_DIR, "broadcast_enabled.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
@@ -1443,6 +1444,10 @@ def post_to_channel(product) -> bool:
 # ========= ATOMIC SEND =========
 # ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
+    if not is_broadcast_enabled():
+        log_info(f"{source}: broadcast disabled (no send)")
+        return False
+
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
         if not pending:
@@ -1493,6 +1498,24 @@ def read_auto_flag():
 def write_auto_flag(value):
     with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
         f.write(value)
+
+
+def read_broadcast_flag():
+    try:
+        with open(BROADCAST_FLAG_FILE, "r", encoding="utf-8") as f:
+            return (f.read() or "").strip() or "off"
+    except Exception:
+        return "off"
+
+def write_broadcast_flag(value: str):
+    with open(BROADCAST_FLAG_FILE, "w", encoding="utf-8") as f:
+        f.write(str(value or "off").strip())
+
+def is_broadcast_enabled() -> bool:
+    return (read_broadcast_flag().strip().lower() in ("1", "true", "yes", "on"))
+
+def set_broadcast_enabled(flag: bool):
+    write_broadcast_flag("on" if flag else "off")
 
 def get_auto_delay():
     now = _now_il().time()
@@ -2413,6 +2436,11 @@ PROD_SEARCH_WAIT: dict[int, bool] = {}        # uid -> waiting for keyword text?
 PROD_SEARCH_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
 PROD_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
 
+# --- Set post interval (minutes) prompt state ---
+DELAY_SET_WAIT: dict[int, bool] = {}        # uid -> waiting for minutes text?
+DELAY_SET_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
+DELAY_SET_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
+
 # --- Manual PRODUCT search preview session (per admin user) ---
 # Stores last fetched results for a keyword so you can review what was found BEFORE adding to queue.
 MANUAL_SEARCH_SESS: dict[int, dict] = {}  # uid -> {q, page, per_page, results:[{row,ok,reason}], idx}
@@ -2446,6 +2474,22 @@ def _ms_active_filters_text() -> str:
     if cats:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
     return " | ".join(parts) if parts else "ללא"
+
+def _ms_keyword_match(title: str, q: str) -> bool:
+    """Best-effort strictness to reduce unrelated results in manual search."""
+    try:
+        t = (title or "").lower()
+        qq = (q or "").lower().strip()
+        if not qq or not t:
+            return True
+        toks = [x for x in re.split(r"[^\w\u0590-\u05FF]+", qq) if len(x) >= 2]
+        if not toks:
+            toks = [qq]
+        hits = sum(1 for tok in toks if tok in t)
+        need = 1 if len(toks) <= 2 else 2
+        return hits >= need
+    except Exception:
+        return True
 
 def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
     """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
@@ -2492,6 +2536,9 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
         ok, reason = _ms_eval_row_filters(row)
+        # Extra strictness: reduce unrelated results (keyword must match title)
+        if ok and not _ms_keyword_match(row.get('Title') or '', q):
+            ok, reason = False, "לא תואם מילת החיפוש"
         if not ok:
             # bucket reasons (best-effort)
             if "קישור" in reason:
@@ -3129,12 +3176,16 @@ def inline_menu():
         types.InlineKeyboardButton(f"🔁 המרת $→₪: {conv_state}", callback_data="toggle_usd2ils_convert"),
     )
 
-
+    bc_state = "פעיל" if is_broadcast_enabled() else "כבוי"
     kb.add(
-        types.InlineKeyboardButton("⏱️ דקה", callback_data="delay_60"),
-        types.InlineKeyboardButton("⏱️ 20ד", callback_data="delay_1200"),
-        types.InlineKeyboardButton("⏱️ 25ד", callback_data="delay_1500"),
-        types.InlineKeyboardButton("⏱️ 30ד", callback_data="delay_1800"),
+        types.InlineKeyboardButton(f"🎙️ שידור: {bc_state}", callback_data="toggle_broadcast"),
+    )
+
+
+
+    cur_mins = max(1, int(POST_DELAY_SECONDS // 60))
+    kb.add(
+        types.InlineKeyboardButton(f"⏱️ מרווח פרסום: {cur_mins} דק׳ (עריכה)", callback_data="set_delay_minutes"),
     )
 
     kb.add(
@@ -3452,6 +3503,9 @@ def on_inline_click(c):
         return
 
     if data == "publish_now":
+        if not is_broadcast_enabled():
+            bot.answer_callback_query(c.id, "⛔ שידור כבוי. הפעל שידור כדי לפרסם.", show_alert=True)
+            return
         ok = send_next_locked("manual")
         if not ok:
             bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
@@ -3587,6 +3641,37 @@ def on_inline_click(c):
                               reply_markup=inline_menu(), cb_id=c.id)
         except Exception as e:
             bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
+
+
+    elif data == "toggle_broadcast":
+        new_flag = not is_broadcast_enabled()
+        set_broadcast_enabled(new_flag)
+        # wake loops
+        try:
+            DELAY_EVENT.set()
+        except Exception:
+            pass
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="🎛️ עודכן מצב שידור.", reply_markup=inline_menu())
+        bot.answer_callback_query(c.id, "שידור הופעל ✅" if new_flag else "שידור כובה ⛔", show_alert=True)
+        return
+
+    elif data == "set_delay_minutes":
+        uid = c.from_user.id
+        DELAY_SET_WAIT[uid] = True
+        DELAY_SET_CTX[uid] = (chat_id, c.message.message_id)
+        try:
+            prompt = bot.send_message(
+                chat_id,
+                "⏱️ שלח מספר דקות בין פרסום לפרסום (לדוגמה: 20).\n"
+                "טיפ: אם אתה בתוך קבוצה – *תענה/י* להודעה הזאת (Reply) כדי שהבוט יקבל את הטקסט.",
+                parse_mode='Markdown',
+                reply_markup=types.ForceReply(selective=True)
+            )
+            DELAY_SET_PROMPT[uid] = (chat_id, prompt.message_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(c.id)
+        return
 
     elif data == "toggle_auto_mode":
         current = read_auto_flag()
@@ -3841,6 +3926,64 @@ def handle_manual_product_search_text(m):
 
 
 # ========= UPLOAD CSV =========
+
+
+# ========= SET DELAY INPUT (admin text input) =========
+@bot.message_handler(func=lambda m: bool(DELAY_SET_WAIT.get(m.from_user.id, False)) and _is_admin(m), content_types=["text"])
+def handle_set_delay_minutes_text(m):
+    uid = m.from_user.id
+    chat_id = m.chat.id
+    txt = (m.text or "").strip()
+
+    # In groups, prefer reply-to the prompt (privacy mode)
+    try:
+        prompt_ctx = DELAY_SET_PROMPT.get(uid)
+        if prompt_ctx and m.chat.type in ("group", "supergroup"):
+            if not (m.reply_to_message and m.reply_to_message.message_id == prompt_ctx[1]):
+                return
+    except Exception:
+        pass
+
+    # Parse minutes
+    try:
+        minutes = int(float(txt))
+    except Exception:
+        bot.send_message(chat_id, "❗️אנא שלח מספר דקות תקין (למשל 20).")
+        return
+
+    minutes = max(1, min(24*60, minutes))
+    seconds = minutes * 60
+
+    try:
+        global POST_DELAY_SECONDS
+        POST_DELAY_SECONDS = seconds
+        save_delay_seconds(POST_DELAY_SECONDS)
+        try:
+            DELAY_EVENT.set()
+        except Exception:
+            pass
+        bot.send_message(chat_id, f"✅ עודכן מרווח פרסום: {minutes} דקות.")
+    except Exception as e:
+        bot.send_message(chat_id, f"❗️שגיאה בעדכון מרווח: {e}")
+
+    DELAY_SET_WAIT.pop(uid, None)
+
+    # cleanup prompt message (best-effort)
+    try:
+        ctx = DELAY_SET_PROMPT.pop(uid, None)
+        if ctx:
+            _safe_delete(ctx[0], ctx[1])
+    except Exception:
+        pass
+
+    # refresh menu message if we have it
+    try:
+        ctx = DELAY_SET_CTX.pop(uid, None)
+        if ctx and ctx[0] == chat_id:
+            safe_edit_message(bot, chat_id=ctx[0], message_id=ctx[1], new_text="🎛️ תפריט עודכן.", reply_markup=inline_menu())
+    except Exception:
+        pass
+
 @bot.message_handler(commands=['upload_source'])
 def cmd_upload_source(msg):
     if not _is_admin(msg):
@@ -4031,6 +4174,12 @@ def auto_post_loop():
     init_pending()
 
     while True:
+        # Hard stop: if broadcast is OFF, do not publish
+        if not is_broadcast_enabled():
+            DELAY_EVENT.wait(timeout=60)
+            DELAY_EVENT.clear()
+            continue
+
         if read_auto_flag() == "on":
             delay = get_auto_delay()
             if delay is None or is_quiet_now():
@@ -4074,6 +4223,11 @@ def refill_daemon():
     print("[INFO] Refill daemon started", flush=True)
 
     while True:
+        # Hard stop: if broadcast is OFF, do not refill (prevents immediate fetch after deploy)
+        if not is_broadcast_enabled():
+            time.sleep(60)
+            continue
+
         try:
             with FILE_LOCK:
                 qlen = len(read_products(PENDING_CSV))
@@ -4153,6 +4307,8 @@ except Exception:
 
     if not os.path.exists(AUTO_FLAG_FILE):
         write_auto_flag("on")
+    if not os.path.exists(BROADCAST_FLAG_FILE):
+        write_broadcast_flag("off")
 
     t1 = threading.Thread(target=auto_post_loop, daemon=True)
     t1.start()
