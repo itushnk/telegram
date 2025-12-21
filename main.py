@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-20currencyfix")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21refill-diversify-v16")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -1939,11 +1939,27 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
 
 def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_selected_categories: bool = False) -> tuple[int, int, int, int, str | None]:
-    """
+    """מילוי תור מהממשק Affiliate.
+
     מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
+
+    יעדים:
+    - גיוון: איסוף ממספר מילות מפתח בסבב (Round-Robin) כדי לא לקבל "כל הזמן אותו הדבר".
+    - יציבות: TOP לעיתים מחזיר resp_msg='The result is empty' – זה לא שגיאה אלא סוף תוצאות.
+    - סינונים: מכבד MIN_ORDERS / MIN_RATING / FREE_SHIP_ONLY / AE_PRICE_BUCKETS לפני שמכניס לתור.
     """
     if not AE_APP_KEY or not AE_APP_SECRET or not AE_TRACKING_ID:
         return 0, 0, 0, 0, "חסרים AE_APP_KEY/AE_APP_SECRET/AE_TRACKING_ID"
+
+    # snapshot of current filters
+    min_orders = int(MIN_ORDERS or 0)
+    min_rating = float(MIN_RATING or 0.0)
+    free_ship_only = bool(FREE_SHIP_ONLY)
+
+    diversify = str(os.environ.get('AE_REFILL_DIVERSIFY', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '6'), 6)
+    pages_per_kw = max(1, safe_int(os.environ.get('AE_REFILL_PAGES_PER_KEYWORD', '1'), 1))
+    max_per_bucket = max(1, safe_int(os.environ.get('AE_REFILL_MAX_PER_BUCKET', '12'), 12))
 
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
@@ -1953,15 +1969,100 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     dup = 0
     skipped_no_link = 0
     skipped_price = 0
-    last_error = None
+    last_error: str | None = None
     last_page = 0
-    last_resp = None
 
-    
-    # Build active filters snapshot
+    # -------- helpers --------
+    def _parse_env_keywords() -> list[str]:
+        kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS or "") if k.strip()]
+        # Dedup preserve order
+        out = []
+        seen = set()
+        for k in kws:
+            kk = k.lower().strip()
+            if kk in seen:
+                continue
+            seen.add(kk)
+            out.append(k)
+        return out
+
+    def _choose_keywords_for_cycle() -> list[str | None]:
+        # if explicit keywords passed (manual override) – use only it
+        if keywords and str(keywords).strip():
+            return [str(keywords).strip()]
+        kws = _parse_env_keywords()
+        if not kws:
+            return [None]  # will use hotproduct
+        # sample multiple keywords for diversity
+        if kw_per_cycle <= 0:
+            return kws
+        if len(kws) <= kw_per_cycle:
+            return kws
+        try:
+            return random.sample(kws, kw_per_cycle)
+        except Exception:
+            random.shuffle(kws)
+            return kws[:kw_per_cycle]
+
+    def _bucket_key(kw_used: str | None) -> str:
+        if not kw_used:
+            return 'hot'
+        # stable short bucket label
+        s = re.sub(r"\s+", " ", str(kw_used).strip().lower())
+        s = re.sub(r"[^a-z0-9\- _]", "", s)
+        if len(s) > 40:
+            s = s[:40].rstrip()
+        return s or 'kw'
+
+    def _passes_filters(row: dict) -> bool:
+        nonlocal skipped_price
+        if AE_PRICE_BUCKETS:
+            sale_num = _extract_float(row.get("SalePrice") or "")
+            if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
+                skipped_price += 1
+                return False
+        if min_orders:
+            o = safe_int(row.get("Orders") or "0", 0)
+            if o < min_orders:
+                return False
+        if min_rating:
+            r = _extract_float(row.get("Rating") or "")
+            if r is None or float(r) < min_rating:
+                return False
+        if free_ship_only:
+            # in this bot logic: treat "free ship" threshold as min sale price
+            sale_num = _extract_float(row.get("SalePrice") or "")
+            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
+                return False
+        if not row.get("BuyLink"):
+            return False
+        return True
+
+    # -------- categories selected (optional) --------
     selected_cats = [] if ignore_selected_categories else get_selected_category_ids()
-    # Distribute evenly if categories selected
+
+    # candidates: list of tuples(row, bucket)
+    candidates: list[tuple[dict, str]] = []
+    bucket_raw_counts: dict[str, int] = {}
+    bucket_after_filters: dict[str, int] = {}
+
+    def _add_candidate(row: dict, bucket: str):
+        nonlocal dup
+        k = _key_of_row(row)
+        if k in existing_keys:
+            dup += 1
+            return
+        if not _passes_filters(row):
+            return
+        existing_keys.add(k)
+        candidates.append((row, bucket))
+        bucket_after_filters[bucket] = bucket_after_filters.get(bucket, 0) + 1
+
+    # Fetching strategy
+    kw_list = _choose_keywords_for_cycle()
+
     if selected_cats:
+        # distribute max_needed across selected categories, still with keyword variety per category
         n = len(selected_cats)
         base = max_needed // n
         rem = max_needed % n
@@ -1971,232 +2072,190 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
             if need > 0:
                 per_cat.append((cid, need))
 
+        # pages per category is limited
         max_pages_per_cat = max(1, AE_REFILL_MAX_PAGES // max(1, len(per_cat)))
 
         for (cat_id, need_cat) in per_cat:
             got_cat = 0
-            last_page = 0
-            for page_no in range(1, max_pages_per_cat + 1):
-                last_page = page_no
-                try:
-                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id, keywords=keywords)
-                    last_resp = (resp_code, resp_msg, len(products))
-                    # Some TOP responses use resp_msg='The result is empty' with non-200 resp_code; treat as no-more-results
-                    if resp_msg and 'result is empty' in str(resp_msg).lower():
-                        resp_code = 200
-                except Exception as e:
-                    last_error = f"category_id={cat_id} page={page_no} error={type(e).__name__}: {e}"
+            for kw_used in kw_list:
+                if got_cat >= need_cat or len(candidates) >= (max_needed * 5):
                     break
+                for page_no in range(1, max_pages_per_cat + 1):
+                    last_page = page_no
+                    try:
+                        products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=str(cat_id), keywords=kw_used)
+                        # treat empty as end-of-results
+                        if resp_msg and 'result is empty' in str(resp_msg).lower():
+                            products = []
+                            resp_code = 200
+                    except Exception as e:
+                        last_error = f"category_id={cat_id} kw={kw_used} page={page_no} error={type(e).__name__}: {e}"
+                        break
 
-                if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
-                    last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
-                    break
+                    if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
+                        last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
+                        break
+                    if not products:
+                        break
 
-                if not products:
-                    break
+                    try:
+                        random.shuffle(products)
+                    except Exception:
+                        pass
 
-                    new_rows = []
+                    b = _bucket_key(kw_used) + f"|cat:{cat_id}"
+                    bucket_raw_counts[b] = bucket_raw_counts.get(b, 0) + len(products)
                     for p in products:
                         row = _map_affiliate_product_to_row(p)
-
-                        # Filters
-                        if AE_PRICE_BUCKETS:
-                            sale_num = _extract_float(row.get("SalePrice") or "")
-                            if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
-                                skipped_price += 1
-                                continue
-
-                        if MIN_ORDERS:
-                            o = safe_int(row.get("Orders") or "0", 0)
-                            if o < int(MIN_ORDERS):
-                                continue
-
-                        if MIN_RATING:
-                            r = _extract_float(row.get("Rating") or "")
-                            if r is None or float(r) < float(MIN_RATING):
-                                continue
-
-                        if FREE_SHIP_ONLY:
-                            sale_num = _extract_float(row.get("SalePrice") or "")
-                            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-                                continue
-
-                        if not row.get("BuyLink"):
-                            skipped_no_link += 1
+                        if not row.get('BuyLink'):
                             continue
-
-                        k = _key_of_row(row)
-                        if k in existing_keys:
-                            dup += 1
+                        if not row.get('BuyLink'):
                             continue
-                        existing_keys.add(k)
-                        new_rows.append(row)
+                        _add_candidate(row, b)
                         got_cat += 1
                         if got_cat >= need_cat:
                             break
-
-                    # AI enrichment (optional)
-                    if ai_auto_mode() and GPT_ON_REFILL and new_rows:
-                        try:
-                            upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
-                            if err:
-                                logging.warning(f"[AI] enrich warning: {err}")
-                            elif upd:
-                                logging.info(f"[AI] enriched {upd} items on refill")
-                        except Exception as _e:
-                            logging.warning(f"[AI] enrich failed: {_e}")
-                    if new_rows:
-                        with FILE_LOCK:
-                            pending_rows = read_products(PENDING_CSV)
-                            pending_rows.extend(new_rows)
-                            write_products(PENDING_CSV, pending_rows)
-                        added += len(new_rows)
-
-                    if got_cat >= need_cat or added >= max_needed:
+                    if got_cat >= need_cat:
                         break
 
-
-            if added >= max_needed:
-                break
+            if got_cat >= need_cat:
+                continue
 
     else:
-        # No categories selected:
-        # - If admin provided keywords: use affiliate.product.query with those keywords.
-        # - Otherwise: use HotProduct feed (most stable) + optional AE_KEYWORDS fallback.
-        for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
-            last_page = page_no
-            try:
-                if keywords:
-                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None, keywords=keywords)
-                else:
-                    if AE_KEYWORDS:
-                        # Prefer product.query with (random/rr) keywords for variety
-                        products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
+        # no categories selected
+        # strategy:
+        # - if we have kw_list with real keywords => query product.query per keyword (pages_per_kw)
+        # - else => use hotproduct
+        for kw_used in kw_list:
+            if len(candidates) >= (max_needed * 5):
+                break
+            for page_no in range(1, pages_per_kw + 1):
+                last_page = page_no
+                try:
+                    if kw_used:
+                        products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None, keywords=kw_used)
                     else:
                         products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
-                last_resp = (resp_code, resp_msg, len(products))
 
-                # Some TOP responses use resp_msg='The result is empty' with non-200 resp_code; treat as no-more-results
-                if resp_msg and 'result is empty' in str(resp_msg).lower():
-                    resp_code = 200
-
+                    if resp_msg and 'result is empty' in str(resp_msg).lower():
+                        products = []
+                        resp_code = 200
+                except Exception as e:
+                    last_error = f"kw={kw_used} page={page_no} error={type(e).__name__}: {e}"
+                    continue
 
                 if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
                     last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
-                    break
+                    continue
 
                 if not products:
                     break
 
-                # Shuffle to avoid always same ordering (TOP sort can be deterministic)
                 try:
                     random.shuffle(products)
                 except Exception:
                     pass
 
-                new_rows = []
+                b = _bucket_key(kw_used)
+                bucket_raw_counts[b] = bucket_raw_counts.get(b, 0) + len(products)
+
                 for p in products:
                     row = _map_affiliate_product_to_row(p)
-
-                    if AE_PRICE_BUCKETS:
-                        sale_num = _extract_float(row.get("SalePrice") or "")
-                        if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
-                            skipped_price += 1
-                            continue
-
-                    if MIN_ORDERS:
-                        o = safe_int(row.get("Orders") or "0", 0)
-                        if o < int(MIN_ORDERS):
-                            continue
-
-                    if MIN_RATING:
-                        r = _extract_float(row.get("Rating") or "")
-                        if r is None or float(r) < float(MIN_RATING):
-                            continue
-
-                    if FREE_SHIP_ONLY:
-                        sale_num = _extract_float(row.get("SalePrice") or "")
-                        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-                            continue
-
                     if not row.get("BuyLink"):
                         skipped_no_link += 1
                         continue
+                    _add_candidate(row, b)
 
-                    k = _key_of_row(row)
-                    if k in existing_keys:
-                        dup += 1
-                        continue
-                    existing_keys.add(k)
-                    new_rows.append(row)
+    # -------- Diversified selection into queue --------
+    # group by bucket
+    by_bucket: dict[str, list[dict]] = {}
+    for row, b in candidates:
+        by_bucket.setdefault(b, []).append(row)
 
-                # AI enrichment (optional)
-                if ai_auto_mode() and GPT_ON_REFILL and new_rows:
-                    try:
-                        upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
-                        if err:
-                            logging.warning(f"[AI] enrich warning: {err}")
-                        elif upd:
-                            logging.info(f"[AI] enriched {upd} items on refill")
-                    except Exception as _e:
-                        logging.warning(f"[AI] enrich failed: {_e}")
-                if new_rows:
-                    with FILE_LOCK:
-                        pending_rows = read_products(PENDING_CSV)
-                        pending_rows.extend(new_rows)
-                        write_products(PENDING_CSV, pending_rows)
-                    added += len(new_rows)
+    for b in by_bucket:
+        try:
+            random.shuffle(by_bucket[b])
+        except Exception:
+            pass
 
-                if added >= max_needed:
+    selected: list[dict] = []
+    selected_counts: dict[str, int] = {b: 0 for b in by_bucket}
+
+    buckets = list(by_bucket.keys())
+    try:
+        random.shuffle(buckets)
+    except Exception:
+        pass
+
+    # If not diversifying, just flatten randomly
+    if not diversify:
+        flat = []
+        for b in buckets:
+            flat.extend(by_bucket[b])
+        try:
+            random.shuffle(flat)
+        except Exception:
+            pass
+        selected = flat[:max_needed]
+    else:
+        # round-robin across buckets
+        progress = True
+        while len(selected) < max_needed and progress:
+            progress = False
+            for b in list(buckets):
+                if len(selected) >= max_needed:
                     break
+                if selected_counts.get(b, 0) >= max_per_bucket:
+                    continue
+                lst = by_bucket.get(b) or []
+                if not lst:
+                    continue
+                row = lst.pop(0)
+                selected.append(row)
+                selected_counts[b] = selected_counts.get(b, 0) + 1
+                progress = True
 
-            except Exception as e:
-                last_error = str(e)
-                break
+    # logs for debugging diversity
+    try:
+        top_buckets = sorted(selected_counts.items(), key=lambda x: x[1], reverse=True)
+        logging.info(f"[REFILL] kw_cycle={kw_list} raw_by_bucket={bucket_raw_counts} after_filters={bucket_after_filters} selected={dict(top_buckets)}")
+    except Exception:
+        pass
+
+    # AI enrichment (optional) before writing
+    if ai_auto_mode() and GPT_ON_REFILL and selected:
+        try:
+            upd, err = ai_enrich_rows(selected, reason="refill_from_affiliate")
+            if err:
+                logging.warning(f"[AI] enrich warning: {err}")
+            elif upd:
+                logging.info(f"[AI] enriched {upd} items on refill")
+        except Exception as _e:
+            logging.warning(f"[AI] enrich failed: {_e}")
+
+    if selected:
+        with FILE_LOCK:
+            pending_rows = read_products(PENDING_CSV)
+            pending_rows.extend(selected)
+            write_products(PENDING_CSV, pending_rows)
+        added = len(selected)
 
     with FILE_LOCK:
         total_after = len(read_products(PENDING_CSV))
 
-    if added == 0 and last_error is None:
-        if skipped_no_link > 0:
-            last_error = (
-                "⚠️ התקבלו מוצרים אבל כולם בלי promotion_link. "
-                "בדרך כלל זה אומר ש-AE_TRACKING_ID לא תקין/לא משויך לחשבון האפילייט שלך. "
-                f"(skipped_no_link={skipped_no_link}, last_resp={last_resp})"
-            )
-        elif last_resp is not None:
-            rc, rm, n = last_resp
-            last_error = f"0 מוצרים (resp_code={rc}, resp_msg={rm}, ship_to={AE_SHIP_TO_COUNTRY}, sort={AE_REFILL_SORT})"
-    # Treat 'The result is empty' as a normal end-of-pages signal (not an error)
-    try:
-        if last_error and 'result is empty' in str(last_error).lower():
-            last_error = None if added > 0 else 'אין תוצאות שמתאימות לסינונים שנבחרו. נסה להוריד מינ׳ הזמנות/דירוג או לבטל משלוח חינם.'
-    except Exception:
-        pass
+    # If we found nothing, provide a helpful message
+    if added == 0 and not last_error:
+        # usually because filters are too strict
+        msg = []
+        if min_orders:
+            msg.append(f"מינימום הזמנות={min_orders}")
+        if min_rating:
+            msg.append(f"מינימום דירוג={min_rating}")
+        if free_ship_only:
+            msg.append("משלוח חינם=פעיל")
+        last_error = "לא נמצאו תוצאות שמתאימות לסינונים" + (" (" + ", ".join(msg) + ")" if msg else "")
 
-    # update last stats snapshot
-    try:
-        LAST_REFILL_STATS.update({
-            'added': added,
-            'dup': dup,
-            'skipped_no_link': skipped_no_link,
-            'price_filtered': skipped_price,
-            'last_error': last_error,
-            'last_page': last_page,
-        })
-    except Exception:
-        pass
     return added, dup, total_after, last_page, last_error
-
-# ========= INLINE MENU =========
-PRICE_BUCKET_PRESETS = [
-    ("1-5", "1-5"),
-    ("5-10", "5-10"),
-    ("10-20", "10-20"),
-    ("20-50", "20-50"),
-    ("50+", "50+"),
-]
-
 def _active_price_bucket_ids():
     raw = (AE_PRICE_BUCKETS_RAW or "").strip()
     if not raw:
