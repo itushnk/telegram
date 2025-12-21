@@ -285,6 +285,29 @@ AE_PRICE_INT_IS_CENTS = (os.environ.get("AE_PRICE_INT_IS_CENTS", "1") or "1").st
 AE_PRICE_PICK_MODE = (os.environ.get("AE_PRICE_PICK_MODE", "min") or "min").strip().lower()
 
 AE_KEYWORDS = (os.environ.get("AE_KEYWORDS", "") or "").strip()
+
+def _parse_keywords_list(raw: str) -> list[str]:
+    parts = [p.strip() for p in re.split(r"[\n,|]+", raw or "") if p.strip()]
+    seen=set()
+    out=[]
+    for p in parts:
+        k=p.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+    return out
+
+def _choose_refill_keywords() -> list[str]:
+    kws = _parse_keywords_list(AE_KEYWORDS)
+    if not kws:
+        return []
+    if not AE_REFILL_RANDOMIZE:
+        return kws
+    kws2 = list(kws)
+    random.shuffle(kws2)
+    k = min(len(kws2), max(1, AE_REFILL_KEYWORDS_PER_CYCLE))
+    return kws2[:k]
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
 # ========= CONFIG (AliExpress Affiliate / TOP) =========
@@ -298,8 +321,7 @@ _default_candidates = [
     "https://api-sg.aliexpress.com/sync",       # Newer AliExpress gateway (/sync)
     "https://api.taobao.com/router/rest",        # Overseas (US)
     "https://gw.api.taobao.com/router/rest",     # Legacy gateway
-    "https://eco.taobao.com/router/rest",        # Alt/legacy
-    # "https://de-api.aliexpress.com/router/rest", # EU gateway (often returns isv.appkey-not-exists)
+        # "https://de-api.aliexpress.com/router/rest", # EU gateway (often returns isv.appkey-not-exists)
 ]
 
 AE_TOP_URL_CANDIDATES = []
@@ -467,6 +489,14 @@ AE_REFILL_MIN_QUEUE = int(os.environ.get("AE_REFILL_MIN_QUEUE", "30") or "30")
 AE_REFILL_MAX_PAGES = int(os.environ.get("AE_REFILL_MAX_PAGES", "3") or "3")
 AE_REFILL_PAGE_SIZE = int(os.environ.get("AE_REFILL_PAGE_SIZE", "50") or "50")
 AE_REFILL_SORT = (os.environ.get("AE_REFILL_SORT", "LAST_VOLUME_DESC") or "LAST_VOLUME_DESC").strip().upper()
+# Randomized refill across keywords (helps avoid always pulling the same top items)
+AE_REFILL_RANDOMIZE = (os.environ.get("AE_REFILL_RANDOMIZE", "1") or "1").strip().lower() in ("1","true","yes","on")
+AE_REFILL_KEYWORDS_PER_CYCLE = int(os.environ.get("AE_REFILL_KEYWORDS_PER_CYCLE", "6") or "6")
+AE_REFILL_RANDOM_PAGE_MAX = int(os.environ.get("AE_REFILL_RANDOM_PAGE_MAX", "3") or "3")  # sample pages 1..N
+AE_REFILL_SORT_POOL = (os.environ.get("AE_REFILL_SORT_POOL", "") or "").strip()
+# If set to 0, refill applies MIN_ORDERS/MIN_RATING/FREE_SHIP_ONLY. Default: 1 (refill is for variety)
+AE_REFILL_IGNORE_GLOBAL_FILTERS = (os.environ.get("AE_REFILL_IGNORE_GLOBAL_FILTERS", "1") or "1").strip().lower() in ("1","true","yes","on")
+
 
 # Optional price filtering (ILS buckets) for refill results.
 # Example: AE_PRICE_BUCKETS=1-5,5-10,10-20,20-50,50+
@@ -1828,19 +1858,27 @@ def affiliate_hotproduct_query(page_no: int, page_size: int) -> tuple[list[dict]
     return products, resp_code, resp_msg
 
 
-def affiliate_product_query(page_no: int, page_size: int, category_id: str | None = None, keywords: str | None = None) -> tuple[list[dict], int | None, str | None]:
+
+def affiliate_product_query(
+    page_no: int,
+    page_size: int,
+    category_id: str | None = None,
+    keywords: str | None = None,
+    sort: str | None = None,
+) -> tuple[list[dict], int | None, str | None]:
     """Affiliate product query with optional category filter.
 
     Notes:
     - If `keywords` is provided, it is sent as-is to TOP.
-    - Otherwise, if AE_KEYWORDS exists, it rotates keywords to avoid repetitive results.
+    - Otherwise, if AE_KEYWORDS exists, it can randomize keywords (AE_REFILL_RANDOMIZE) to avoid repetitive results.
+    - `sort` overrides AE_REFILL_SORT for this call.
     """
-    fields = "product_id,product_title,product_main_image_url,promotion_link,promotion_url,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
+    fields = "product_id,product_title,product_main_image_url,product_small_image_urls,app_sale_price,original_price,sale_price,app_sale_price,original_price,discount,evaluate_rate,lastest_volume,product_video_url,product_detail_url"
     biz = {
         "tracking_id": AE_TRACKING_ID,
         "page_no": str(page_no),
         "page_size": str(page_size),
-        "sort": AE_REFILL_SORT,
+        "sort": (sort or AE_REFILL_SORT),
         "ship_to_country": AE_SHIP_TO_COUNTRY,
         "target_currency": AE_TARGET_CURRENCY,
         "target_language": AE_TARGET_LANGUAGE,
@@ -1851,27 +1889,27 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         biz["category_ids"] = str(category_id).strip()
 
     # Manual keywords override (e.g., admin "manual search")
-    if keywords:
+    if keywords is not None and str(keywords).strip():
         biz["keywords"] = str(keywords).strip()
-    # Otherwise rotate env keywords (if provided)
+    # Otherwise use env keywords (if provided)
     elif AE_KEYWORDS:
-        kws = [k.strip() for k in re.split(r"[\n,|]+", AE_KEYWORDS) if k.strip()]
+        kws = _parse_keywords_list(AE_KEYWORDS)
         if kws:
-            biz["keywords"] = kws[(page_no - 1) % len(kws)]
+            if AE_REFILL_RANDOMIZE:
+                biz["keywords"] = random.choice(kws)
+            else:
+                biz["keywords"] = kws[(page_no - 1) % len(kws)]
+
     payload = _top_call("aliexpress.affiliate.product.query", biz)
     resp = _extract_resp_result(payload)
     resp_code = resp.get("resp_code")
     resp_msg = resp.get("resp_msg")
 
     result = resp.get("result") or {}
-    products = result.get("products") or result.get("product_list") or []
-    if isinstance(products, dict) and "product" in products:
-        products = products.get("product") or []
-    if products is None:
-        products = []
-    if not isinstance(products, list):
+    products = (result.get("products") or {}).get("product") or []
+    if isinstance(products, dict):
         products = [products]
-    return products, resp_code, resp_msg
+    return list(products), (int(resp_code) if str(resp_code).isdigit() else None), (str(resp_msg) if resp_msg else None)
 
 
 def affiliate_product_detail_get(product_ids: str, fields: str | None = None) -> tuple[list[dict], int | None, str | None]:
@@ -2004,29 +2042,19 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
 
 
-def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_selected_categories: bool = False) -> tuple[int, int, int, int, str | None]:
+
+def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_selected_categories: bool = False) -> tuple[int, int, int, str | None]:
     """
-    מחזיר: (added, duplicates, total_after, last_page_checked, last_error)
+    מחזיר: (added, duplicates, total_queue, info_or_error)
+    - ממלא תור מפריטי AliExpress Affiliate API.
+    - מנסה לגוון אוטומטית (רנדומלי בין נושאים) כדי לא לקבל תמיד את אותם מוצרים.
     """
-    if not AE_APP_KEY or not AE_APP_SECRET or not AE_TRACKING_ID:
-        return 0, 0, 0, 0, "חסרים AE_APP_KEY/AE_APP_SECRET/AE_TRACKING_ID"
+    if max_needed <= 0:
+        return (0, 0, len(queue_items), None)
 
-    with FILE_LOCK:
-        pending_rows = read_products(PENDING_CSV)
-        existing_keys = {_key_of_row(r) for r in pending_rows}
-
-    added = 0
-    dup = 0
-    skipped_no_link = 0
-    skipped_price = 0
-    last_error = None
-    last_page = 0
-    last_resp = None
-
-    
-    # Build active filters snapshot
     selected_cats = [] if ignore_selected_categories else get_selected_category_ids()
-    # Distribute evenly if categories selected
+    # distribute need across categories; if none -> single bucket
+    per_cat: list[tuple[str | None, int]] = [(None, max_needed)]
     if selected_cats:
         n = len(selected_cats)
         base = max_needed // n
@@ -2036,142 +2064,94 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
             need = base + (1 if i < rem else 0)
             if need > 0:
                 per_cat.append((cid, need))
+        if not per_cat:
+            per_cat = [(None, max_needed)]
 
-        max_pages_per_cat = max(1, AE_REFILL_MAX_PAGES // max(1, len(per_cat)))
+    max_pages_per_cat = max(1, AE_REFILL_MAX_PAGES // max(1, len(per_cat)))
+    # Randomized keywords for this refill cycle
+    cycle_kws = _choose_refill_keywords()
+    if not cycle_kws and keywords:
+        cycle_kws = [keywords]
 
-        for (cat_id, need_cat) in per_cat:
-            got_cat = 0
-            last_page = 0
-            for page_no in range(1, max_pages_per_cat + 1):
-                last_page = page_no
-                try:
-                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=cat_id, keywords=keywords)
-                    last_resp = (resp_code, resp_msg, len(products))
+    sort_pool = [s.strip().upper() for s in re.split(r"[\n,|]+", AE_REFILL_SORT_POOL or "") if s.strip()]
+    added = 0
+    duplicates = 0
+    skipped_no_link = 0
+    skipped_price = 0
+    last_error: str | None = None
+    last_resp: tuple[int | None, str | None, int, str | None, str | None, int | None] | None = None  # (code,msg,raw,kw,sort,page)
 
-                    if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
-                        last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
-                        break
+    # We accumulate new rows and shuffle before enqueue to improve variety
+    collected_rows: list[dict] = []
 
-                    if not products:
-                        break
+    for (cat_id, need_cat) in per_cat:
+        if added >= max_needed:
+            break
 
-                    new_rows = []
-                    for p in products:
-                        row = _map_affiliate_product_to_row(p)
-        
-                        # Filters
-                        if AE_PRICE_BUCKETS:
-                            sale_num = _extract_float(row.get("SalePrice") or "")
-                            if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
-                                skipped_price += 1
-                                continue
-
-                        if MIN_ORDERS:
-                            o = safe_int(row.get("Orders") or "0", 0)
-                            if o < int(MIN_ORDERS):
-                                continue
-
-                        if MIN_RATING:
-                            r = _extract_float(row.get("Rating") or "")
-                            if r is None or float(r) < float(MIN_RATING):
-                                continue
-
-                        if FREE_SHIP_ONLY:
-                            sale_num = _extract_float(row.get("SalePrice") or "")
-                            if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-                                continue
-
-                        if not row.get("BuyLink"):
-                            skipped_no_link += 1
-                            continue
-
-                        k = _key_of_row(row)
-                        if k in existing_keys:
-                            dup += 1
-                            continue
-                        existing_keys.add(k)
-                        new_rows.append(row)
-                        got_cat += 1
-                        if got_cat >= need_cat:
-                            break
-
-                    # AI enrichment (optional)
-                    if ai_auto_mode() and GPT_ON_REFILL and new_rows:
-                        try:
-                            upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
-                            if err:
-                                logging.warning(f"[AI] enrich warning: {err}")
-                            elif upd:
-                                logging.info(f"[AI] enriched {upd} items on refill")
-                        except Exception as _e:
-                            logging.warning(f"[AI] enrich failed: {_e}")
-                    if new_rows:
-                        with FILE_LOCK:
-                            pending_rows = read_products(PENDING_CSV)
-                            pending_rows.extend(new_rows)
-                            write_products(PENDING_CSV, pending_rows)
-                        added += len(new_rows)
-
-                    if got_cat >= need_cat or added >= max_needed:
-                        break
-
-                except Exception as e:
-                    last_error = str(e)
-                    break
-
+        # try a few pages; when randomize enabled, we randomly sample within a small range
+        for _ in range(1, max_pages_per_cat + 1):
             if added >= max_needed:
                 break
 
-    else:
-        # No categories selected:
-        # - If admin provided keywords: use affiliate.product.query with those keywords.
-        # - Otherwise: use HotProduct feed (most stable) + optional AE_KEYWORDS fallback.
-        for page_no in range(1, AE_REFILL_MAX_PAGES + 1):
-            last_page = page_no
-            try:
-                if keywords:
-                    products, resp_code, resp_msg = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None, keywords=keywords)
-                else:
-                    products, resp_code, resp_msg = affiliate_hotproduct_query(page_no, AE_REFILL_PAGE_SIZE)
-                    # Fallback: some accounts/params return empty from hotproduct query.
-                    # If AE_KEYWORDS exists, try affiliate.product.query with rotating keywords.
-                    if (not products) and AE_KEYWORDS:
-                        try:
-                            products2, rc2, rm2 = affiliate_product_query(page_no, AE_REFILL_PAGE_SIZE, category_id=None)
-                            if products2:
-                                products, resp_code, resp_msg = products2, rc2, rm2
-                        except Exception:
-                            pass
-                last_resp = (resp_code, resp_msg, len(products))
+            page_no = _ if not AE_REFILL_RANDOMIZE else random.randint(1, max(1, AE_REFILL_RANDOM_PAGE_MAX))
+            eff_sort = AE_REFILL_SORT
+            if sort_pool:
+                eff_sort = random.choice(sort_pool)
 
+            # If we have explicit cycle keywords – fetch per keyword; otherwise let API choose/rotate
+            kw_list = cycle_kws if cycle_kws else [None]
+            for kw_one in kw_list:
+                if added >= max_needed:
+                    break
+
+                kw_str = (kw_one or "").strip() if kw_one is not None else None
+                products: list[dict] = []
+                resp_code: int | None = None
+                resp_msg: str | None = None
+                try:
+                    products, resp_code, resp_msg = affiliate_product_query(
+                        page_no,
+                        AE_REFILL_PAGE_SIZE,
+                        category_id=cat_id,
+                        keywords=kw_str,
+                        sort=eff_sort,
+                    )
+                    last_resp = (resp_code, resp_msg, len(products), kw_str, eff_sort, page_no)
+                except Exception as e:
+                    last_error = f"{type(e).__name__}: {e}"
+                    continue
+
+                # stop conditions
                 if resp_code is not None and str(resp_code).isdigit() and int(resp_code) != 200:
                     last_error = f"resp_code={resp_code} resp_msg={resp_msg}"
                     break
-
                 if not products:
-                    break
+                    continue
 
-                new_rows = []
                 for p in products:
+                    if added >= max_needed:
+                        break
                     row = _map_affiliate_product_to_row(p)
 
+                    # Filters (price buckets always apply)
                     if AE_PRICE_BUCKETS:
                         sale_num = _extract_float(row.get("SalePrice") or "")
                         if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
                             skipped_price += 1
                             continue
 
-                    if MIN_ORDERS:
+                    # Global filters (optionally ignored for refill variety)
+                    if (not AE_REFILL_IGNORE_GLOBAL_FILTERS) and MIN_ORDERS:
                         o = safe_int(row.get("Orders") or "0", 0)
                         if o < int(MIN_ORDERS):
                             continue
 
-                    if MIN_RATING:
+                    if (not AE_REFILL_IGNORE_GLOBAL_FILTERS) and MIN_RATING:
                         r = _extract_float(row.get("Rating") or "")
                         if r is None or float(r) < float(MIN_RATING):
                             continue
 
-                    if FREE_SHIP_ONLY:
+                    if (not AE_REFILL_IGNORE_GLOBAL_FILTERS) and FREE_SHIP_ONLY:
                         sale_num = _extract_float(row.get("SalePrice") or "")
                         if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
                             continue
@@ -2180,72 +2160,38 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
                         skipped_no_link += 1
                         continue
 
-                    k = _key_of_row(row)
-                    if k in existing_keys:
-                        dup += 1
+                    # Dedup on ProductId
+                    pid = str(row.get("ProductId") or "").strip()
+                    if not pid:
                         continue
-                    existing_keys.add(k)
-                    new_rows.append(row)
+                    if is_duplicate_product(pid):
+                        duplicates += 1
+                        continue
 
-                # AI enrichment (optional)
-                if ai_auto_mode() and GPT_ON_REFILL and new_rows:
-                    try:
-                        upd, err = ai_enrich_rows(new_rows, reason="refill_from_affiliate")
-                        if err:
-                            logging.warning(f"[AI] enrich warning: {err}")
-                        elif upd:
-                            logging.info(f"[AI] enriched {upd} items on refill")
-                    except Exception as _e:
-                        logging.warning(f"[AI] enrich failed: {_e}")
-                if new_rows:
-                    with FILE_LOCK:
-                        pending_rows = read_products(PENDING_CSV)
-                        pending_rows.extend(new_rows)
-                        write_products(PENDING_CSV, pending_rows)
-                    added += len(new_rows)
+                    remember_product(pid)
+                    collected_rows.append(row)
+                    added += 1
+                    if added >= max_needed:
+                        break
 
-                if added >= max_needed:
-                    break
+    # Shuffle before enqueue for more variety (and to avoid always same first item)
+    if collected_rows and AE_REFILL_RANDOMIZE:
+        random.shuffle(collected_rows)
 
-            except Exception as e:
-                last_error = str(e)
-                break
+    with queue_lock:
+        for row in collected_rows:
+            queue_items.append(row)
+        _save_queue()
 
-    with FILE_LOCK:
-        total_after = len(read_products(PENDING_CSV))
+    info = None
+    if last_error:
+        info = last_error
+    elif last_resp:
+        code0, msg0, raw0, kw0, sort0, pg0 = last_resp
+        info = f"resp_code={code0} raw={raw0} kw={kw0} sort={sort0} page={pg0} skip_nolink={skipped_no_link} skip_price={skipped_price}"
 
-    if added == 0 and last_error is None:
-        if skipped_no_link > 0:
-            last_error = (
-                "⚠️ התקבלו מוצרים אבל כולם בלי promotion_link. "
-                "בדרך כלל זה אומר ש-AE_TRACKING_ID לא תקין/לא משויך לחשבון האפילייט שלך. "
-                f"(skipped_no_link={skipped_no_link}, last_resp={last_resp})"
-            )
-        elif last_resp is not None:
-            rc, rm, n = last_resp
-            last_error = f"0 מוצרים (resp_code={rc}, resp_msg={rm}, ship_to={AE_SHIP_TO_COUNTRY}, sort={AE_REFILL_SORT})"
-    # update last stats snapshot
-    try:
-        LAST_REFILL_STATS.update({
-            'added': added,
-            'dup': dup,
-            'skipped_no_link': skipped_no_link,
-            'price_filtered': skipped_price,
-            'last_error': last_error,
-            'last_page': last_page,
-        })
-    except Exception:
-        pass
-    return added, dup, total_after, last_page, last_error
+    return (added, duplicates, len(queue_items), info)
 
-# ========= INLINE MENU =========
-PRICE_BUCKET_PRESETS = [
-    ("1-5", "1-5"),
-    ("5-10", "5-10"),
-    ("10-20", "10-20"),
-    ("20-50", "20-50"),
-    ("50+", "50+"),
-]
 
 def _active_price_bucket_ids():
     raw = (AE_PRICE_BUCKETS_RAW or "").strip()
@@ -2531,6 +2477,37 @@ _HE_WORD_MAP = {
     "מצלמה": "camera",
 }
 
+def _ms_extract_device_model(q: str) -> str:
+    """Extract device/model tokens from Hebrew/English query to improve precision in manual search."""
+    t = (q or "").strip()
+    if not t:
+        return ""
+    t_low = t.lower()
+
+    # Apple Watch
+    if ("אפל" in t and "ווטש" in t) or ("apple watch" in t_low):
+        return "Apple Watch"
+
+    # iPhone
+    m1 = re.search(r"(?:אייפון|iphone)\s*(\d{1,2})", t_low)
+    if m1:
+        return f"iPhone {m1.group(1)}"
+
+    # Samsung Galaxy
+    if ("גלקסי" in t) or ("galaxy" in t_low) or ("סמסונג" in t):
+        # A series (A55 etc)
+        mA = re.search(r"\b(a)\s*([0-9]{2})\b", t_low)
+        if mA:
+            return f"Samsung Galaxy A{mA.group(2)}"
+        mS = re.search(r"(?:גלקסי|galaxy)\s*(?:s\s*)?(\d{1,2})", t_low)
+        if mS:
+            return f"Samsung Galaxy S{mS.group(1)}"
+        mS2 = re.search(r"\b(s)\s*(\d{1,2})\b", t_low)
+        if mS2:
+            return f"Samsung Galaxy S{mS2.group(2)}"
+
+    return ""
+
 _MS_TRANSLATE_CACHE: dict[str, str] = {}
 
 def _ms_ai_translate_keywords(q: str) -> str:
@@ -2597,7 +2574,8 @@ def _ms_normalize_keywords(q: str) -> str:
         # phrase map (most specific first)
         for he, en in _HE_PHRASE_MAP:
             if he and he in q:
-                return en
+                model = _ms_extract_device_model(q)
+                return (en + (' ' + model if model else '')).strip()
 
         def _he_stem(w: str) -> str:
             w = (w or "").strip()
@@ -2644,16 +2622,40 @@ def _ms_normalize_keywords(q: str) -> str:
             toks2.append(t)
 
         if toks2:
-            return " ".join(toks2[:5])
+            model = _ms_extract_device_model(q)
+            base = " ".join(toks2[:5])
+            return (base + (" " + model if model else "")).strip()
 
         return _ms_ai_translate_keywords(q)
 
     return q
 
+
 def _ms_build_query_variants(kw: str) -> list[str]:
     kw = (kw or "").strip().lower()
     if not kw:
         return []
+
+    # If the normalized keyword contains a device model, try structured variants first
+    m_iph = re.search(r"iphone\s*(\d{1,2})", kw)
+    m_gal_s = re.search(r"galaxy\s*s\s*(\d{1,2})", kw)
+    m_gal_a = re.search(r"galaxy\s*a\s*(\d{2})", kw)
+    model = None
+    if m_iph:
+        model = f"iphone {m_iph.group(1)}"
+    elif m_gal_s:
+        model = f"galaxy s{m_gal_s.group(1)}"
+    elif m_gal_a:
+        model = f"galaxy a{m_gal_a.group(1)}"
+
+    if model:
+        if "screen protector" in kw:
+            return [f"{model} screen protector", f"screen protector for {model}", kw]
+        if "case" in kw or "cover" in kw:
+            return [f"{model} case", f"case for {model}", kw]
+        if "watch band" in kw or "watch strap" in kw:
+            return [f"{model} band", f"band for {model}", kw]
+        return [kw, f"{model} accessories", model]
 
     # Specializations (ordered)
     if "dog leash" in kw or ("dog" in kw and "leash" in kw):
@@ -2679,6 +2681,7 @@ def _ms_build_query_variants(kw: str) -> list[str]:
         return ["tools", "hand tools", "power tools", "workshop tools"]
 
     return [kw]
+
 
 def _ms_build_token_set(kw: str) -> set[str]:
     low = (kw or "").lower().strip()
