@@ -38,7 +38,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v33")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v34")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -3188,12 +3188,17 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
 
     # Map and evaluate
     results = []
+    passed_filters_rows = []  # rows that pass all numeric/link filters (before keyword match)
+    keyword_rejected_rows = []  # rows that pass filters but fail strict keyword match
     raw_count = 0
     reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "commission": 0, "free_ship": 0, "other": 0}
     for p in (products or []):
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
         ok, reason = _ms_eval_row_filters(row)
+        if ok:
+            if len(passed_filters_rows) < 50:
+                passed_filters_rows.append(row)
         # Extra strictness: reduce unrelated results (keyword must match title)
         sess = MANUAL_SEARCH_SESS.get(uid) or {}
         q_user = str(sess.get("q_user") or q)
@@ -3201,6 +3206,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         q_variants = [q_user] + ([q_api] if q_api and q_api != q_user else [])
         if ok and not _ms_keyword_match(row.get("Title") or "", q_variants, strict=not relaxed_match):
             ok, reason = False, "לא תואם מילת החיפוש"
+            if len(keyword_rejected_rows) < 50:
+                keyword_rejected_rows.append(row)
         if not ok:
             # bucket reasons (best-effort)
             if "קישור" in reason:
@@ -3225,6 +3232,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         "per_page": per_page,
         "idx": 0,
         "results": results,
+        "passed_filters_rows": passed_filters_rows,
+        "keyword_rejected_rows": keyword_rejected_rows,
         "raw_count": raw_count,
         "resp_code": resp_code,
         "resp_msg": resp_msg,
@@ -3293,6 +3302,16 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
             f"סינונים פעילים: {html.escape(flt)}\n\n"
         )
         if raw_count > 0:
+            auto_relax = env_bool("MS_AUTO_RELAX_ON_EMPTY", True)
+            if auto_relax and not sess.get("relaxed_match", False) and sess.get("keyword_rejected_rows"):
+                # Auto-fallback: if strict keyword match filtered everything, show the best candidates anyway.
+                new_results = []
+                for row2 in (sess.get("keyword_rejected_rows") or [])[:10]:
+                    new_results.append({"ok": True, "reason": "הצגה מורחבת: לא תואם מילת החיפוש", "row": row2})
+                sess["results"] = new_results
+                sess["relaxed_match"] = True
+                MANUAL_SEARCH_SESS[uid] = sess
+                return _ms_caption(uid)
             info += (
                 f"מצאתי {raw_count} תוצאות גולמיות אבל אף אחת לא עברה את הסינונים.\n"
                 f"נפסלו: ללא קישור={reasons.get('no_link',0)} | מחיר={reasons.get('price',0)} | הזמנות={reasons.get('orders',0)} | דירוג={reasons.get('rating',0)} | עמלה={reasons.get('commission',0)} | משלוח={reasons.get('free_ship',0)}\n\n"
@@ -3416,7 +3435,9 @@ def _ms_start(uid: int, chat_id: int, q: str):
     # Cache translated query for strict matching (Hebrew input vs English titles)
     try:
         ms_translate = env_bool("MS_TRANSLATE_QUERY", True)
-        q_api = _translate_query_for_search(q) if ms_translate else q
+        # Translate Hebrew queries to English for better AE matching (even if MS_TRANSLATE_QUERY is off).
+        force_translate = any('\u0590' <= ch <= '\u05FF' for ch in (q or ''))
+        q_api = _translate_query_for_search(q) if (ms_translate or force_translate) else q
     except Exception:
         q_api = q
     sess = MANUAL_SEARCH_SESS.get(uid, {})
