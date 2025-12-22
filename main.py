@@ -5444,9 +5444,26 @@ t1.start()
 t2 = threading.Thread(target=refill_daemon, daemon=True)
 t2.start()
 
+
+def _wait_for_telegram_ready(max_sleep: int = 60):
+    """Block until Telegram API responds to getMe, to avoid noisy crashes on boot/network hiccups."""
+    delay = 2
+    while True:
+        try:
+            bot.get_me()
+            return
+        except Exception as e:
+            try:
+                log_error(f"Telegram getMe failed: {e}. Retrying in {delay}s...")
+            except Exception:
+                print(f"[ERROR] Telegram getMe failed: {e}. Retrying in {delay}s...", flush=True)
+            time.sleep(delay)
+            delay = min(max_sleep, delay * 2)
+
 # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
 while True:
     try:
+        _wait_for_telegram_ready()
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
