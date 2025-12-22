@@ -3078,6 +3078,81 @@ def _ms_keyword_match(title: str, q: str, strict: bool = True) -> bool:
     except Exception:
         return True
 
+def _ms_build_terms(q_user: str, q_api: str | None = None) -> list[str]:
+    """Build match terms for strict relevance checking.
+
+    We match against (lowercased) product titles (often EN), so we include:
+    - user query tokens (HE) + light synonyms
+    - translated query tokens (EN) if available
+    """
+    def norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        # keep hebrew + latin letters/digits/spaces
+        s = re.sub(r"[^0-9a-z\u0590-\u05FF\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    qh = norm(q_user)
+    qe = norm(q_api or "")
+    terms: list[str] = []
+
+    def add_terms_from_q(q: str):
+        if not q:
+            return
+        # tokenization
+        toks = [t for t in q.split() if len(t) >= 2]
+        if not toks:
+            toks = [q]
+        for tok in toks:
+            terms.append(tok)
+            # naive singular for EN plurals
+            if tok.endswith("s") and len(tok) > 3:
+                terms.append(tok[:-1])
+
+    add_terms_from_q(qh)
+    add_terms_from_q(qe)
+
+    # light Hebrew synonym expansion for common ecommerce intents
+    # (kept small + safe to avoid over-broad matches)
+    if "נעל" in qh or "נעליים" in qh:
+        terms += ["נעל", "נעליים", "נעלי", "סניקר", "סניקרס", "סניקרס", "נעלי ספורט",
+                  "shoe", "shoes", "sneaker", "sneakers", "running shoes", "boots", "sandals"]
+    if "שעון" in qh:
+        terms += ["שעון", "שעונים", "watch", "watches", "smartwatch", "smart watch"]
+    if "טלפון" in qh or "סמארטפון" in qh:
+        terms += ["טלפון", "סמארטפון", "phone", "smartphone", "mobile"]
+
+    # de-dup while preserving order
+    out=[]
+    seen=set()
+    for t in terms:
+        t=norm(t)
+        if not t:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _ms_keyword_match_terms(title: str, terms: list[str], strict: bool = True) -> bool:
+    """Match title against terms.
+
+    - strict=True: require at least ONE meaningful term hit (keeps results relevant, but not too strict).
+    - strict=False: always allow (used for fallback).
+    """
+    try:
+        t = (title or "").lower()
+        if not strict:
+            return True
+        if not t or not terms:
+            return True
+        # any hit
+        return any(term and term in t for term in terms)
+    except Exception:
+        return True
+
 def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
     """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
     # Price buckets
@@ -3126,7 +3201,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         row = _map_affiliate_product_to_row(p)
         ok, reason = _ms_eval_row_filters(row)
         # Extra strictness: reduce unrelated results (keyword must match title)
-        if ok and not _ms_keyword_match(row.get("Title") or "", q, strict=not relaxed_match):
+        terms = sess.get("q_terms") or _ms_build_terms(sess.get("q_user", q), q)
+        if ok and not _ms_keyword_match_terms(row.get("Title") or "", terms, strict=not relaxed_match):
             ok, reason = False, "לא תואם מילת החיפוש"
         if not ok:
             # bucket reasons (best-effort)
@@ -3165,7 +3241,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         ok_count = sum(1 for it in results if it.get("ok"))
     except Exception:
         ok_count = 0
-    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match} price_in={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} rate={USD_TO_ILS_RATE} display={_display_currency_code()}")
+    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match} price_in={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} rate={USD_TO_ILS_RATE} display={PRICE_DISPLAY_CURRENCY}")
     MANUAL_SEARCH_SESS[uid] = sess
     return sess
 
@@ -3334,14 +3410,32 @@ def _ms_add_rows_to_queue(rows: list[dict]) -> tuple[int, int, int]:
     return added, dups, total
 
 def _ms_start(uid: int, chat_id: int, q: str):
-    q = (q or "").strip()
-    if not q:
+    q_user = (q or "").strip()
+    if not q_user:
         bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש.")
         return
-    # reset session and fetch first page
+
     _ms_clear(uid)
-    bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} (שולח ל-AliExpress בדיוק כפי שהזנת)")
-    _ms_fetch_page(uid, q=q, page=1, per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10), use_selected_categories=False)
+
+    # Translate (once) so AliExpress receives an English query; keep original for UI + strict match terms
+    q_api = q_user
+    if GPT_TRANSLATE_SEARCH:
+        try:
+            q_api = _translate_query_for_search(q_user)
+        except Exception:
+            q_api = q_user
+
+    sess = MANUAL_SEARCH_SESS.setdefault(uid, {})
+    sess["q_user"] = q_user
+    sess["q_api"] = q_api
+    sess["q_terms"] = _ms_build_terms(q_user, q_api)
+
+    if q_api and q_api != q_user:
+        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q_user}\n🔎 נשלח ל-AliExpress בתרגום: {q_api}")
+    else:
+        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q_user}")
+
+    _ms_fetch_page(uid, q=q_api, page=1, per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10), use_selected_categories=False)
     _ms_show(uid, chat_id)
 
 # Keywords used to shrink the category list in "top" mode (Hebrew+English)
@@ -5283,8 +5377,13 @@ except Exception:
 
     if not os.path.exists(AUTO_FLAG_FILE):
         write_auto_flag("on")
-    if not os.path.exists(BROADCAST_FLAG_FILE):
-        write_broadcast_flag("off")
+    
+# Broadcast default: OFF on every boot (unless you explicitly override).
+BROADCAST_FORCE_OFF_ON_BOOT = env_bool("BROADCAST_FORCE_OFF_ON_BOOT", True)
+if BROADCAST_FORCE_OFF_ON_BOOT:
+    write_broadcast_flag("off")
+elif not os.path.exists(BROADCAST_FLAG_FILE):
+    write_broadcast_flag("off")
 
     t1 = threading.Thread(target=auto_post_loop, daemon=True)
     t1.start()
