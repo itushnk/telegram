@@ -3165,7 +3165,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         ok_count = sum(1 for it in results if it.get("ok"))
     except Exception:
         ok_count = 0
-    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match} price_in={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} rate={USD_TO_ILS_RATE} display={PRICE_DISPLAY_CURRENCY}")
+    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match} price_in={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} rate={USD_TO_ILS_RATE} display={_display_currency_code()}")
     MANUAL_SEARCH_SESS[uid] = sess
     return sess
 
