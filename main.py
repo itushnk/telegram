@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v28")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v29")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -802,18 +802,44 @@ def usd_to_ils(price_text: str, rate: float) -> str:
 
 
 
+def _normalize_price_text(price_text: str) -> str:
+    """Normalize raw price text to a displayable numeric string (no currency sign).
+
+    - Keeps only the numeric value (supports strings like 'US $1.43', '1.43', '1.43 - 2.10').
+    - Applies AE_PRICE_INT_IS_CENTS if configured.
+    - Uses PRICE_DECIMALS for formatting.
+    """
+    if price_text is None:
+        return ""
+    raw = str(price_text)
+    raw_clean = clean_price_text(raw)
+    num = _extract_float(raw_clean)
+    if num is None:
+        return ""
+    # Normalize integer-cents when configured
+    if AE_PRICE_INT_IS_CENTS and raw_clean and raw_clean.isdigit():
+        try:
+            ival = int(raw_clean)
+            if ival >= 1000 and ival <= 10000000:
+                num = ival / 100.0
+        except Exception:
+            pass
+    return _format_money(float(num), PRICE_DECIMALS)
+
+
 def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str:
-    if AE_FORCE_USD_ONLY:
-        return _normalize_price_text(price_text)
     """Normalize incoming price text to what we display in the post.
 
     Rules:
+    - If AE_FORCE_USD_ONLY is ON → never convert; always return normalized USD numeric text.
     - If AE_PRICE_INPUT_CURRENCY=ILS → treat input as ILS and NEVER convert.
     - If input is USD:
         - If AE_PRICE_CONVERT_USD_TO_ILS is ON → convert USD→ILS using usd_to_ils_rate.
-        - If OFF → keep USD as-is (no conversion).
-    - Cents-as-integer normalization (AE_PRICE_INT_IS_CENTS) is applied in both modes.
+        - If OFF → keep USD numeric text (no conversion).
+    - Cents-as-integer normalization (AE_PRICE_INT_IS_CENTS) is applied in all modes.
     """
+    if AE_FORCE_USD_ONLY:
+        return _normalize_price_text(price_text)
     if price_text is None:
         return ""
     raw = str(price_text)
