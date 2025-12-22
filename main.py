@@ -5845,7 +5845,7 @@ def on_text_input(m):
         PROD_SEARCH_WAIT.pop(uid, None)
         query = text
         try:
-            _run_product_search_flow(m.chat.id, query, strict=True, origin="item")
+            _ms_start(uid=uid, chat_id=m.chat.id, q=query)
         except Exception as e:
             bot.reply_to(m, f"שגיאה בחיפוש: {e}")
         return
