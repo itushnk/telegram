@@ -277,6 +277,10 @@ USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.
 
 USD_TO_ILS_RATE = _get_state_float("usd_to_ils_rate", USD_TO_ILS_RATE_DEFAULT)
 
+# Max allowed ratio original/sale to show 'original price' (prevents insane crossed prices)
+ORIG_MAX_RATIO_DEFAULT = float(os.environ.get("ORIG_MAX_RATIO", "3.5") or "3.5")
+ORIG_MAX_RATIO = _get_state_float("orig_max_ratio", ORIG_MAX_RATIO_DEFAULT)
+
 def set_usd_to_ils_rate(v: float):
     global USD_TO_ILS_RATE
     try:
@@ -1461,15 +1465,33 @@ def format_post(product):
     row_cur = str(product.get("DisplayCurrency") or "").strip().upper()
     cur_code = row_cur if row_cur in ("USD", "ILS") else _display_currency_code()
 
+    def _orig_ok(sp_str: str, op_str: str) -> bool:
+        try:
+            spv = float(_extract_float(clean_price_text(sp_str)) or 0.0)
+            opv = float(_extract_float(clean_price_text(op_str)) or 0.0)
+        except Exception:
+            return False
+        if spv <= 0 or opv <= 0:
+            return False
+        if opv < spv * 1.01:
+            return False
+        try:
+            max_ratio = float(ORIG_MAX_RATIO or 3.5)
+        except Exception:
+            max_ratio = 3.5
+        if (opv / spv) > max_ratio:
+            return False
+        return True
+
     if cur_code == "ILS":
         sp = str(product.get("SalePriceILS") or sale_price or "").strip()
         op = str(product.get("OriginalPriceILS") or original_price or "").strip()
-        price_line = f'💰 {price_label}: {sp} ש"ח (מחיר מקורי: {op} ש"ח)'
+        price_line = f'💰 {price_label}: {sp} ש"ח' + (f' (מחיר מקורי: {op} ש"ח)' if _orig_ok(sp, op) else "")
         ship_line = '🚚 משלוח חינם מעל 38 ש"ח או 7.49 ש"ח'
     else:
         sp = str(product.get("SalePriceUSD") or sale_price or "").strip()
         op = str(product.get("OriginalPriceUSD") or original_price or "").strip()
-        price_line = f'💰 {price_label}: ${sp} (מחיר מקורי: ${op})'
+        price_line = f'💰 {price_label}: ${sp}' + (f' (מחיר מקורי: ${op})' if _orig_ok(sp, op) else "")
         ship_line = '🚚 משלוח/מחירון לפי תנאי המוכר'
     lines += [
         price_line,
@@ -2232,18 +2254,25 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         ]
 
     def _orig_field_order() -> list[str]:
+        # IMPORTANT: AliExpress sometimes exposes different "original" fields.
+        # We prefer "app_original" / "target_app_original" if present, and we later apply sanity checks.
         if AE_PRICE_INPUT_CURRENCY == "ILS":
             return [
+                "target_app_original_price",
                 "target_original_price",
-                "original_price",
-                # fallbacks
                 "target_app_price",
                 "target_price",
+                # fallbacks (may be USD or generic)
+                "app_original_price",
+                "original_price",
                 "app_price",
                 "price",
             ]
+        # USD mode
         return [
+            "app_original_price",
             "original_price",
+            "target_app_original_price",
             "target_original_price",
             "app_price",
             "price",
@@ -2281,26 +2310,72 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
 
         return best_key, best_raw, best_txt, best_is_from
 
-    def _first_orig_candidate():
-        best_key = ""
-        best_raw = ""
-        best_txt = ""
-        best_is_from = False
+    def _best_orig_candidate(sale_txt: str):
+        """Pick the most reasonable original price.
+
+        We choose the closest original >= sale, and hide original if it is wildly inflated
+        (prevents 500%+ mismatches that confuse users).
+        """
+        try:
+            sale_num = float(_extract_float(clean_price_text(sale_txt)) or 0.0)
+        except Exception:
+            sale_num = 0.0
+
+        candidates = []
         for k in _orig_field_order():
             rawv = p.get(k)
             if rawv in (None, ""):
                 continue
             txt, is_from = _pick_value(rawv)
-            if txt:
-                best_key = k
-                best_raw = str(rawv)
-                best_txt = txt
-                best_is_from = is_from
-                break
-        return best_key, best_raw, best_txt, best_is_from
+            if not txt:
+                continue
+            num = _extract_float(clean_price_text(txt))
+            if num is None:
+                continue
+            try:
+                numf = float(num)
+            except Exception:
+                continue
+            if numf <= 0:
+                continue
+            candidates.append((k, str(rawv), txt, is_from, numf))
+
+        if not candidates:
+            return "", "", "", False
+
+        # If sale is unknown, keep first candidate by priority order.
+        if sale_num <= 0:
+            k, raw, txt, is_from, _ = candidates[0]
+            return k, raw, txt, is_from
+
+        sane = []
+        for k, raw, txt, is_from, numf in candidates:
+            if numf < sale_num * 1.001:
+                continue
+            ratio = numf / sale_num if sale_num else 0.0
+            if ratio <= float(ORIG_MAX_RATIO or 3.5):
+                sane.append((numf, k, raw, txt, is_from))
+
+        if sane:
+            sane.sort(key=lambda t: t[0])  # closest above sale
+            _, k, raw, txt, is_from = sane[0]
+            return k, raw, txt, is_from
+
+        # Fallback: if the closest above-sale is still insane, hide original.
+        above = [(numf, k, raw, txt, is_from) for k, raw, txt, is_from, numf in candidates if numf >= sale_num]
+        if above:
+            above.sort(key=lambda t: t[0])
+            numf, k, raw, txt, is_from = above[0]
+            if (numf / sale_num) > float(ORIG_MAX_RATIO or 3.5):
+                return "", "", "", False
+            return k, raw, txt, is_from
+
+        # Otherwise, return first candidate.
+        k, raw, txt, is_from, _ = candidates[0]
+        return k, raw, txt, is_from
 
     sale_key, sale_raw, sale_text, sale_is_from = _best_sale_candidate()
-    orig_key, orig_raw, orig_text, orig_is_from = _first_orig_candidate()
+    orig_key, orig_raw, orig_text, orig_is_from = _best_orig_candidate(sale_text)
 
     sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE)
     orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE)
@@ -3103,7 +3178,7 @@ def _ms_active_filters_text() -> str:
         except Exception:
             parts.append(f"💰 מינ' עמלה: {MIN_COMMISSION}%")
     if FREE_SHIP_ONLY:
-        parts.append("🚚 משלוח חינם (לא מסונן בחיפוש ידני)")
+        parts.append(f"🚚 משלוח חינם (>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g})")
     cats = get_selected_category_ids()
     if cats:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
@@ -3121,33 +3196,6 @@ def _translate_query_for_search(q: str) -> str:
     if not q:
         return q
     if (not GPT_ENABLED) or (not GPT_TRANSLATE_SEARCH) or (not OPENAI_API_KEY):
-        # Fallback without OpenAI: quick Hebrew→English shopping keywords mapping (improves strict title matching)
-        if _contains_hebrew(q):
-            qh = re.sub(r"\s+", " ", q).strip()
-            qn = qh.replace("־", " ").replace("-", " ")
-            qn = re.sub(r"\s+", " ", qn)
-            mapping = [
-                ("נעלי ריצה", "running shoes"),
-                ("נעלי ספורט", "sneakers"),
-                ("סניקרס", "sneakers"),
-                ("נעליים", "shoes"),
-                ("נעל", "shoes"),
-                ("שעון חכם", "smartwatch"),
-                ("שעון", "watch"),
-                ("אוזניות", "earbuds"),
-                ("כיסוי", "case"),
-                ("מגן", "case"),
-                ("מטען", "charger"),
-                ("כבל", "cable"),
-                ("תיק גב", "backpack"),
-                ("תיק", "bag"),
-                ("שמלה", "dress"),
-                ("חולצה", "shirt"),
-                ("מכנס", "pants"),
-            ]
-            for he, en in mapping:
-                if he in qn:
-                    return en
         return q
     if not _contains_hebrew(q):
         return q
@@ -3425,10 +3473,9 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         raw_count = int(sess.get("raw_count") or 0)
         flt = _ms_active_filters_text()
         info = (
-            f"🔎 חיפוש: <b>{html.escape(q)}</b>\\n"
-            + (f"🛰️ נשלח ל-AliExpress: <b>{html.escape(str(sess.get('q_api') or q))}</b>\\n" if str(sess.get('q_api') or q) != q else "")
-            + f"דף: {page}\\n"
-            + f"סינונים פעילים: {html.escape(flt)}\\n\\n"
+            f"🔎 חיפוש: <b>{html.escape(q)}</b>\n"
+            f"דף: {page}\n"
+            f"סינונים פעילים: {html.escape(flt)}\n\n"
         )
         if raw_count > 0:
             auto_relax = env_bool("MS_AUTO_RELAX_ON_EMPTY", True)
@@ -3464,6 +3511,18 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
 
     sale = str(row.get("SalePrice") or "").strip()
     orig = str(row.get("OriginalPrice") or "").strip()
+
+    # Show original price only when it is sane vs sale
+    show_orig = False
+    if sale and orig:
+        try:
+            spv = float(_extract_float(clean_price_text(sale)) or 0.0)
+            opv = float(_extract_float(clean_price_text(orig)) or 0.0)
+            max_ratio = float(ORIG_MAX_RATIO or 3.5)
+            show_orig = (spv > 0 and opv > spv * 1.01 and (opv / spv) <= max_ratio)
+        except Exception:
+            show_orig = False
+
     rating = str(row.get("Rating") or "").strip()
     orders = str(row.get("Orders") or "").strip()
     comm = str(row.get("CommissionRate") or "").strip()
@@ -3483,16 +3542,8 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         else:
             comm_line = f"\n💸 עמלה: {comm_pct:g}%"
     link = str(row.get("BuyLink") or "").strip()
+    link_line = (f"{link_line}" if link else "🔗 (אין קישור)\n")
     img = str(row.get("ImageURL") or "").strip() or None
-
-    show_full_link = env_bool("MS_SHOW_FULL_LINK", False)
-    if link:
-        if show_full_link:
-            link_line = f"🔗 {html.escape(link)}"
-        else:
-            link_line = f'🔗 <a href="{html.escape(link)}">לפתיחת המוצר</a>'
-    else:
-        link_line = "🔗 (אין קישור)"
 
     status_line = "✅ עומד בסינונים" if ok else f"🚫 נפסל: {html.escape(reason)}"
     flt = _ms_active_filters_text()
@@ -3501,18 +3552,56 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
     if ok_count == 0 and sess.get("strict_match") and not sess.get("relaxed_match"):
         hint = "⚠️ אין התאמות מדויקות לפי הכותרת. לחץ על 🔎 הרחב התאמה כדי להרחיב.\n"
 
+    # Stats & diagnostics for better feedback
+    raw_count = int(sess.get("raw_count") or 0)
+    ok_count = int(sess.get("ok_count") or 0)
+    q_api = str(sess.get("q_api") or q).strip()
+    reasons = sess.get("reasons") or {}
+
+    def _ms_fmt_reasons(r: dict) -> str:
+        labels = {
+            "no_link": "ללא קישור",
+            "price": "מחיר",
+            "orders": "הזמנות",
+            "rating": "דירוג",
+            "commission": "עמלה",
+            "free_ship": "משלוח חינם",
+            "keyword": "התאמה",
+            "other": "אחר",
+        }
+        parts = []
+        for k, label in labels.items():
+            try:
+                n = int(r.get(k) or 0)
+            except Exception:
+                n = 0
+            if n:
+                parts.append(f"{label}: {n}")
+        return " | ".join(parts)
+
+    sent_line = f"🛰️ נשלח: <b>{html.escape(q_api)}</b>\n" if (q_api and q_api != q) else ""
+    stats_line = ""
+    if raw_count:
+        rejected = max(raw_count - ok_count, 0)
+        why = _ms_fmt_reasons(reasons)
+        stats_line = f"📦 התקבלו: {raw_count} | עברו סינון: {ok_count}\n"
+        if rejected and why:
+            stats_line += f"🧹 נפסלו: {rejected} ({why})\n"
+
+
     caption = (
-        f"🔎 חיפוש: <b>{html.escape(q)}</b>\\n"
-        + (f"🛰️ נשלח ל-AliExpress: <b>{html.escape(str(sess.get('q_api') or q))}</b>\\n" if str(sess.get('q_api') or q) != q else "")
-        + f"תוצאה {idx+1}/{len(results)} | דף {page}\\n"
-        + f"סינונים פעילים: {html.escape(flt)}\\n"
-        + f"{hint}"
-        + f"{status_line}\\n\\n"
-        + f"<b>{html.escape(title)}</b>\\n"
-        + f"💰 {html.escape(sale)} (מקורי {html.escape(orig)})\\n"
-        + f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}"
-        + f"{html.escape(comm_line)}\\n"
-        + f"{link_line}"
+        f"🔎 חיפוש: <b>{html.escape(q)}</b>\n"
+        f"{sent_line}"
+        f"{stats_line}"
+        f"תוצאה {idx+1}/{len(results)} | דף {page}\n"
+        f"סינונים פעילים: {html.escape(flt)}\n"
+        f"{hint}"
+        f"{status_line}\n\n"
+        f"<b>{html.escape(title)}</b>\n"
+        f"💰 {html.escape(sale)}" + (f" (מקורי {html.escape(orig)})" if show_orig else "") + "\n"
+        f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}"
+        f"{html.escape(comm_line)}\n"
+        f"🔗 {html.escape(link)}"
     )
     return caption, img
 
@@ -4192,6 +4281,35 @@ def _prod_search_menu_kb():
 
 
 @bot.callback_query_handler(func=lambda c: True)
+
+def _rate_panel_text() -> str:
+    # Shows current USD→ILS rate and quick controls.
+    try:
+        cur = float(USD_TO_ILS_RATE)
+    except Exception:
+        cur = 0.0
+    return (
+        "💱 <b>שער המרה (USD→ILS)</b>\n\n"
+        f"השער הנוכחי: <b>{cur:.2f}</b>\n\n"
+        "בחר פעולה:"
+    )
+
+
+def _rate_panel_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        InlineKeyboardButton("➖0.05", callback_data="rate_dec_005"),
+        InlineKeyboardButton("➖0.01", callback_data="rate_dec_001"),
+        InlineKeyboardButton("✍️ הקלדה", callback_data="rate_manual"),
+    )
+    kb.add(
+        InlineKeyboardButton("➕0.01", callback_data="rate_inc_001"),
+        InlineKeyboardButton("➕0.05", callback_data="rate_inc_005"),
+        InlineKeyboardButton("🔁 איפוס 3.70", callback_data="rate_reset_370"),
+    )
+    kb.add(InlineKeyboardButton("↩️ חזרה", callback_data="rate_back"))
+    return kb
+
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
 
@@ -4341,12 +4459,68 @@ def on_inline_click(c):
 
 
     if data == "ps_set_rate":
-        uid = c.from_user.id
-        RATE_SET_WAIT[uid] = True
-        RATE_SET_CTX[uid] = (chat_id, msg_id)
-        prompt = bot.send_message(chat_id, "הזן שער USD→ILS (למשל 3.70):")
-        RATE_SET_PROMPT[uid] = (chat_id, prompt.message_id)
+        # Show rate control panel (buttons)
         bot.answer_callback_query(c.id)
+        safe_edit_message(
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id,
+            text=_rate_panel_text(),
+            reply_markup=_rate_panel_kb(),
+            parse_mode="HTML",
+            cb_id=c.id,
+        )
+        return
+
+    if data in ("rate_dec_005", "rate_dec_001", "rate_inc_001", "rate_inc_005", "rate_reset_370"):
+        bot.answer_callback_query(c.id)
+        try:
+            cur = float(USD_TO_ILS_RATE)
+        except Exception:
+            cur = float(USD_TO_ILS_RATE_DEFAULT)
+
+        if data == "rate_reset_370":
+            new_rate = 3.70
+        else:
+            delta_map = {
+                "rate_dec_005": -0.05,
+                "rate_dec_001": -0.01,
+                "rate_inc_001": 0.01,
+                "rate_inc_005": 0.05,
+            }
+            new_rate = cur + float(delta_map.get(data, 0.0))
+
+        # Clamp + round
+        new_rate = max(0.1, round(new_rate, 2))
+        set_usd_to_ils_rate(new_rate)
+
+        safe_edit_message(
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id,
+            text=_rate_panel_text(),
+            reply_markup=_rate_panel_kb(),
+            parse_mode="HTML",
+            cb_id=c.id,
+        )
+        return
+
+    if data == "rate_manual":
+        bot.answer_callback_query(c.id)
+        uid = c.from_user.id
+        _set_state_str("awaiting", "RATE_SET_WAIT")
+        txt = "🔢 שלח מספר (למשל 3.70) כדי לקבוע שער USD→ILS:"
+        bot.send_message(c.message.chat.id, txt)
+        return
+
+    if data == "rate_back":
+        bot.answer_callback_query(c.id)
+        safe_edit_message(
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id,
+            text=_prod_search_menu_text(),
+            reply_markup=_prod_search_menu_kb(),
+            parse_mode="HTML",
+            cb_id=c.id,
+        )
         return
 
     if data == "ps_item":
