@@ -885,6 +885,70 @@ def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str
         pass
     return _format_money(float(num), PRICE_DECIMALS)
 
+# === PRICE: convert USD→ILS only after AI ===
+# Enable with ENV: CONVERT_TO_ILS_AFTER_AI=1
+# This helps avoid double-conversion / wrong-currency bugs by keeping ingestion in USD.
+
+def maybe_convert_prices_after_ai(row: dict, reason: str = "") -> bool:
+    # Convert stored USD prices to ILS after AI (in-place).
+    try:
+        if not env_bool("CONVERT_TO_ILS_AFTER_AI", False):
+            return False
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("PriceConverted") or "").strip() == "1":
+            return False
+
+        # Convert only once we have AI content (or explicit AIState)
+        st = str(row.get("AIState") or "").strip().lower()
+        has_ai = bool(
+            str(row.get("Opening") or "").strip() and
+            str(row.get("Title") or "").strip() and
+            str(row.get("Strengths") or "").strip()
+        )
+        if not has_ai and st not in ("done", "approved"):
+            return False
+
+        sale_usd = str(row.get("SalePriceUSD") or row.get("SalePrice") or "").strip()
+        orig_usd = str(row.get("OriginalPriceUSD") or row.get("OriginalPrice") or "").strip()
+        if not sale_usd and not orig_usd:
+            return False
+
+        # Preserve raw USD
+        if sale_usd and not row.get("SalePriceUSD"):
+            row["SalePriceUSD"] = sale_usd
+        if orig_usd and not row.get("OriginalPriceUSD"):
+            row["OriginalPriceUSD"] = orig_usd
+
+        rate = float(USD_TO_ILS_RATE or 3.7)
+
+        def conv(x: str) -> str:
+            v = _extract_float(clean_price_text(str(x) or ""))
+            if v is None:
+                return ""
+            return _format_money(float(v) * rate, PRICE_DECIMALS)
+
+        sale_ils = conv(sale_usd)
+        orig_ils = conv(orig_usd)
+
+        if sale_ils:
+            row["SalePriceILS"] = sale_ils
+            row["SalePrice"] = sale_ils
+        if orig_ils:
+            row["OriginalPriceILS"] = orig_ils
+            row["OriginalPrice"] = orig_ils
+
+        row["DisplayCurrency"] = "ILS"
+        row["PriceConverted"] = "1"
+        return bool(sale_ils or orig_ils)
+    except Exception as e:
+        try:
+            logging.warning(f"[PRICE] convert after AI failed: {e} reason={reason}")
+        except Exception:
+            pass
+        return False
+
+
 
 def _parse_price_buckets(raw: str):
     """Parse price bucket filters like: '1-5,5-10,10-20,20-50,50+'.
@@ -1144,6 +1208,8 @@ def ai_enrich_rows(rows: list[dict], reason: str = "") -> tuple[int, str | None]
                 r["Title"] = title
                 r["Strengths"] = "\n".join([str(s).strip() for s in strengths])
                 updated += 1
+                r["AIState"] = "done"
+                maybe_convert_prices_after_ai(r, reason=f"ai_enrich:{reason}")
 
         except Exception as e:
             last_err = str(e)
@@ -1388,13 +1454,22 @@ def format_post(product):
             if part:
                 lines.append(part)
         lines.append("")
+
     price_label = "מחיר החל מ" if (product.get("PriceIsFrom") or "").strip() else "מחיר מבצע"
-    cur_code = _display_currency_code()
+
+    # Per-row currency override (useful when we fetch USD but convert only after AI)
+    row_cur = str(product.get("DisplayCurrency") or "").strip().upper()
+    cur_code = row_cur if row_cur in ("USD", "ILS") else _display_currency_code()
+
     if cur_code == "ILS":
-        price_line = f'💰 {price_label}: {sale_price} ש"ח (מחיר מקורי: {original_price} ש"ח)'
+        sp = str(product.get("SalePriceILS") or sale_price or "").strip()
+        op = str(product.get("OriginalPriceILS") or original_price or "").strip()
+        price_line = f'💰 {price_label}: {sp} ש"ח (מחיר מקורי: {op} ש"ח)'
         ship_line = '🚚 משלוח חינם מעל 38 ש"ח או 7.49 ש"ח'
     else:
-        price_line = f'💰 {price_label}: ${sale_price} (מחיר מקורי: ${original_price})'
+        sp = str(product.get("SalePriceUSD") or sale_price or "").strip()
+        op = str(product.get("OriginalPriceUSD") or original_price or "").strip()
+        price_line = f'💰 {price_label}: ${sp} (מחיר מקורי: ${op})'
         ship_line = '🚚 משלוח/מחירון לפי תנאי המוכר'
     lines += [
         price_line,
@@ -3177,13 +3252,24 @@ def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
     return True, ""
 
 def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False, relaxed_match: bool = False) -> dict:
-    """Fetch one page from AliExpress Affiliate API and prepare preview session."""
+    """Fetch one page from AliExpress Affiliate API and prepare preview session.
+
+    Notes:
+    - `q` here is the string we actually send to AliExpress (q_api).
+    - We keep `q_user` (what the admin typed) for display + strict matching.
+    """
+    prev = MANUAL_SEARCH_SESS.get(uid) or {}
+    q_user = str(prev.get("q_user") or prev.get("q") or q or "").strip()
+    q_api = str(prev.get("q_api") or q or "").strip()
+    q_variants = [q_user] + ([q_api] if q_api and q_api != q_user else [])
+
     # IMPORTANT: For manual search we default to ALL categories (category_id=None),
     # so the keyword is the primary selector.
     cat_id = None
     if use_selected_categories:
         cats = get_selected_category_ids()
         cat_id = cats[0] if cats else None  # keep it simple: first selected
+
     products, resp_code, resp_msg = affiliate_product_query(page, per_page, category_id=cat_id, keywords=q)
 
     # Map and evaluate
@@ -3192,22 +3278,20 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     keyword_rejected_rows = []  # rows that pass filters but fail strict keyword match
     raw_count = 0
     reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "commission": 0, "free_ship": 0, "other": 0}
+
     for p in (products or []):
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
         ok, reason = _ms_eval_row_filters(row)
-        if ok:
-            if len(passed_filters_rows) < 50:
-                passed_filters_rows.append(row)
+        if ok and len(passed_filters_rows) < 50:
+            passed_filters_rows.append(row)
+
         # Extra strictness: reduce unrelated results (keyword must match title)
-        sess = MANUAL_SEARCH_SESS.get(uid) or {}
-        q_user = str(sess.get("q_user") or q)
-        q_api = str(sess.get("q_api") or q)
-        q_variants = [q_user] + ([q_api] if q_api and q_api != q_user else [])
         if ok and not _ms_keyword_match(row.get("Title") or "", q_variants, strict=not relaxed_match):
             ok, reason = False, "לא תואם מילת החיפוש"
             if len(keyword_rejected_rows) < 50:
                 keyword_rejected_rows.append(row)
+
         if not ok:
             # bucket reasons (best-effort)
             if "קישור" in reason:
@@ -3224,10 +3308,16 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["free_ship"] += 1
             else:
                 reasons["other"] += 1
+
         results.append({"row": row, "ok": ok, "reason": reason})
 
     sess = {
-        "q": q,
+        # what we show to the admin
+        "q": q_user,
+        "q_user": q_user,
+        # what we sent to AliExpress
+        "q_api": q_api,
+        "q_sent": q,
         "page": page,
         "per_page": per_page,
         "idx": 0,
@@ -3242,14 +3332,25 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         "strict_match": bool(not relaxed_match),
         "relaxed_match": bool(relaxed_match),
     }
+
     # Debug log (helps diagnose empty results / filters)
     try:
         ok_count = sum(1 for it in results if it.get("ok"))
     except Exception:
         ok_count = 0
-    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match} price_in={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} rate={USD_TO_ILS_RATE} display={PRICE_DISPLAY_CURRENCY}")
+
+    _logger.info(
+        f"[MS] q_user='{q_user}' q_sent='{q}' page={page} raw={raw_count} ok={ok_count} "
+        f"resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} "
+        f"min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} "
+        f"free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match} "
+        f"price_in={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} rate={USD_TO_ILS_RATE} "
+        f"display={_display_currency_code()}"
+    )
+
     MANUAL_SEARCH_SESS[uid] = sess
     return sess
+
 
 def _ms_kb(uid: int) -> 'types.InlineKeyboardMarkup':
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -3425,29 +3526,44 @@ def _ms_add_rows_to_queue(rows: list[dict]) -> tuple[int, int, int]:
         total = len(pending)
     return added, dups, total
 
+
 def _ms_start(uid: int, chat_id: int, q: str):
     q = (q or "").strip()
     if not q:
         bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש.")
         return
-    # reset session and fetch first page
+
+    # Reset session and fetch first page
     _ms_clear(uid)
-    # Cache translated query for strict matching (Hebrew input vs English titles)
+
+    # Translate Hebrew queries (optional) so the API has a better chance to match titles
     try:
         ms_translate = env_bool("MS_TRANSLATE_QUERY", True)
-        # Translate Hebrew queries to English for better AE matching (even if MS_TRANSLATE_QUERY is off).
-        force_translate = any('\u0590' <= ch <= '\u05FF' for ch in (q or ''))
+        force_translate = any('֐' <= ch <= '׿' for ch in (q or ''))
         q_api = _translate_query_for_search(q) if (ms_translate or force_translate) else q
     except Exception:
         q_api = q
-    sess = MANUAL_SEARCH_SESS.get(uid, {})
+
+    sess = MANUAL_SEARCH_SESS.get(uid) or {}
+    sess["q"] = q
     sess["q_user"] = q
     sess["q_api"] = q_api
     MANUAL_SEARCH_SESS[uid] = sess
 
-    bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} (שולח ל-AliExpress בדיוק כפי שהזנת)")
-    _ms_fetch_page(uid, q=q, page=1, per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10), use_selected_categories=False)
-    _ms_show(uid, chat_id)
+    if q_api and q_api != q:
+        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}\n🛰️ שולח ל-AliExpress: {q_api}")
+    else:
+        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}")
+
+    try:
+        _ms_fetch_page(uid, q=(q_api or q), page=1,
+                      per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10),
+                      use_selected_categories=False)
+        _ms_show(uid, chat_id)
+    except Exception as e:
+        _logger.exception("[MS] start failed")
+        bot.send_message(chat_id, f"❌ החיפוש נכשל: {e}")
+
 
 # Keywords used to shrink the category list in "top" mode (Hebrew+English)
 CATEGORY_TOP_KEYWORDS = [
