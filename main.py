@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22fix-topics-debug-v26")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v28")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -291,7 +291,16 @@ AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CON
 AE_PRICE_DEBUG_DEFAULT = bool(int(os.environ.get("AE_PRICE_DEBUG", "0") or "0"))
 AE_PRICE_DEBUG = _get_state_bool("price_debug", AE_PRICE_DEBUG_DEFAULT)
 
+# Force USD-only pricing mode (no conversions). Default ON to avoid double-conversion / mixed currencies.
+AE_FORCE_USD_ONLY_DEFAULT = (os.environ.get("AE_FORCE_USD_ONLY", "1") or "1").strip().lower() in ("1","true","yes","on")
+AE_FORCE_USD_ONLY = _get_state_bool("force_usd_only", AE_FORCE_USD_ONLY_DEFAULT)
+if AE_FORCE_USD_ONLY:
+    AE_PRICE_INPUT_CURRENCY = "USD"
+    AE_PRICE_CONVERT_USD_TO_ILS = False
+
 def _display_currency_code() -> str:
+    if AE_FORCE_USD_ONLY:
+        return "USD"
     # If input is already ILS, never convert again.
     if AE_PRICE_INPUT_CURRENCY == "ILS":
         return "ILS"
@@ -794,6 +803,8 @@ def usd_to_ils(price_text: str, rate: float) -> str:
 
 
 def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str:
+    if AE_FORCE_USD_ONLY:
+        return _normalize_price_text(price_text)
     """Normalize incoming price text to what we display in the post.
 
     Rules:
@@ -2237,7 +2248,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     # snapshot of current filters
     min_orders = int(MIN_ORDERS or 0)
     min_rating = float(MIN_RATING or 0.0)
-    free_ship_only = bool(FREE_SHIP_ONLY)
+    free_ship_only = bool(FREE_SHIP_ONLY) and (not AE_FORCE_USD_ONLY)
     min_commission = float(MIN_COMMISSION or 0.0)
 
     diversify = str(os.environ.get('AE_REFILL_DIVERSIFY', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
@@ -2983,6 +2994,40 @@ def _ms_active_filters_text() -> str:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
     return " | ".join(parts) if parts else "ללא"
 
+
+def _contains_hebrew(s: str) -> bool:
+    return bool(re.search(r"[\u0590-\u05FF]", s or ""))
+
+def _translate_query_for_search(q: str) -> str:
+    """Translate a Hebrew search query to short English shopping keywords.
+    Uses OpenAI only if GPT is enabled and GPT_TRANSLATE_SEARCH is True.
+    """
+    q = (q or "").strip()
+    if not q:
+        return q
+    if (not GPT_ENABLED) or (not GPT_TRANSLATE_SEARCH) or (not OPENAI_API_KEY):
+        return q
+    if not _contains_hebrew(q):
+        return q
+    try:
+        # Keep it cheap: one short translation, no fancy text.
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.1,
+            max_tokens=20,
+            messages=[
+                {"role": "system", "content": "Translate Hebrew product search queries to concise English shopping keywords."},
+                {"role": "user", "content": f"Translate to 1-4 English words, no punctuation, no explanation: {q}"},
+            ],
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        out = re.sub(r"[^a-zA-Z0-9\s\-]", "", out).strip()
+        out = re.sub(r"\s+", " ", out)
+        return out or q
+    except Exception as e:
+        log_warn(f"[MS] query translate failed: {e}")
+        return q
+
 def _ms_keyword_match(title: str, q: str, strict: bool = True) -> bool:
     """Best-effort relevance gate for manual search.
 
@@ -3030,11 +3075,7 @@ def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
         c = float(c or 0.0)
         if c < float(MIN_COMMISSION):
             return False, f"עמלה נמוכה מ-{MIN_COMMISSION:g}%"
-    # Free ship only (our heuristic threshold)
-    if FREE_SHIP_ONLY:
-        sale_num = _extract_float(row.get("SalePrice") or "")
-        if sale_num is None or float(sale_num) < float(AE_FREE_SHIP_THRESHOLD_ILS):
-            return False, f"מתחת לסף משלוח חינם ₪{AE_FREE_SHIP_THRESHOLD_ILS:g}"
+    # FREE_SHIP_ONLY: Affiliate responses don't reliably include shipping cost; skip filtering here.
     # Buy link
     if not (row.get("BuyLink") or "").strip():
         return False, "אין קישור רכישה"
@@ -3098,7 +3139,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         ok_count = sum(1 for it in results if it.get("ok"))
     except Exception:
         ok_count = 0
-    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match}")
+    _logger.info(f"[MS] q='{q}' page={page} raw={raw_count} ok={ok_count} resp_code={resp_code} resp_msg='{resp_msg}' reasons={reasons} min_orders={MIN_ORDERS} min_rating={MIN_RATING} min_commission={MIN_COMMISSION} free_ship_only={FREE_SHIP_ONLY} strict_match={not relaxed_match} price_in={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} rate={USD_TO_ILS_RATE} display={PRICE_DISPLAY_CURRENCY}")
     MANUAL_SEARCH_SESS[uid] = sess
     return sess
 
