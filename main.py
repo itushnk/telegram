@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-21refill-diversify-v16")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22fix-topics-debug-v26")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -287,6 +287,9 @@ if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
 
 AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
 AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
+
+AE_PRICE_DEBUG_DEFAULT = bool(int(os.environ.get("AE_PRICE_DEBUG", "0") or "0"))
+AE_PRICE_DEBUG = _get_state_bool("price_debug", AE_PRICE_DEBUG_DEFAULT)
 
 def _display_currency_code() -> str:
     # If input is already ILS, never convert again.
@@ -2889,7 +2892,7 @@ def _ps_groups_kb() -> 'types.InlineKeyboardMarkup':
         g = TOPIC_GROUPS.get(key)
         if not g:
             continue
-        kb.add(types.InlineKeyboardButton(g["label"], callback_data=f"ps_g_{key}_0"))
+        kb.add(types.InlineKeyboardButton((g.get("label") or g.get("title") or g.get("name") or str(key)), callback_data=f"ps_g_{key}_0"))
     kb.row(types.InlineKeyboardButton("⬅️ חזרה", callback_data="ps_back"))
     return kb
 
@@ -2902,7 +2905,23 @@ def _ps_topics_kb(group_key: str, page: int) -> 'types.InlineKeyboardMarkup':
     chunk = topics[start:start + TOPICS_PAGE_SIZE]
 
     kb = types.InlineKeyboardMarkup(row_width=2)
-    for i, (label, _kw) in enumerate(chunk):
+    for i, t in enumerate(chunk):
+        # topics can be tuples (label, query) or dicts {"title":..., "keywords":[...]}
+        label = ""
+        kw = ""
+        if isinstance(t, (list, tuple)) and len(t) >= 2:
+            label, kw = str(t[0]), t[1]
+        elif isinstance(t, dict):
+            label = str(t.get("label") or t.get("title") or t.get("name") or "")
+            kws = t.get("keywords") or t.get("kw") or ""
+            if isinstance(kws, (list, tuple)):
+                kw = str(kws[0]) if kws else ""
+            else:
+                kw = str(kws)
+        else:
+            label = str(t)
+            kw = str(t)
+        
         idx = start + i
         kb.add(types.InlineKeyboardButton(label, callback_data=f"ps_t_{group_key}_{idx}"))
     kb.row(
@@ -4043,14 +4062,26 @@ def on_inline_click(c):
             group_key = _p[2]
             idx = int(_p[3])
             topics = (TOPIC_GROUPS.get(group_key) or {}).get("topics") or []
-            label, kw = topics[idx]
+            t = topics[idx]
+            # topics may be tuple or dict
+            if isinstance(t, (list, tuple)) and len(t) >= 2:
+                label, kw = t[0], t[1]
+            elif isinstance(t, dict):
+                label = t.get("label") or t.get("title") or t.get("name") or ""
+                kws = t.get("keywords") or t.get("kw") or ""
+                if isinstance(kws, (list, tuple)):
+                    kw = kws[0] if kws else ""
+                else:
+                    kw = kws
+            else:
+                label, kw = (str(t), str(t))
         except Exception:
             label, kw = ("", "")
         if not kw:
             bot.send_message(chat_id, "שגיאה בבחירת נושא. נסה שוב.")
             return
         per_page = int(os.environ.get("AE_MANUAL_SEARCH_PAGE_SIZE", "10") or "10")
-        _ms_fetch_page(uid, q=kw, page=1, per_page=per_page, use_selected_categories=False, relaxed_match=False)
+        _ms_fetch_page(uid, q=str(kw), page=1, per_page=per_page, use_selected_categories=False, relaxed_match=False)
         bot.send_message(chat_id, f"🔎 חיפוש לפי נושא: <b>{html.escape(label)}</b>", parse_mode="HTML")
         _ms_show(uid, chat_id)
         return
