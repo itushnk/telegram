@@ -280,8 +280,6 @@ USD_TO_ILS_RATE = _get_state_float("usd_to_ils_rate", USD_TO_ILS_RATE_DEFAULT)
 # Max allowed ratio original/sale to show 'original price' (prevents insane crossed prices)
 ORIG_MAX_RATIO_DEFAULT = float(os.environ.get("ORIG_MAX_RATIO", "3.5") or "3.5")
 ORIG_MAX_RATIO = _get_state_float("orig_max_ratio", ORIG_MAX_RATIO_DEFAULT)
-# Hard safety cap to prevent displaying ridiculous "original" prices due to API quirks or misconfiguration.
-ABS_ORIG_MAX_RATIO = float(os.environ.get("ABS_ORIG_MAX_RATIO", "4.0") or "4.0")
 
 def set_usd_to_ils_rate(v: float):
     global USD_TO_ILS_RATE
@@ -386,9 +384,6 @@ AE_TARGET_CURRENCY = "USD"
 # =================== AI (OpenAI) — “לתת חיים למוצרים” ===================
 # הפעלה/כיבוי:
 GPT_ENABLED = (os.environ.get("GPT_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
-# Separate toggle: allow using OpenAI just to translate manual-search keywords (Hebrew->English),
-# even when GPT_ENABLED (auto AI pipeline) is OFF.
-GPT_TRANSLATE_SEARCH = env_bool("GPT_TRANSLATE_SEARCH", True)
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
 OPENAI_MODEL = (os.environ.get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
 
@@ -1447,7 +1442,7 @@ def format_post(product):
     rating_percent = rating if rating else "אין דירוג"
     orders_num = safe_int(orders, default=0)
     orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
-    discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
+    discount_text = ""  # computed later from prices to keep consistency
     coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
 
     lines = []
@@ -1481,7 +1476,7 @@ def format_post(product):
         if opv < spv * 1.01:
             return False
         try:
-            max_ratio = float(ORIG_MAX_RATIO or 3.5)
+            max_ratio = min(max(float(ORIG_MAX_RATIO or 3.5), 1.2), 6.0)
         except Exception:
             max_ratio = 3.5
         if (opv / spv) > max_ratio:
@@ -1492,11 +1487,31 @@ def format_post(product):
         sp = str(product.get("SalePriceILS") or sale_price or "").strip()
         op = str(product.get("OriginalPriceILS") or original_price or "").strip()
         price_line = f'💰 {price_label}: {sp} ש"ח' + (f' (מחיר מקורי: {op} ש"ח)' if _orig_ok(sp, op) else "")
+        # Compute discount from the same prices we display (prevents mismatched %)
+        try:
+            spv = float(_extract_float(clean_price_text(sp)) or 0.0)
+            opv = float(_extract_float(clean_price_text(op)) or 0.0)
+            if _orig_ok(sp, op) and opv > 0 and spv > 0:
+                pct = int(round((1.0 - (spv / opv)) * 100))
+                if 1 <= pct <= 95:
+                    discount_text = f"💸 חיסכון של {pct}%!"
+        except Exception:
+            pass
         ship_line = '🚚 משלוח חינם מעל 38 ש"ח או 7.49 ש"ח'
     else:
         sp = str(product.get("SalePriceUSD") or sale_price or "").strip()
         op = str(product.get("OriginalPriceUSD") or original_price or "").strip()
         price_line = f'💰 {price_label}: ${sp}' + (f' (מחיר מקורי: ${op})' if _orig_ok(sp, op) else "")
+        # Compute discount from the same prices we display (prevents mismatched %)
+        try:
+            spv = float(_extract_float(clean_price_text(sp)) or 0.0)
+            opv = float(_extract_float(clean_price_text(op)) or 0.0)
+            if _orig_ok(sp, op) and opv > 0 and spv > 0:
+                pct = int(round((1.0 - (spv / opv)) * 100))
+                if 1 <= pct <= 95:
+                    discount_text = f"💸 חיסכון של {pct}%!"
+        except Exception:
+            pass
         ship_line = '🚚 משלוח/מחירון לפי תנאי המוכר'
     lines += [
         price_line,
@@ -2275,14 +2290,17 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
             ]
         # USD mode
         return [
-            "app_original_price",
-            "original_price",
+            # Prefer target_* first (usually matches what users see in their target currency/market)
             "target_app_original_price",
             "target_original_price",
-            "app_price",
-            "price",
+            # Then generic app/original
+            "app_original_price",
+            "original_price",
+            # Fall back to base price fields
             "target_app_price",
             "target_price",
+            "app_price",
+            "price",
         ]
 
     def _best_sale_candidate():
@@ -2358,8 +2376,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
             if numf < sale_num * 1.001:
                 continue
             ratio = numf / sale_num if sale_num else 0.0
-            cap = min(float(ORIG_MAX_RATIO or 3.5), float(ABS_ORIG_MAX_RATIO or 4.0))
-            if ratio <= cap:
+            if ratio <= min(max(float(ORIG_MAX_RATIO or 3.5), 1.2), 6.0):
                 sane.append((numf, k, raw, txt, is_from))
 
         if sane:
@@ -2372,8 +2389,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
         if above:
             above.sort(key=lambda t: t[0])
             numf, k, raw, txt, is_from = above[0]
-            cap = min(float(ORIG_MAX_RATIO or 3.5), float(ABS_ORIG_MAX_RATIO or 4.0))
-            if (numf / sale_num) > cap:
+            if (numf / sale_num) > min(max(float(ORIG_MAX_RATIO or 3.5), 1.2), 6.0):
                 return "", "", "", False
             return k, raw, txt, is_from
 
@@ -3195,67 +3211,119 @@ def _ms_active_filters_text() -> str:
 def _contains_hebrew(s: str) -> bool:
     return bool(re.search(r"[\u0590-\u05FF]", s or ""))
 
-# Fallback local mapping for Hebrew queries when OpenAI translation is disabled/unavailable.
-# This prevents sending Hebrew keywords to AliExpress which often yields unrelated results.
-MS_LOCAL_TRANSLATE_MAP = {
-    "נעליים": "shoes",
-    "נעלי": "shoes",
-    "נעלי ספורט": "running shoes",
-    "נעלי ריצה": "running shoes",
-    "סניקרס": "sneakers",
-    "מכנס": "pants",
-    "חולצה": "tshirt",
-    "אוזניות": "earbuds",
-    "שעון": "watch",
-    "טלפון": "phone",
-    "מגן מסך": "screen protector",
-    "כיסוי": "case",
-    "תיק": "bag",
-    "תיק גב": "backpack",
-}
-
 def _translate_query_for_search(q: str) -> str:
     """Translate a Hebrew search query to short English shopping keywords.
-    Uses OpenAI if OPENAI_API_KEY is set and GPT_TRANSLATE_SEARCH is True.
 
-    Note: This is intentionally independent of GPT_ENABLED.
-    You may want AI posting disabled, but still want accurate Hebrew manual search.
+    Priority:
+    1) If GPT translation is enabled (GPT_ENABLED + GPT_TRANSLATE_SEARCH + OPENAI_API_KEY) -> use OpenAI.
+    2) Otherwise -> use a small local Hebrew→English keyword map + token fallback.
+
+    This is critical for AliExpress affiliate search: Hebrew queries often return irrelevant results.
     """
     q = (q or "").strip()
     if not q:
         return q
-    # First: local mapping (free)
-    try:
-        if _contains_hebrew(q):
-            mapped = MS_LOCAL_TRANSLATE_MAP.get(q)
-            if mapped:
-                return mapped
-    except Exception:
-        pass
-
-    # Then: OpenAI (optional)
-    if (not GPT_TRANSLATE_SEARCH) or (not OPENAI_API_KEY):
-        return q
     if not _contains_hebrew(q):
         return q
-    try:
-        # Keep it cheap: one short translation, no fancy text.
-        resp = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.1,
-            max_tokens=20,
-            messages=[
-                {"role": "system", "content": "Translate Hebrew product search queries to concise English shopping keywords."},
-                {"role": "user", "content": f"Translate to 1-4 English words, no punctuation, no explanation: {q}"},
-            ],
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        out = re.sub(r"[^a-zA-Z0-9\s\-]", "", out).strip()
-        out = re.sub(r"\s+", " ", out)
-        return out or q
-    except Exception as e:
-        log_warn(f"[MS] query translate failed: {e}")
-        return q
+
+    # Local mapping (works even when GPT is disabled)
+    local_map = {
+        "נעליים": "shoes",
+        "נעלי ספורט": "running shoes",
+        "סניקרס": "sneakers",
+        "כפכפים": "slippers",
+        "מגפיים": "boots",
+        "מעיל": "jacket",
+        "מעילים": "jackets",
+        "חולצה": "shirt",
+        "חולצות": "shirts",
+        "מכנס": "pants",
+        "מכנסיים": "pants",
+        "שמלה": "dress",
+        "שמלות": "dresses",
+        "תיק": "bag",
+        "תיקים": "bags",
+        "שעון": "watch",
+        "שעונים": "watches",
+        "אוזניות": "earphones",
+        "רמקול": "speaker",
+        "מקלדת": "keyboard",
+        "עכבר": "mouse",
+        "מצלמה": "camera",
+        "מצלמת רכב": "dash cam",
+        "קופסה": "box",
+        "כיסוי": "cover",
+        "מגן": "protector",
+        "מגן מסך": "screen protector",
+        "טלפון": "phone",
+        "סמארטפון": "smartphone",
+        "אייפון": "iphone",
+        "סמסונג": "samsung",
+        "מטען": "charger",
+        "כבל": "cable",
+        "רכב": "car",
+        "אופניים": "bicycle",
+        "ניקיון": "cleaning",
+        "מטבח": "kitchen",
+        "בית": "home",
+        "תאורה": "lighting",
+        "ילדים": "kids",
+        "תינוק": "baby",
+        "צעצוע": "toy",
+        "צעצועים": "toys",
+        "מקדחה": "drill",
+        "כלי עבודה": "tools",
+        "כלים": "tools",
+        "ספורט": "sport",
+        "כושר": "fitness",
+        "גימנסיה": "fitness",
+        "מסך": "screen",
+    }
+
+    # Exact phrase first
+    if q in local_map:
+        return local_map[q]
+
+    # Token fallback: translate known tokens and keep unknown tokens as-is (drops punctuation)
+    parts = re.split(r"\s+", q)
+    out = []
+    for p in parts:
+        p2 = (p or "").strip()
+        if not p2:
+            continue
+        if p2 in local_map:
+            out.append(local_map[p2])
+        else:
+            # Try to strip common Hebrew prefixes/suffixes (minimal)
+            p3 = re.sub(r"^[והבכלמ]", "", p2)  # ו/ה/ב/כ/ל/מ
+            if p3 in local_map:
+                out.append(local_map[p3])
+            else:
+                # Unknown Hebrew token: keep it (API might still handle transliterated brands), but avoid breaking
+                out.append(p2)
+
+    fallback = " ".join(out).strip()
+    # If fallback is still identical Hebrew, we can try GPT if enabled; else return as-is.
+    if (GPT_ENABLED and GPT_TRANSLATE_SEARCH and OPENAI_API_KEY):
+        try:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "Translate Hebrew product search to short English shopping keywords. Output only keywords."},
+                    {"role": "user", "content": q},
+                ],
+                temperature=0,
+                max_tokens=12,
+            )
+            t = (resp.choices[0].message.content or "").strip()
+            t = re.sub(r"[^0-9A-Za-z\s\-]", " ", t).strip()
+            t = re.sub(r"\s+", " ", t).strip()
+            return t or fallback or q
+        except Exception:
+            return fallback or q
+
+    return fallback or q
+
 
 def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
     """Keyword match for manual search.
@@ -3517,10 +3585,7 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
             f"סינונים פעילים: {html.escape(flt)}\n\n"
         )
         if raw_count > 0:
-            # IMPORTANT: don't auto-show unrelated products by default.
-            # When strict keyword match filters everything, we prefer to show a clear diagnostic
-            # and let the admin explicitly click "🔎 הרחב התאמה".
-            auto_relax = env_bool("MS_AUTO_RELAX_ON_EMPTY", False)
+            auto_relax = env_bool("MS_AUTO_RELAX_ON_EMPTY", True)
             if auto_relax and not sess.get("relaxed_match", False) and sess.get("keyword_rejected_rows"):
                 # Auto-fallback: if strict keyword match filtered everything, show the best candidates anyway.
                 new_results = []
@@ -3530,20 +3595,10 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
                 sess["relaxed_match"] = True
                 MANUAL_SEARCH_SESS[uid] = sess
                 return _ms_caption(uid)
-            # If most failures are keyword-match, explain it clearly.
-            kw_rej = len(sess.get("keyword_rejected_rows") or [])
-            passed_before_kw = len(sess.get("passed_filters_rows") or [])
-            if kw_rej > 0 and passed_before_kw > 0:
-                info += (
-                    f"מצאתי {raw_count} תוצאות גולמיות, {passed_before_kw} עברו סינון — אבל כולן נפסלו כי הכותרת לא תואמת את מילת החיפוש.\n"
-                    f"👉 פתרון: בדוק שבשורה 🛰️ נשלח ל-AliExpress מופיע ביטוי באנגלית (למשל shoes).\n"
-                    f"או לחץ על 🔎 הרחב התאמה כדי לראות גם התאמות חלקיות.\n\n"
-                )
-            else:
-                info += (
-                    f"מצאתי {raw_count} תוצאות גולמיות אבל אף אחת לא עברה את הסינונים.\n"
-                    f"נפסלו: ללא קישור={reasons.get('no_link',0)} | מחיר={reasons.get('price',0)} | הזמנות={reasons.get('orders',0)} | דירוג={reasons.get('rating',0)} | עמלה={reasons.get('commission',0)} | משלוח={reasons.get('free_ship',0)}\n\n"
-                )
+            info += (
+                f"מצאתי {raw_count} תוצאות גולמיות אבל אף אחת לא עברה את הסינונים.\n"
+                f"נפסלו: ללא קישור={reasons.get('no_link',0)} | מחיר={reasons.get('price',0)} | הזמנות={reasons.get('orders',0)} | דירוג={reasons.get('rating',0)} | עמלה={reasons.get('commission',0)} | משלוח={reasons.get('free_ship',0)}\n\n"
+            )
         info += f"resp_code={resp_code} resp_msg={html.escape(str(resp_msg or ''))}"
         return info, None
 
@@ -3570,7 +3625,7 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         try:
             spv = float(_extract_float(clean_price_text(sale)) or 0.0)
             opv = float(_extract_float(clean_price_text(orig)) or 0.0)
-            max_ratio = min(float(ORIG_MAX_RATIO or 3.5), float(ABS_ORIG_MAX_RATIO or 4.0))
+            max_ratio = min(max(float(ORIG_MAX_RATIO or 3.5), 1.2), 6.0)
             show_orig = (spv > 0 and opv > spv * 1.01 and (opv / spv) <= max_ratio)
         except Exception:
             show_orig = False
@@ -3594,8 +3649,7 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         else:
             comm_line = f"\n💸 עמלה: {comm_pct:g}%"
     link = str(row.get("BuyLink") or "").strip()
-    # Build a safe link line (avoid referencing undefined variables)
-    link_line = (f"🔗 {html.escape(link)}\n" if link else "🔗 (אין קישור)\n")
+    link_line = (f"{link_line}" if link else "🔗 (אין קישור)\n")
     img = str(row.get("ImageURL") or "").strip() or None
 
     status_line = "✅ עומד בסינונים" if ok else f"🚫 נפסל: {html.escape(reason)}"
@@ -3654,7 +3708,7 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         f"💰 {html.escape(sale)}" + (f" (מקורי {html.escape(orig)})" if show_orig else "") + "\n"
         f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}"
         f"{html.escape(comm_line)}\n"
-        f"{link_line.strip()}"
+        f"🔗 {html.escape(link)}"
     )
     return caption, img
 
@@ -4348,7 +4402,7 @@ def _rate_panel_text() -> str:
     )
 
 
-def _rate_panel_kb() -> InlineKeyboardMarkup:
+def _rate_panel_kb() -> "types.InlineKeyboardMarkup":
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
         InlineKeyboardButton("➖0.05", callback_data="rate_dec_005"),
