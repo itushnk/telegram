@@ -5617,19 +5617,46 @@ def cmd_cancel(msg):
 
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
+    # Always respond to /start. If something goes wrong building the menu, fall back to plain text.
     try:
         log_info(f"[IN] /start|/help|/menu from uid={getattr(msg.from_user,'id',None)} chat={getattr(msg.chat,'id',None)}")
     except Exception:
         pass
     try:
-        uid = getattr(msg.from_user, "id", None)
+        uid = getattr(msg.from_user, 'id', None)
         if uid is not None:
             EXPECTING_TARGET.pop(uid, None)
             EXPECTING_UPLOAD.discard(uid)
     except Exception:
         pass
-    _save_admin_chat_id(msg.chat.id)
-    bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
+    try:
+        _save_admin_chat_id(msg.chat.id)
+    except Exception:
+        pass
+
+    kb = None
+    try:
+        kb = inline_menu()
+    except Exception as e:
+        log_error(f"[MENU] inline_menu failed: {e}")
+
+    try:
+        bot.send_message(msg.chat.id, "✅ תפריט ראשי", reply_markup=kb)
+        log_info(f"[OUT] menu sent to chat={msg.chat.id}")
+        return
+    except Exception as e:
+        log_error(f"[OUT] send_message failed: {e}")
+
+    # Fallback: raw Telegram API without reply_markup
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            timeout=10,
+            data={'chat_id': msg.chat.id, 'text': '✅ הבוט פעיל. כתוב /help או שלח הודעה מהתריט.', 'parse_mode': 'HTML'}
+        )
+        log_error(f"[OUT] raw sendMessage status={r.status_code} body={r.text[:200]}")
+    except Exception as e2:
+        log_error(f"[OUT] raw sendMessage failed: {e2}")
 
 @bot.message_handler(commands=['pending_status','queue'])
 def pending_status_cmd(msg):
