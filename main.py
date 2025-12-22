@@ -3103,7 +3103,7 @@ def _ms_active_filters_text() -> str:
         except Exception:
             parts.append(f"💰 מינ' עמלה: {MIN_COMMISSION}%")
     if FREE_SHIP_ONLY:
-        parts.append(f"🚚 משלוח חינם (>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g})")
+        parts.append("🚚 משלוח חינם (לא מסונן בחיפוש ידני)")
     cats = get_selected_category_ids()
     if cats:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
@@ -3121,6 +3121,33 @@ def _translate_query_for_search(q: str) -> str:
     if not q:
         return q
     if (not GPT_ENABLED) or (not GPT_TRANSLATE_SEARCH) or (not OPENAI_API_KEY):
+        # Fallback without OpenAI: quick Hebrew→English shopping keywords mapping (improves strict title matching)
+        if _contains_hebrew(q):
+            qh = re.sub(r"\s+", " ", q).strip()
+            qn = qh.replace("־", " ").replace("-", " ")
+            qn = re.sub(r"\s+", " ", qn)
+            mapping = [
+                ("נעלי ריצה", "running shoes"),
+                ("נעלי ספורט", "sneakers"),
+                ("סניקרס", "sneakers"),
+                ("נעליים", "shoes"),
+                ("נעל", "shoes"),
+                ("שעון חכם", "smartwatch"),
+                ("שעון", "watch"),
+                ("אוזניות", "earbuds"),
+                ("כיסוי", "case"),
+                ("מגן", "case"),
+                ("מטען", "charger"),
+                ("כבל", "cable"),
+                ("תיק גב", "backpack"),
+                ("תיק", "bag"),
+                ("שמלה", "dress"),
+                ("חולצה", "shirt"),
+                ("מכנס", "pants"),
+            ]
+            for he, en in mapping:
+                if he in qn:
+                    return en
         return q
     if not _contains_hebrew(q):
         return q
@@ -3398,9 +3425,10 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         raw_count = int(sess.get("raw_count") or 0)
         flt = _ms_active_filters_text()
         info = (
-            f"🔎 חיפוש: <b>{html.escape(q)}</b>\n"
-            f"דף: {page}\n"
-            f"סינונים פעילים: {html.escape(flt)}\n\n"
+            f"🔎 חיפוש: <b>{html.escape(q)}</b>\\n"
+            + (f"🛰️ נשלח ל-AliExpress: <b>{html.escape(str(sess.get('q_api') or q))}</b>\\n" if str(sess.get('q_api') or q) != q else "")
+            + f"דף: {page}\\n"
+            + f"סינונים פעילים: {html.escape(flt)}\\n\\n"
         )
         if raw_count > 0:
             auto_relax = env_bool("MS_AUTO_RELAX_ON_EMPTY", True)
@@ -3457,6 +3485,15 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
     link = str(row.get("BuyLink") or "").strip()
     img = str(row.get("ImageURL") or "").strip() or None
 
+    show_full_link = env_bool("MS_SHOW_FULL_LINK", False)
+    if link:
+        if show_full_link:
+            link_line = f"🔗 {html.escape(link)}"
+        else:
+            link_line = f'🔗 <a href="{html.escape(link)}">לפתיחת המוצר</a>'
+    else:
+        link_line = "🔗 (אין קישור)"
+
     status_line = "✅ עומד בסינונים" if ok else f"🚫 נפסל: {html.escape(reason)}"
     flt = _ms_active_filters_text()
 
@@ -3465,16 +3502,17 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         hint = "⚠️ אין התאמות מדויקות לפי הכותרת. לחץ על 🔎 הרחב התאמה כדי להרחיב.\n"
 
     caption = (
-        f"🔎 חיפוש: <b>{html.escape(q)}</b>\n"
-        f"תוצאה {idx+1}/{len(results)} | דף {page}\n"
-        f"סינונים פעילים: {html.escape(flt)}\n"
-        f"{hint}"
-        f"{status_line}\n\n"
-        f"<b>{html.escape(title)}</b>\n"
-        f"💰 {html.escape(sale)} (מקורי {html.escape(orig)})\n"
-        f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}"
-        f"{html.escape(comm_line)}\n"
-        f"🔗 {html.escape(link)}"
+        f"🔎 חיפוש: <b>{html.escape(q)}</b>\\n"
+        + (f"🛰️ נשלח ל-AliExpress: <b>{html.escape(str(sess.get('q_api') or q))}</b>\\n" if str(sess.get('q_api') or q) != q else "")
+        + f"תוצאה {idx+1}/{len(results)} | דף {page}\\n"
+        + f"סינונים פעילים: {html.escape(flt)}\\n"
+        + f"{hint}"
+        + f"{status_line}\\n\\n"
+        + f"<b>{html.escape(title)}</b>\\n"
+        + f"💰 {html.escape(sale)} (מקורי {html.escape(orig)})\\n"
+        + f"⭐ {html.escape(rating)}% | 📦 {html.escape(orders)}"
+        + f"{html.escape(comm_line)}\\n"
+        + f"{link_line}"
     )
     return caption, img
 
