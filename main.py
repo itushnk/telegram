@@ -24,7 +24,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v29")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v31")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -5379,6 +5379,22 @@ except Exception:
         write_auto_flag("on")
     
 # Broadcast default: OFF on every boot (unless you explicitly override).
+
+# --- env helpers ---
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s == '':
+        return default
+    if s in ('1','true','t','yes','y','on'): 
+        return True
+    if s in ('0','false','f','no','n','off'): 
+        return False
+    return default
+
 BROADCAST_FORCE_OFF_ON_BOOT = env_bool("BROADCAST_FORCE_OFF_ON_BOOT", True)
 if BROADCAST_FORCE_OFF_ON_BOOT:
     write_broadcast_flag("off")
