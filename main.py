@@ -11,6 +11,20 @@ Changes vs previous:
 
 import html
 import os, sys
+def env_bool(name: str, default: bool = False) -> bool:
+    """Parse environment boolean flags safely.
+    Accepts: 1/0, true/false, yes/no, on/off (case-insensitive).
+    """
+    v = os.environ.get(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    return bool(default)
+
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -24,7 +38,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v31")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v33")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -3054,102 +3068,82 @@ def _translate_query_for_search(q: str) -> str:
         log_warn(f"[MS] query translate failed: {e}")
         return q
 
-def _ms_keyword_match(title: str, q: str, strict: bool = True) -> bool:
-    """Best-effort relevance gate for manual search.
+def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
+    """Keyword match for manual search.
 
-    - strict=True  → require *all* tokens to appear in title (very strict).
-    - strict=False → allow partial match (fallback).
+    - strict=True: require ALL tokens of at least one query variant to be present
+    - strict=False: require a minimal hit count (OR-like) for at least one query variant
+
+    Includes a small synonym expansion for common categories (helps Hebrew->English matching).
     """
     try:
         t = (title or "").lower()
-        qq = (q or "").lower().strip()
-        if not qq or not t:
-            return True
-        toks = [x for x in re.split(r"[^\w\u0590-\u05FF]+", qq) if len(x) >= 2]
-        if not toks:
-            toks = [qq]
-
-        if strict:
-            return all(tok in t for tok in toks)
-
-        hits = sum(1 for tok in toks if tok in t)
-        need = 1 if len(toks) <= 2 else 2
-        return hits >= need
-    except Exception:
-        return True
-
-def _ms_build_terms(q_user: str, q_api: str | None = None) -> list[str]:
-    """Build match terms for strict relevance checking.
-
-    We match against (lowercased) product titles (often EN), so we include:
-    - user query tokens (HE) + light synonyms
-    - translated query tokens (EN) if available
-    """
-    def norm(s: str) -> str:
-        s = (s or "").strip().lower()
-        # keep hebrew + latin letters/digits/spaces
-        s = re.sub(r"[^0-9a-z\u0590-\u05FF\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    qh = norm(q_user)
-    qe = norm(q_api or "")
-    terms: list[str] = []
-
-    def add_terms_from_q(q: str):
-        if not q:
-            return
-        # tokenization
-        toks = [t for t in q.split() if len(t) >= 2]
-        if not toks:
-            toks = [q]
-        for tok in toks:
-            terms.append(tok)
-            # naive singular for EN plurals
-            if tok.endswith("s") and len(tok) > 3:
-                terms.append(tok[:-1])
-
-    add_terms_from_q(qh)
-    add_terms_from_q(qe)
-
-    # light Hebrew synonym expansion for common ecommerce intents
-    # (kept small + safe to avoid over-broad matches)
-    if "נעל" in qh or "נעליים" in qh:
-        terms += ["נעל", "נעליים", "נעלי", "סניקר", "סניקרס", "סניקרס", "נעלי ספורט",
-                  "shoe", "shoes", "sneaker", "sneakers", "running shoes", "boots", "sandals"]
-    if "שעון" in qh:
-        terms += ["שעון", "שעונים", "watch", "watches", "smartwatch", "smart watch"]
-    if "טלפון" in qh or "סמארטפון" in qh:
-        terms += ["טלפון", "סמארטפון", "phone", "smartphone", "mobile"]
-
-    # de-dup while preserving order
-    out=[]
-    seen=set()
-    for t in terms:
-        t=norm(t)
         if not t:
-            continue
-        if t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out
-
-
-def _ms_keyword_match_terms(title: str, terms: list[str], strict: bool = True) -> bool:
-    """Match title against terms.
-
-    - strict=True: require at least ONE meaningful term hit (keeps results relevant, but not too strict).
-    - strict=False: always allow (used for fallback).
-    """
-    try:
-        t = (title or "").lower()
-        if not strict:
             return True
-        if not t or not terms:
+
+        # Normalize inputs: allow string or list of strings
+        if isinstance(queries, str):
+            q_list = [queries]
+        else:
+            q_list = [q for q in (queries or []) if q]
+
+        if not q_list:
             return True
-        # any hit
-        return any(term and term in t for term in terms)
+
+        synonyms = {
+            # shoes / footwear
+            "shoe": ["shoes", "sneaker", "sneakers", "boots", "boot", "sandals", "slippers", "loafers"],
+            "shoes": ["shoe", "sneaker", "sneakers", "boots", "boot", "sandals", "slippers", "loafers"],
+            "sneaker": ["sneakers", "shoes", "shoe", "trainers"],
+            "sneakers": ["sneaker", "shoes", "shoe", "trainers"],
+            # watch
+            "watch": ["watches", "smartwatch", "smart watch"],
+            "watches": ["watch", "smartwatch", "smart watch"],
+            "smartwatch": ["smart watch", "watch", "watches"],
+            # headphones / earbuds
+            "headphones": ["headset", "earbuds", "ear phones", "earphones"],
+            "earbuds": ["headphones", "earphones"],
+            "earphones": ["earbuds", "headphones"],
+            # phone accessories
+            "phone": ["smartphone", "mobile"],
+            "case": ["cover", "shell"],
+            "charger": ["charging", "adapter", "power"],
+            # generic (avoid too broad)
+        }
+
+        def token_options(tok: str) -> list[str]:
+            opts = [tok]
+            opts += synonyms.get(tok, [])
+            return list(dict.fromkeys([o for o in opts if o]))
+
+        for q in q_list:
+            qq = (q or "").lower().strip()
+            if not qq:
+                continue
+
+            toks = [x for x in re.split(r"[^0-9a-zA-Zא-ת]+", qq) if x]
+            toks = [x for x in toks if len(x) >= 2]
+            if not toks:
+                toks = [qq]
+
+            # Build per-token options (synonyms)
+            per_tok_opts = [token_options(tok) for tok in toks]
+
+            if strict:
+                # All tokens must match, but each token can match any of its options
+                if all(any(opt in t for opt in opts) for opts in per_tok_opts):
+                    return True
+            else:
+                # Count how many token-groups hit
+                hits = 0
+                for opts in per_tok_opts:
+                    if any(opt in t for opt in opts):
+                        hits += 1
+                need = 1 if len(per_tok_opts) <= 2 else 2
+                if hits >= need:
+                    return True
+
+        return False
     except Exception:
         return True
 
@@ -3201,8 +3195,11 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         row = _map_affiliate_product_to_row(p)
         ok, reason = _ms_eval_row_filters(row)
         # Extra strictness: reduce unrelated results (keyword must match title)
-        terms = sess.get("q_terms") or _ms_build_terms(sess.get("q_user", q), q)
-        if ok and not _ms_keyword_match_terms(row.get("Title") or "", terms, strict=not relaxed_match):
+        sess = MANUAL_SEARCH_SESS.get(uid) or {}
+        q_user = str(sess.get("q_user") or q)
+        q_api = str(sess.get("q_api") or q)
+        q_variants = [q_user] + ([q_api] if q_api and q_api != q_user else [])
+        if ok and not _ms_keyword_match(row.get("Title") or "", q_variants, strict=not relaxed_match):
             ok, reason = False, "לא תואם מילת החיפוש"
         if not ok:
             # bucket reasons (best-effort)
@@ -3410,32 +3407,25 @@ def _ms_add_rows_to_queue(rows: list[dict]) -> tuple[int, int, int]:
     return added, dups, total
 
 def _ms_start(uid: int, chat_id: int, q: str):
-    q_user = (q or "").strip()
-    if not q_user:
+    q = (q or "").strip()
+    if not q:
         bot.send_message(chat_id, "❗️לא קיבלתי מילת חיפוש.")
         return
-
+    # reset session and fetch first page
     _ms_clear(uid)
-
-    # Translate (once) so AliExpress receives an English query; keep original for UI + strict match terms
-    q_api = q_user
-    if GPT_TRANSLATE_SEARCH:
-        try:
-            q_api = _translate_query_for_search(q_user)
-        except Exception:
-            q_api = q_user
-
-    sess = MANUAL_SEARCH_SESS.setdefault(uid, {})
-    sess["q_user"] = q_user
+    # Cache translated query for strict matching (Hebrew input vs English titles)
+    try:
+        ms_translate = env_bool("MS_TRANSLATE_QUERY", True)
+        q_api = _translate_query_for_search(q) if ms_translate else q
+    except Exception:
+        q_api = q
+    sess = MANUAL_SEARCH_SESS.get(uid, {})
+    sess["q_user"] = q
     sess["q_api"] = q_api
-    sess["q_terms"] = _ms_build_terms(q_user, q_api)
+    MANUAL_SEARCH_SESS[uid] = sess
 
-    if q_api and q_api != q_user:
-        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q_user}\n🔎 נשלח ל-AliExpress בתרגום: {q_api}")
-    else:
-        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q_user}")
-
-    _ms_fetch_page(uid, q=q_api, page=1, per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10), use_selected_categories=False)
+    bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q} (שולח ל-AliExpress בדיוק כפי שהזנת)")
+    _ms_fetch_page(uid, q=q, page=1, per_page=int(os.environ.get('AE_MANUAL_SEARCH_PAGE_SIZE','10') or 10), use_selected_categories=False)
     _ms_show(uid, chat_id)
 
 # Keywords used to shrink the category list in "top" mode (Hebrew+English)
@@ -5324,6 +5314,14 @@ def on_text_input(m):
 
 if __name__ == "__main__":
     log_info(f"[BOOT] main.py {CODE_VERSION} fp={_code_fingerprint()} commit={os.environ.get('RAILWAY_GIT_COMMIT_SHA') or os.environ.get('RAILWAY_COMMIT_SHA') or os.environ.get('GIT_COMMIT') or 'n/a'}")
+    BROADCAST_FORCE_OFF_ON_BOOT = env_bool("BROADCAST_FORCE_OFF_ON_BOOT", True)
+    if BROADCAST_FORCE_OFF_ON_BOOT:
+        try:
+            set_broadcast_enabled(False)
+            log_info("[BOOT] Broadcast forced OFF on boot (BROADCAST_FORCE_OFF_ON_BOOT=1)")
+        except Exception as e:
+            log_info(f"[BOOT] Broadcast force-off failed: {e}")
+
     log_info(f"Instance: {socket.gethostname()}")
 
     # הדפסה קצרה של קונפיג (מסכות)
@@ -5377,29 +5375,8 @@ except Exception:
 
     if not os.path.exists(AUTO_FLAG_FILE):
         write_auto_flag("on")
-    
-# Broadcast default: OFF on every boot (unless you explicitly override).
-
-# --- env helpers ---
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.environ.get(name)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s == '':
-        return default
-    if s in ('1','true','t','yes','y','on'): 
-        return True
-    if s in ('0','false','f','no','n','off'): 
-        return False
-    return default
-
-BROADCAST_FORCE_OFF_ON_BOOT = env_bool("BROADCAST_FORCE_OFF_ON_BOOT", True)
-if BROADCAST_FORCE_OFF_ON_BOOT:
-    write_broadcast_flag("off")
-elif not os.path.exists(BROADCAST_FLAG_FILE):
-    write_broadcast_flag("off")
+    if not os.path.exists(BROADCAST_FLAG_FILE):
+        write_broadcast_flag("off")
 
     t1 = threading.Thread(target=auto_post_loop, daemon=True)
     t1.start()
