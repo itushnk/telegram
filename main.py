@@ -38,7 +38,7 @@ import math
 from logging.handlers import RotatingFileHandler
 
 # ========= LOGGING / VERSION =========
-CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-22strict-usd-only-v41")
+CODE_VERSION = os.environ.get("CODE_VERSION", "v2025-12-23fix-text-router-v42")
 def _code_fingerprint() -> str:
     try:
         p = os.path.abspath(__file__)
@@ -5618,6 +5618,10 @@ def cmd_cancel(msg):
 @bot.message_handler(commands=['start', 'help', 'menu'])
 def cmd_start(msg):
     try:
+        log_info(f"[IN] /start|/help|/menu from uid={getattr(msg.from_user,'id',None)} chat={getattr(msg.chat,'id',None)}")
+    except Exception:
+        pass
+    try:
         uid = getattr(msg.from_user, "id", None)
         if uid is not None:
             EXPECTING_TARGET.pop(uid, None)
@@ -5801,12 +5805,27 @@ def refill_daemon():
 # ========= TEXT INPUT ROUTER (for menus that expect typed input) =========
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def on_text_input(m):
+    # NOTE: This handler is a catch-all for free-typed text. To avoid making the bot look "dead",
+    # we must NOT swallow slash-commands (e.g. /start, /help, /myid). Let the dedicated command
+    # handlers process those.
+    raw_text = (m.text or "").strip()
+    try:
+        log_info(f"[IN] text from uid={getattr(m.from_user,'id',None)} chat={getattr(m.chat,'id',None)} len={len(raw_text)}")
+    except Exception:
+        pass
+    if raw_text.startswith("/"):
+        return
+
     # Only admins can drive typed inputs
     if not _is_admin(m):
+        try:
+            bot.reply_to(m, "⛔ אין לך הרשאה לבצע פעולה זו. אם אתה מנהל, ודא שה-ID שלך נמצא ב-ADMIN_USER_IDS ושלח /myid.")
+        except Exception:
+            pass
         return
 
     uid = m.from_user.id
-    text = (m.text or "").strip()
+    text = raw_text
 
     # Allow cancel
     if text.lower() in ("/cancel", "cancel", "ביטול"):
@@ -5845,7 +5864,7 @@ def on_text_input(m):
         PROD_SEARCH_WAIT.pop(uid, None)
         query = text
         try:
-            _ms_start(uid=uid, chat_id=m.chat.id, q=query)
+            _run_product_search_flow(m.chat.id, query, strict=True, origin="item")
         except Exception as e:
             bot.reply_to(m, f"שגיאה בחיפוש: {e}")
         return
