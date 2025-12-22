@@ -249,17 +249,31 @@ ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשי�
 
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
 
+USD_TO_ILS_RATE = _get_state_float("usd_to_ils_rate", USD_TO_ILS_RATE_DEFAULT)
+
+def set_usd_to_ils_rate(v: float):
+    global USD_TO_ILS_RATE
+    try:
+        v = float(v)
+    except Exception:
+        return
+    # sanity bounds; allow user override but avoid extreme typos
+    if v <= 0:
+        return
+    USD_TO_ILS_RATE = v
+    _set_state_str("usd_to_ils_rate", str(USD_TO_ILS_RATE))
+
 # ========= PRICE CURRENCY MODE =========
 # AE affiliate API usually returns prices in the requested target_currency (default USD),
 # but sometimes the returned fields (especially app_* fields) may already be in ILS.
 # We support a runtime switch to tell the bot what currency the incoming prices are in,
 # and whether to convert USD→ILS for display.
-AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
+AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "ILS") or "ILS").strip().upper()
 AE_PRICE_INPUT_CURRENCY = (_get_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY_DEFAULT) or AE_PRICE_INPUT_CURRENCY_DEFAULT).strip().upper()
 if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
     AE_PRICE_INPUT_CURRENCY = "USD"
 
-AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
 AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
 
 def _display_currency_code() -> str:
@@ -473,8 +487,8 @@ AE_PRICE_BUCKETS_RAW = _get_state_str("price_buckets_raw", AE_PRICE_BUCKETS_RAW_
 AE_PRICE_BUCKETS = _parse_price_buckets(AE_PRICE_BUCKETS_RAW)
 
 # Optional other filters (persisted)
-AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "0") or "0"))
-AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "0") or "0")  # percent (0-100)
+AE_MIN_ORDERS_DEFAULT = int(float(os.environ.get("AE_MIN_ORDERS", "300") or "300"))
+AE_MIN_RATING_DEFAULT = float(os.environ.get("AE_MIN_RATING", "88") or "88")  # percent (0-100)
 AE_FREE_SHIP_ONLY_DEFAULT = (os.environ.get("AE_FREE_SHIP_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
 AE_FREE_SHIP_THRESHOLD_ILS = float(os.environ.get("AE_FREE_SHIP_THRESHOLD_ILS", "38") or "38")  # heuristic
 AE_CATEGORY_IDS_DEFAULT = (os.environ.get("AE_CATEGORY_IDS", "") or "").strip()
@@ -1926,8 +1940,8 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     sale_text, sale_is_from = _pick_value(sale_raw)
     orig_text, orig_is_from = _pick_value(orig_raw)
 
-    sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE_DEFAULT)
-    orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE_DEFAULT)
+    sale_disp = price_text_to_display_amount(sale_text, USD_TO_ILS_RATE)
+    orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE)
 
     product_id = str(p.get("product_id", "")).strip()
 
@@ -2436,10 +2450,231 @@ PROD_SEARCH_WAIT: dict[int, bool] = {}        # uid -> waiting for keyword text?
 PROD_SEARCH_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
 PROD_SEARCH_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
 
+
+
+# ========= SEARCH (Topics + Item) =========
+TOPICS_PAGE_SIZE = 8
+
+TOPIC_GROUP_ORDER = [
+    "tools", "home", "electronics", "fashion", "kids", "beauty", "sport", "auto", "pets", "gaming", "office", "outdoor"
+]
+
+TOPIC_GROUPS: dict[str, dict] = {
+    "tools": {
+        "label": "🧰 כלים ועבודה",
+        "topics": [
+            ("מברגה/מקדחה", "cordless drill"),
+            ("סט ביטים/ראצ'ט", "ratchet screwdriver set"),
+            ("מולטיטול", "multitool pliers"),
+            ("פנס עבודה", "work light flashlight"),
+            ("מד לייזר", "laser distance meter"),
+            ("אקדח ניטים/ריבט", "rivet gun tool"),
+            ("סט מברגים", "screwdriver set"),
+            ("כפפות עבודה", "work gloves"),
+            ("מקדחים/כוסות קידוח", "drill bits hole saw"),
+            ("ארגז/תיק כלים", "tool box organizer"),
+            ("סוללות/מטענים", "power tool battery charger"),
+        ],
+    },
+    "home": {
+        "label": "🏠 לבית ולמטבח",
+        "topics": [
+            ("אחסון וארגון", "home storage organizer"),
+            ("גאדג'טים למטבח", "kitchen gadget"),
+            ("ניקיון הבית", "cleaning supplies"),
+            ("מצעים/כריות", "bedding pillow"),
+            ("תאורה לבית", "led lights home"),
+            ("ברזים ואביזרי אמבט", "bathroom faucet accessories"),
+            ("כלי בישול", "cookware pan pot"),
+            ("קופסאות אוכל", "food container bento"),
+            ("מדפים/מתלים", "wall shelf hooks"),
+        ],
+    },
+    "electronics": {
+        "label": "💻 אלקטרוניקה",
+        "topics": [
+            ("אוזניות", "wireless earbuds"),
+            ("מטענים וכבלים", "usb c charger cable"),
+            ("Power Bank", "power bank"),
+            ("מצלמת רכב", "dash cam"),
+            ("תאורה חכמה", "smart led light"),
+            ("אביזרי טלפון", "phone accessories"),
+            ("שעונים חכמים", "smart watch"),
+            ("רמקול בלוטוס", "bluetooth speaker"),
+            ("מצלמת אבטחה", "security camera"),
+        ],
+    },
+    "fashion": {
+        "label": "👗 אופנה ואקססוריז",
+        "topics": [
+            ("שעונים", "wristwatch"),
+            ("תיקים/ארנקים", "wallet bag"),
+            ("חגורות", "leather belt"),
+            ("משקפי שמש", "sunglasses"),
+            ("נעליים", "shoes sneakers"),
+            ("כפפות חורף", "winter gloves"),
+            ("ג'קטים", "jacket coat"),
+        ],
+    },
+    "kids": {
+        "label": "🧒 ילדים וצעצועים",
+        "topics": [
+            ("LEGO/בריקים", "building blocks bricks"),
+            ("צעצועי שלט", "rc toy car"),
+            ("משחקי חשיבה", "puzzle educational toy"),
+            ("ציוד לבית ספר", "school supplies"),
+            ("תחפושות פורים", "kids costume"),
+            ("דמויות ואקשן", "action figure"),
+            ("משחקי יצירה", "diy craft kit"),
+        ],
+    },
+    "beauty": {
+        "label": "💄 יופי וטיפוח",
+        "topics": [
+            ("מכשירי שיער", "hair dryer straightener"),
+            ("טיפוח עור", "skincare serum"),
+            ("מניקור/פדיקור", "nail kit"),
+            ("מכשירי גילוח", "electric shaver"),
+            ("איפור", "makeup"),
+            ("בשמים", "perfume fragrance"),
+        ],
+    },
+    "sport": {
+        "label": "🏃 ספורט ובריאות",
+        "topics": [
+            ("נעלי ריצה", "running shoes"),
+            ("כושר ביתי", "fitness equipment"),
+            ("בקבוקי שתייה", "water bottle"),
+            ("שעון ספורט", "sport smartwatch"),
+            ("אופניים/אביזרים", "bicycle accessories"),
+            ("מסאז'ר", "massage gun"),
+        ],
+    },
+    "auto": {
+        "label": "🚗 רכב",
+        "topics": [
+            ("תושבת טלפון", "car phone holder"),
+            ("אביזרי ניקוי", "car cleaning kit"),
+            ("תאורה לרכב", "car led light"),
+            ("קומפרסור נייד", "portable air compressor"),
+            ("כיסוי מושבים", "car seat cover"),
+            ("OBD/דיאגנוסטיקה", "obd2 scanner"),
+        ],
+    },
+    "pets": {
+        "label": "🐶 חיות מחמד",
+        "topics": [
+            ("צעצועים לכלבים", "dog toy"),
+            ("קערות ומזרקות מים", "pet water fountain"),
+            ("טיפוח חיות", "pet grooming"),
+            ("רצועות וקולרים", "dog leash collar"),
+            ("חתולים", "cat accessories"),
+        ],
+    },
+    "gaming": {
+        "label": "🎮 גיימינג",
+        "topics": [
+            ("שלטים", "game controller"),
+            ("אביזרי קונסולות", "ps5 accessory"),
+            ("סטנד/אחסון", "gaming stand organizer"),
+            ("אוזניות גיימינג", "gaming headset"),
+            ("מקלדת/עכבר", "gaming keyboard mouse"),
+        ],
+    },
+    "office": {
+        "label": "🖇️ משרד ולימודים",
+        "topics": [
+            ("ארגונומיה", "ergonomic office"),
+            ("מדפסות ותלת מימד", "3d printer accessory"),
+            ("כתיבה וסידור", "desk organizer"),
+            ("מנורות שולחן", "desk lamp"),
+        ],
+    },
+    "outdoor": {
+        "label": "🏕️ שטח וקמפינג",
+        "topics": [
+            ("ציוד קמפינג", "camping gear"),
+            ("תאורה לשטח", "camping lantern"),
+            ("סכין כיס / EDC", "edc pocket tool"),
+            ("דיג", "fishing reel"),
+            ("תיקי טיולים", "hiking backpack"),
+        ],
+    },
+}
+
+def _prod_search_menu_text() -> str:
+    flt = _ms_active_filters_text()
+    cur = _display_currency_code()
+    conv = "כן" if AE_PRICE_CONVERT_USD_TO_ILS else "לא"
+    return (
+        "🔎 <b>חיפוש</b>\n\n"
+        "בחר מצב:\n"
+        "• 🎯 חיפוש פריט ספציפי (תכתוב מילה/ביטוי)\n"
+        "• 📚 חיפוש נושאים (רשימת נושאים מוכנים)\n\n"
+        f"סינונים פעילים: {html.escape(flt)}\n"
+        f"מחיר: מטבע מקור={cur} | המרה $→₪={conv} | שער={USD_TO_ILS_RATE:g}\n"
+    )
+
+def _prod_search_menu_kb() -> 'types.InlineKeyboardMarkup':
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton("🎯 חיפוש פריט ספציפי", callback_data="ps_item"),
+        types.InlineKeyboardButton("📚 חיפוש נושאים", callback_data="ps_topics"),
+    )
+    kb.row(types.InlineKeyboardButton("🎯 סינון מומלץ 300+/88%", callback_data="ps_best"))
+    kb.row(
+        types.InlineKeyboardButton("📦 מינ' הזמנות", callback_data="fo_menu"),
+        types.InlineKeyboardButton("⭐ מינ' דירוג", callback_data="fr_menu"),
+    )
+    kb.row(
+        types.InlineKeyboardButton(f"💱 מטבע מקור: {_display_currency_code()}", callback_data="toggle_price_input_currency"),
+        types.InlineKeyboardButton(f"🔁 המרה $→₪: {'ON' if AE_PRICE_CONVERT_USD_TO_ILS else 'OFF'}", callback_data="toggle_usd2ils_convert"),
+    )
+    kb.row(types.InlineKeyboardButton("🔢 קבע שער USD→ILS", callback_data="ps_set_rate"))
+    kb.row(types.InlineKeyboardButton("⬅️ תפריט ראשי", callback_data="ps_back_main"))
+    return kb
+
+def _ps_groups_kb() -> 'types.InlineKeyboardMarkup':
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for key in TOPIC_GROUP_ORDER:
+        g = TOPIC_GROUPS.get(key)
+        if not g:
+            continue
+        kb.add(types.InlineKeyboardButton(g["label"], callback_data=f"ps_g_{key}_0"))
+    kb.row(types.InlineKeyboardButton("⬅️ חזרה", callback_data="ps_back"))
+    return kb
+
+def _ps_topics_kb(group_key: str, page: int) -> 'types.InlineKeyboardMarkup':
+    g = TOPIC_GROUPS.get(group_key) or {}
+    topics = g.get("topics") or []
+    total_pages = max(1, (len(topics) + TOPICS_PAGE_SIZE - 1) // TOPICS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * TOPICS_PAGE_SIZE
+    chunk = topics[start:start + TOPICS_PAGE_SIZE]
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for i, (label, _kw) in enumerate(chunk):
+        idx = start + i
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"ps_t_{group_key}_{idx}"))
+    kb.row(
+        types.InlineKeyboardButton("⬅️ קודם", callback_data=f"ps_g_{group_key}_{max(0,page-1)}"),
+        types.InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+        types.InlineKeyboardButton("הבא ➡️", callback_data=f"ps_g_{group_key}_{min(total_pages-1,page+1)}"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("📚 קבוצות", callback_data="ps_topics"),
+        types.InlineKeyboardButton("⬅️ חזרה", callback_data="ps_back"),
+    )
+    return kb
 # --- Set post interval (minutes) prompt state ---
 DELAY_SET_WAIT: dict[int, bool] = {}        # uid -> waiting for minutes text?
 DELAY_SET_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
 DELAY_SET_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
+
+# --- Set USD→ILS rate prompt state ---
+RATE_SET_WAIT: dict[int, bool] = {}        # uid -> waiting for rate text?
+RATE_SET_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
+RATE_SET_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
 
 # --- Manual PRODUCT search preview session (per admin user) ---
 # Stores last fetched results for a keyword so you can review what was found BEFORE adding to queue.
@@ -2475,8 +2710,12 @@ def _ms_active_filters_text() -> str:
         parts.append(f"🧩 קטגוריות מסומנות: {len(cats)}")
     return " | ".join(parts) if parts else "ללא"
 
-def _ms_keyword_match(title: str, q: str) -> bool:
-    """Best-effort strictness to reduce unrelated results in manual search."""
+def _ms_keyword_match(title: str, q: str, strict: bool = True) -> bool:
+    """Best-effort relevance gate for manual search.
+
+    - strict=True  → require *all* tokens to appear in title (very strict).
+    - strict=False → allow partial match (fallback).
+    """
     try:
         t = (title or "").lower()
         qq = (q or "").lower().strip()
@@ -2485,6 +2724,10 @@ def _ms_keyword_match(title: str, q: str) -> bool:
         toks = [x for x in re.split(r"[^\w\u0590-\u05FF]+", qq) if len(x) >= 2]
         if not toks:
             toks = [qq]
+
+        if strict:
+            return all(tok in t for tok in toks)
+
         hits = sum(1 for tok in toks if tok in t)
         need = 1 if len(toks) <= 2 else 2
         return hits >= need
@@ -2518,7 +2761,7 @@ def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
         return False, "אין קישור רכישה"
     return True, ""
 
-def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False) -> dict:
+def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False, relaxed_match: bool = False) -> dict:
     """Fetch one page from AliExpress Affiliate API and prepare preview session."""
     # IMPORTANT: For manual search we default to ALL categories (category_id=None),
     # so the keyword is the primary selector.
@@ -2537,7 +2780,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         row = _map_affiliate_product_to_row(p)
         ok, reason = _ms_eval_row_filters(row)
         # Extra strictness: reduce unrelated results (keyword must match title)
-        if ok and not _ms_keyword_match(row.get('Title') or '', q):
+        if ok and not _ms_keyword_match(row.get("Title") or "", q, strict=not relaxed_match):
             ok, reason = False, "לא תואם מילת החיפוש"
         if not ok:
             # bucket reasons (best-effort)
@@ -2566,6 +2809,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         "resp_msg": resp_msg,
         "reasons": reasons,
         "use_selected_categories": bool(use_selected_categories),
+        "strict_match": bool(not relaxed_match),
+        "relaxed_match": bool(relaxed_match),
     }
     MANUAL_SEARCH_SESS[uid] = sess
     return sess
@@ -2588,6 +2833,9 @@ def _ms_kb(uid: int) -> 'types.InlineKeyboardMarkup':
         types.InlineKeyboardButton("➕ הוסף לתור", callback_data="ms_add_one"),
         types.InlineKeyboardButton("➕➕ הוסף את כל הדף", callback_data="ms_add_page"),
     )
+
+    if sess.get("strict_match") and not sess.get("relaxed_match"):
+        kb.row(types.InlineKeyboardButton("🔎 הרחב התאמה", callback_data="ms_relax"))
 
     kb.row(
         types.InlineKeyboardButton("📄 דף קודם", callback_data="ms_page_prev"),
@@ -2613,7 +2861,7 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         raw_count = int(sess.get("raw_count") or 0)
         flt = _ms_active_filters_text()
         info = (
-            f"🔎 חיפוש ידני: <b>{html.escape(q)}</b>\n"
+            f"🔎 חיפוש: <b>{html.escape(q)}</b>\n"
             f"דף: {page}\n"
             f"סינונים פעילים: {html.escape(flt)}\n\n"
         )
@@ -2629,9 +2877,11 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
     idx = max(0, min(idx, len(results)-1))
     sess["idx"] = idx
     item = results[idx]
+    ok_count = sum(1 for it in results if it.get("ok"))
     row = item.get("row") or {}
     ok = bool(item.get("ok"))
     reason = str(item.get("reason") or "").strip()
+    strict_match = bool(sess.get("strict_match")) and not bool(sess.get("relaxed_match"))
 
     title = str(row.get("Title") or "").strip()
     if len(title) > 120:
@@ -2647,10 +2897,15 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
     status_line = "✅ עומד בסינונים" if ok else f"🚫 נפסל: {html.escape(reason)}"
     flt = _ms_active_filters_text()
 
+    hint = ""
+    if ok_count == 0 and sess.get("strict_match") and not sess.get("relaxed_match"):
+        hint = "⚠️ אין התאמות מדויקות לפי הכותרת. לחץ על 🔎 הרחב התאמה כדי להרחיב.\n"
+
     caption = (
-        f"🔎 חיפוש ידני: <b>{html.escape(q)}</b>\n"
+        f"🔎 חיפוש: <b>{html.escape(q)}</b>\n"
         f"תוצאה {idx+1}/{len(results)} | דף {page}\n"
         f"סינונים פעילים: {html.escape(flt)}\n"
+        f"{hint}"
         f"{status_line}\n\n"
         f"<b>{html.escape(title)}</b>\n"
         f"💰 {html.escape(sale)} (מקורי {html.escape(orig)})\n"
@@ -3200,7 +3455,7 @@ def inline_menu():
     )
 
     kb.add(
-        types.InlineKeyboardButton("🔎 חיפוש ידני", callback_data="prod_search"),
+        types.InlineKeyboardButton("🔎 חיפוש", callback_data="prod_search"),
         types.InlineKeyboardButton("₪ המרת $→₪ (לקובץ הבא)", callback_data="convert_next"),
         types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"),
     )
@@ -3269,22 +3524,86 @@ def on_inline_click(c):
         return
 
     if data == "prod_search":
+        bot.answer_callback_query(c.id)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_back_main":
+        bot.answer_callback_query(c.id)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_back":
+        bot.answer_callback_query(c.id)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_best":
+        # Apply recommended strict filters for high-quality results
+        set_min_orders(300)
+        set_min_rating(88.0)
+        bot.answer_callback_query(c.id, "עודכן: מינ׳ 300 הזמנות + 88% דירוג")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data == "ps_set_rate":
+        uid = c.from_user.id
+        RATE_SET_WAIT[uid] = True
+        RATE_SET_CTX[uid] = (chat_id, msg_id)
+        prompt = bot.send_message(chat_id, "הזן שער USD→ILS (למשל 3.70):")
+        RATE_SET_PROMPT[uid] = (chat_id, prompt.message_id)
+        bot.answer_callback_query(c.id)
+        return
+
+    if data == "ps_item":
         uid = c.from_user.id
         PROD_SEARCH_WAIT[uid] = True
-        PROD_SEARCH_CTX[uid] = (chat_id, c.message.message_id)
-        try:
-            prompt = bot.send_message(
-                chat_id,
-                "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח).\n"
-                "טיפ: אם אתה בתוך קבוצה – *תענה/י* להודעה הזאת (Reply) כדי שהבוט יקבל את הטקסט.",
-                parse_mode='Markdown',
-                reply_markup=types.ForceReply(selective=True)
-            )
-            PROD_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
-        except Exception:
-            # Fallback without ForceReply
-            bot.send_message(chat_id, "🔎 שלח עכשיו מילת חיפוש למוצרים (לדוגמה: iPhone / מקדחה / שעון / מטבח)")
+        PROD_SEARCH_CTX[uid] = (chat_id, msg_id)
+        prompt = bot.send_message(
+            chat_id,
+            "כתוב מילת חיפוש לפריט ספציפי (כדאי באנגלית בשביל דיוק).\n"
+            "טיפ: אם לא יצא מדויק – תוכל ללחוץ על \"🔎 הרחב התאמה\" בתוצאות.",
+            parse_mode="HTML",
+        )
+        PROD_SEARCH_PROMPT[uid] = (chat_id, prompt.message_id)
         bot.answer_callback_query(c.id)
+        return
+
+    if data == "ps_topics":
+        bot.answer_callback_query(c.id)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="📚 <b>חיפוש נושאים</b>\nבחר קבוצה:", reply_markup=_ps_groups_kb(), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data.startswith("ps_g_"):
+        bot.answer_callback_query(c.id)
+        try:
+            _p = data.split("_", 3)
+            group_key = _p[2]
+            page = int(_p[3])
+        except Exception:
+            group_key, page = "home", 0
+        label = (TOPIC_GROUPS.get(group_key) or {}).get("label") or "נושאים"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=f"📚 <b>{html.escape(label)}</b>\nבחר נושא:", reply_markup=_ps_topics_kb(group_key, page), parse_mode="HTML", cb_id=c.id)
+        return
+
+    if data.startswith("ps_t_"):
+        bot.answer_callback_query(c.id)
+        uid = c.from_user.id
+        try:
+            _p = data.split("_", 3)
+            group_key = _p[2]
+            idx = int(_p[3])
+            topics = (TOPIC_GROUPS.get(group_key) or {}).get("topics") or []
+            label, kw = topics[idx]
+        except Exception:
+            label, kw = ("", "")
+        if not kw:
+            bot.send_message(chat_id, "שגיאה בבחירת נושא. נסה שוב.")
+            return
+        per_page = int(os.environ.get("AE_MANUAL_SEARCH_PAGE_SIZE", "10") or "10")
+        _ms_fetch_page(uid, q=kw, page=1, per_page=per_page, use_selected_categories=False, relaxed_match=False)
+        bot.send_message(chat_id, f"🔎 חיפוש לפי נושא: <b>{html.escape(label)}</b>", parse_mode="HTML")
+        _ms_show(uid, chat_id)
         return
 
 
@@ -3329,7 +3648,7 @@ def on_inline_click(c):
 
         if data == "ms_page_next":
             bot.answer_callback_query(c.id, "טוען דף הבא…")
-            _ms_fetch_page(uid, q=q, page=page + 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")))
+            _ms_fetch_page(uid, q=q, page=page + 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")), relaxed_match=bool(sess.get("relaxed_match")))
             _refresh()
             return
 
@@ -3338,7 +3657,21 @@ def on_inline_click(c):
                 bot.answer_callback_query(c.id, "זה כבר הדף הראשון.")
                 return
             bot.answer_callback_query(c.id, "טוען דף קודם…")
-            _ms_fetch_page(uid, q=q, page=page - 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")))
+            _ms_fetch_page(uid, q=q, page=page - 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")), relaxed_match=bool(sess.get("relaxed_match")))
+            _refresh()
+            return
+
+        if data == "ms_relax":
+            bot.answer_callback_query(c.id, "מרחיב התאמה…")
+            # Re-fetch the same page but allow partial title matches
+            _ms_fetch_page(
+                uid,
+                q=q,
+                page=page,
+                per_page=per_page,
+                use_selected_categories=bool(sess.get("use_selected_categories")),
+                relaxed_match=True,
+            )
             _refresh()
             return
 
@@ -3610,9 +3943,11 @@ def on_inline_click(c):
         _set_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY)
         # If switched away from USD, conversion is irrelevant (but we keep the stored flag)
         bot.answer_callback_query(c.id, f"עודכן מטבע מקור למחירים: {AE_PRICE_INPUT_CURRENCY}")
-        safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"✅ עודכן מטבע מקור למחירים: {AE_PRICE_INPUT_CURRENCY}",
-                          reply_markup=inline_menu(), cb_id=None)
+        # Refresh the same screen (search menu vs main menu)
+        if c.message and (c.message.text or "").startswith("🔎"):
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
+        else:
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
 
     elif data == "toggle_usd2ils_convert":
         if AE_PRICE_INPUT_CURRENCY != "USD":
@@ -3622,9 +3957,10 @@ def on_inline_click(c):
         _set_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS)
         state_txt = "פעיל" if AE_PRICE_CONVERT_USD_TO_ILS else "כבוי"
         bot.answer_callback_query(c.id, f"המרה $→₪: {state_txt}")
-        safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"✅ המרת $→₪ כעת: {state_txt}",
-                          reply_markup=inline_menu(), cb_id=None)
+        if c.message and (c.message.text or "").startswith("🔎"):
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
+        else:
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
 
     elif data.startswith("delay_"):
         try:
@@ -3983,6 +4319,34 @@ def handle_set_delay_minutes_text(m):
             safe_edit_message(bot, chat_id=ctx[0], message_id=ctx[1], new_text="🎛️ תפריט עודכן.", reply_markup=inline_menu())
     except Exception:
         pass
+
+
+@bot.message_handler(func=lambda m: bool(is_admin(m)) and RATE_SET_WAIT.get(m.from_user.id))
+def handle_set_rate_text(message):
+    uid = message.from_user.id
+    try:
+        raw = (message.text or "").strip().replace(",", ".")
+        v = float(raw)
+        if v <= 0:
+            raise ValueError("nonpositive")
+        set_usd_to_ils_rate(v)
+        bot.reply_to(message, f"✅ עודכן שער USD→ILS: {USD_TO_ILS_RATE:g}")
+    except Exception:
+        bot.reply_to(message, "❌ לא הצלחתי לקרוא את השער. דוגמה תקינה: 3.70")
+    # clean prompt + return to menu
+    RATE_SET_WAIT.pop(uid, None)
+    ctx = RATE_SET_CTX.pop(uid, None)
+    prompt = RATE_SET_PROMPT.pop(uid, None)
+    if prompt:
+        try:
+            bot.delete_message(prompt[0], prompt[1])
+        except Exception:
+            pass
+    if ctx:
+        try:
+            bot.edit_message_text(_prod_search_menu_text(), chat_id=ctx[0], message_id=ctx[1], reply_markup=_prod_search_menu_kb(), parse_mode="HTML")
+        except Exception:
+            pass
 
 @bot.message_handler(commands=['upload_source'])
 def cmd_upload_source(msg):
