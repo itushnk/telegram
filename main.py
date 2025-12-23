@@ -4601,6 +4601,7 @@ def _rate_panel_kb() -> "types.InlineKeyboardMarkup":
     return kb
 
 @bot.callback_query_handler(func=lambda c: True)
+@bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
 
@@ -4612,7 +4613,7 @@ def on_inline_click(c):
     chat_id = c.message.chat.id
     msg_id = c.message.message_id
 
-    log_info(f\"[IN] cb={data} from uid={getattr(c.from_user,'id',None)} chat={chat_id}\")
+    log_info(f"[IN] cb={data} from uid={getattr(c.from_user,'id',None)} chat={chat_id}")
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
         return
