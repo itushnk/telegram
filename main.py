@@ -274,7 +274,6 @@ PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
 PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 
 SCHEDULE_FLAG_FILE      = os.path.join(BASE_DIR, "schedule_enforced.flag")
-CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 BROADCAST_FLAG_FILE     = os.path.join(BASE_DIR, "broadcast_enabled.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
@@ -288,7 +287,7 @@ ORIG_MAX_RATIO_DEFAULT = float(os.environ.get("ORIG_MAX_RATIO", "3.5") or "3.5")
 ORIG_MAX_RATIO = _get_state_float("orig_max_ratio", ORIG_MAX_RATIO_DEFAULT)
 
 def set_usd_to_ils_rate(v: float):
-    global USD_TO_ILS_RATE, AE_PRICE_CONVERT_USD_TO_ILS
+    global USD_TO_ILS_RATE
     try:
         v = float(v)
     except Exception:
@@ -298,16 +297,6 @@ def set_usd_to_ils_rate(v: float):
         return
     USD_TO_ILS_RATE = v
     _set_state_str("usd_to_ils_rate", str(USD_TO_ILS_RATE))
-
-    # UX: changing the rate implies the user wants conversion visible.
-    # We still respect AE_FORCE_USD_ONLY if someone insists on USD-only display.
-    if not env_bool("AE_FORCE_USD_ONLY", False):
-        AE_PRICE_CONVERT_USD_TO_ILS = True
-        _set_state_str("convert_usd_to_ils", "1")
-        if AE_FORCE_USD_ONLY:
-            # user explicitly wants conversion -> disable USD-only lock
-            AE_FORCE_USD_ONLY = False
-            _set_state_str("force_usd_only", "0")
 
 # ========= PRICE CURRENCY MODE =========
 # AE affiliate API usually returns prices in the requested target_currency (default USD),
@@ -1504,12 +1493,15 @@ def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup
 
         try:
             bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception:
+        except Exception as e1:
             # Try caption edit (for media messages)
             try:
                 bot.edit_message_caption(chat_id=chat_id, message_id=message.message_id, caption=new_text, reply_markup=reply_markup, parse_mode=parse_mode)
-            except Exception:
-                pass
+            except Exception as e2:
+                try:
+                    log_error(f"safe_edit_message edit failed: {e1} | caption failed: {e2} | {cb_info or ''}")
+                except Exception:
+                    pass
 
         if cb_id:
             try:
@@ -3391,10 +3383,10 @@ def _translate_query_for_search(q: str) -> str:
     # Local mapping (works even when GPT is disabled)
     local_map = {
         "נעליים": "shoes",
-        "נעלי": "shoes",
         "נעלי ספורט": "running shoes",
         "סניקרס": "sneakers",
         "כפכפים": "slippers",
+        "נעלי בית": "house slippers",
         "מגפיים": "boots",
         "מעיל": "jacket",
         "מעילים": "jackets",
@@ -3416,6 +3408,8 @@ def _translate_query_for_search(q: str) -> str:
         "מצלמת רכב": "dash cam",
         "קופסה": "box",
         "כיסוי": "cover",
+        "כובע": "hat",
+        "כובע שמש": "sun hat",
         "מגן": "protector",
         "מגן מסך": "screen protector",
         "טלפון": "phone",
@@ -3462,96 +3456,39 @@ def _translate_query_for_search(q: str) -> str:
             if p3 in local_map:
                 out.append(local_map[p3])
             else:
-                # Small morphology helpers
-                if p3.startswith("נעל"):
-                    out.append("shoes")
-                else:
-                    # Unknown Hebrew token: keep it (API might still handle transliterated brands), but avoid breaking
-                    out.append(p2)
+                # Unknown Hebrew token: keep it (API might still handle transliterated brands), but avoid breaking
+                out.append(p2)
 
     fallback = " ".join(out).strip()
-    # If fallback is still identical Hebrew, we can try GPT if enabled; else return as-is.
-    if (GPT_ENABLED and GPT_TRANSLATE_SEARCH and OPENAI_API_KEY):
+    # If fallback is still Hebrew, try OpenAI translation (enabled by default when API key exists).
+    use_gpt = bool(OPENAI_API_KEY) and env_bool("MS_USE_GPT_TRANSLATE", True)
+    if use_gpt:
         try:
             resp = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "Translate Hebrew product search to short English shopping keywords. Output only keywords."},
+                    {"role": "system", "content": "Translate Hebrew to short English shopping keywords for AliExpress search. Output ONLY the keywords (no punctuation, no quotes)."},
                     {"role": "user", "content": q},
                 ],
                 temperature=0,
-                max_tokens=12,
+                max_tokens=18,
             )
             t = (resp.choices[0].message.content or "").strip()
             t = re.sub(r"[^0-9A-Za-z\s\-]", " ", t).strip()
             t = re.sub(r"\s+", " ", t).strip()
-            return t or fallback or q
-        except Exception:
-            logger.exception("[MS] translate_query failed")
-            return fallback or q
+            if t:
+                return t
+        except Exception as e:
+            try:
+                _logger.info(f"[MS] translate_query failed: {e}")
+            except Exception:
+                pass
+
+    return fallback or q
 
     return fallback or q
 
 
-
-
-def _ms_ai_rerank_results(q_user: str, results: list[dict]) -> None:
-    """Optional AI rerank to improve relevance of manual search results.
-
-    Updates each item dict in `results` in-place by setting `_ms_score` in [0..1].
-    Falls back silently to existing `_ms_score` if AI is unavailable.
-    """
-    try:
-        if not env_bool("MS_AI_RERANK", True):
-            return
-        if not _ai_enabled():
-            return
-        q_user = (q_user or "").strip()
-        if not q_user or not results:
-            return
-
-        # Limit to a small batch (cost control)
-        titles = []
-        for it in results[:30]:
-            row = it.get("row") or {}
-            title = str(row.get("OrigTitle") or row.get("Title") or "").strip()
-            titles.append(title[:160])
-
-        if not any(titles):
-            return
-
-        prompt = (
-            "קבל שאילתת חיפוש בעברית ורשימת כותרות של מוצרים מאליאקספרס. "
-            "החזר מערך JSON של מספרים (0-100) באותו סדר בדיוק, שמייצגים רלוונטיות לשאילתה. "
-            "הסתמך על משמעות/מילים נרדפות, והתעלם ממילים כלליות. "
-            "החזר JSON בלבד."
-        )
-        user_msg = json.dumps({"query_he": q_user, "titles": titles}, ensure_ascii=False)
-
-        resp = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_msg}],
-            temperature=0,
-            max_tokens=200,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        # Extract JSON array
-        m = re.search(r"\[[\s\S]*\]", content)
-        if not m:
-            return
-        arr = json.loads(m.group(0))
-        if not isinstance(arr, list):
-            return
-        for i, score in enumerate(arr[:len(results)]):
-            try:
-                s = float(score)
-            except Exception:
-                continue
-            s = max(0.0, min(100.0, s))
-            results[i]["_ms_score"] = max(float(results[i].get("_ms_score") or 0.0), s / 100.0)
-    except Exception:
-        logger.exception("[MS] AI rerank failed")
-        return
 def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
     """Keyword match for manual search.
 
@@ -3721,7 +3658,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         results.append({"row": row, "ok": ok, "reason": reason})
 
     # Sort results so the preview shows the most relevant items first.
-    # We rank by: keyword overlap score, then pass/fail, then orders.
+    # We rank by: pass/fail, keyword overlap score, then orders.
     def _ms_overlap_score(title: str) -> float:
         t = (title or "").lower()
         best = 0.0
@@ -3741,8 +3678,6 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         except Exception:
             it["_ms_score"] = 0.0
             it["_ms_orders"] = 0
-
-    _ms_ai_rerank_results(q_user, results)
 
     results.sort(
         key=lambda it: (
@@ -4615,7 +4550,6 @@ def inline_menu():
 
     kb.add(
         types.InlineKeyboardButton("🔎 חיפוש", callback_data="prod_search"),
-        types.InlineKeyboardButton("₪ המרת $→₪ (לקובץ הבא)", callback_data="convert_next"),
         types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"),
     )
 
@@ -4847,9 +4781,6 @@ def on_inline_click(c):
         bot.answer_callback_query(c.id)
         AE_PRICE_CONVERT_USD_TO_ILS = True
         _set_state_str("convert_usd_to_ils", "1")
-        if AE_FORCE_USD_ONLY:
-            AE_FORCE_USD_ONLY = False
-            _set_state_str("force_usd_only", "0")
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
         return
 
@@ -5077,40 +5008,19 @@ def on_inline_click(c):
                 return
             idx = max(0, min(idx, len(results)-1))
             item = results[idx]
-            # Allow adding even if filters rejected it (manual search is a discovery flow).
-            if not item.get("ok") and not env_bool("MS_ALLOW_ADD_REJECTED", True):
+            if not item.get("ok"):
                 bot.answer_callback_query(c.id, f"לא נוסף: {item.get('reason')}", show_alert=True)
                 return
             row = item.get("row") or {}
-            if not item.get("ok"):
-                row = dict(row)
-                row["ManualFilterNote"] = str(item.get("reason") or "").strip()
             added, dups, total = _ms_add_rows_to_queue([row])
             bot.answer_callback_query(c.id, f"נוסף: {added} | כפול: {dups} | בתור: {total}")
             return
 
         if data == "ms_add_page":
             results = sess.get("results") or []
-            if not results:
-                bot.answer_callback_query(c.id, "אין תוצאות להוסיף.", show_alert=True)
-                return
-
-            rows = []
-            for it in results:
-                r = it.get("row") or {}
-                if not isinstance(r, dict) or not r:
-                    continue
-                if not it.get("ok"):
-                    r = dict(r)
-                    r["ManualFilterNote"] = str(it.get("reason") or "").strip()
-                rows.append(r)
-
-            added, dups, total = _ms_add_rows_to_queue(rows)
-            bot.answer_callback_query(c.id, f"✅ הוספו {added} | כפולים {dups} | בתור {total}")
-            try:
-                _refresh(note=f"✅ הוספתי {added} פריטים לתור לאישור AI.")
-            except Exception:
-                _refresh()
+            ok_rows = [it.get("row") for it in results if it.get("ok") and it.get("row")]
+            added, dups, total = _ms_add_rows_to_queue(ok_rows)
+            bot.answer_callback_query(c.id, f"נוספו: {added} | כפולים: {dups} | בתור: {total}", show_alert=True)
             return
 
         bot.answer_callback_query(c.id)
@@ -5479,17 +5389,6 @@ def on_inline_click(c):
                           new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
                           reply_markup=inline_menu(), cb_id=c.id)
 
-    elif data == "convert_next":
-        try:
-            with open(CONVERT_NEXT_FLAG_FILE, "w", encoding="utf-8") as f:
-                f.write(str(USD_TO_ILS_RATE_DEFAULT))
-            safe_edit_message(
-                bot, chat_id=chat_id, message=c.message,
-                new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
-                reply_markup=inline_menu(), cb_id=c.id
-            )
-        except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
 
     elif data == "reset_from_data":
         src = read_products(DATA_CSV)
@@ -5804,16 +5703,10 @@ def on_document(msg):
         rows_raw = [dict(r) for r in raw_reader]
 
         convert_rate = None
-        if os.path.exists(CONVERT_NEXT_FLAG_FILE):
-            try:
-                with open(CONVERT_NEXT_FLAG_FILE, "r", encoding="utf-8") as f:
-                    convert_rate = float((f.read() or "").strip() or USD_TO_ILS_RATE_DEFAULT)
-            except Exception:
-                convert_rate = USD_TO_ILS_RATE_DEFAULT
-            try:
-                os.remove(CONVERT_NEXT_FLAG_FILE)
-            except Exception:
-                pass
+        try:
+            convert_rate = float(USD_TO_ILS_RATE)
+        except Exception:
+            convert_rate = USD_TO_ILS_RATE_DEFAULT
 
         rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
 
