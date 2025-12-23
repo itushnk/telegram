@@ -122,6 +122,24 @@ def _get_state_csv_set(key: str, default_raw: str = "") -> set[str]:
     return set(parts)
 
 
+
+def _parse_price_range_text(text: str):
+    """Parse user input like '10-30' or '10 – 30'. Returns (low, high) floats or None."""
+    if not text:
+        return None
+    t = str(text).strip()
+    # allow comma decimals
+    t = t.replace(",", ".")
+    # normalize dashes
+    t = re.sub(r"[–—−]", "-", t)
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$", t)
+    if not m:
+        return None
+    lo = float(m.group(1)); hi = float(m.group(2))
+    if hi < lo:
+        lo, hi = hi, lo
+    return (lo, hi)
+
 def _parse_price_buckets(raw: str):
     """Parse bucket spec like: '1-5,5-10,10-20,20-50,50+' into [(1,5),(5,10),(10,20),(20,50),(50,None)].
     Safe to call early during module import (no dependencies on other helpers).
@@ -3419,6 +3437,9 @@ def _translate_query_for_search(q: str) -> str:
         "ראש": "head",
         "כיסוי ראש": "head cover",
         "כיסוי שיער": "hair cover",
+        "כיסוי ראש": "headscarf",
+        "כיסוי ראש לנשים": "women headscarf",
+        "כיסוי ראש דתי": "kippah",
         "סרט לשיער": "hair band",
         "כובע": "hat",
         "כובעים": "hats",
@@ -3504,6 +3525,17 @@ def _translate_query_for_search(q: str) -> str:
             t = (resp.choices[0].message.content or "").strip()
             t = re.sub(r"[^0-9A-Za-z\s\-]", " ", t).strip()
             t = re.sub(r"\s+", " ", t).strip()
+
+            # Special post-fixes for common literal translations that hurt AliExpress relevance
+            fix_map = {
+                "head cover": "headscarf",
+                "cover head": "headscarf",
+                "head covering": "headscarf",
+                "hair cover": "headscarf",
+            }
+            t_norm = t.lower().strip()
+            if t_norm in fix_map:
+                t = fix_map[t_norm]
             return t or fallback or q
         except Exception:
             return fallback or q
