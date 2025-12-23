@@ -547,6 +547,17 @@ MIN_ORDERS = _get_state_int("min_orders", AE_MIN_ORDERS_DEFAULT)
 MIN_RATING = _get_state_float("min_rating", AE_MIN_RATING_DEFAULT)
 MIN_COMMISSION = _get_state_float("min_commission", AE_MIN_COMMISSION_DEFAULT)
 FREE_SHIP_ONLY = _get_state_bool("free_ship_only", AE_FREE_SHIP_ONLY_DEFAULT)
+
+# Manual search (MS) overrides.
+# Goal: prioritize keyword precision for admin searches; keep numeric filters optional.
+MS_MIN_ORDERS_DEFAULT = int(os.environ.get("MS_MIN_ORDERS", "0") or "0")
+MS_MIN_RATING_DEFAULT = float(os.environ.get("MS_MIN_RATING", "0") or "0")
+MS_MIN_COMMISSION_DEFAULT = float(os.environ.get("MS_MIN_COMMISSION", "0") or "0")
+MS_FREE_SHIP_ONLY_DEFAULT = env_bool("MS_FREE_SHIP_ONLY", False)
+# If the search returns 0 results mainly because the commission filter is too strict,
+# automatically relax commission to 0 for that search (keyword strictness stays on).
+MS_AUTO_RELAX_COMMISSION_ON_EMPTY = env_bool("MS_AUTO_RELAX_COMMISSION_ON_EMPTY", True)
+
 CATEGORY_IDS_RAW = _get_state_str("category_ids_raw", AE_CATEGORY_IDS_DEFAULT)
 
 def set_min_orders(n: int):
@@ -3522,6 +3533,15 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
         if not q_list:
             return True
 
+        # Phrase-level synonyms (useful for Hebrew->English translations).
+        phrase_synonyms = {
+            "head cover": [
+                "head cover", "head covering", "headcover", "headwear",
+                "head scarf", "headscarf", "scarf", "bandana", "hijab", "veil", "turban",
+                "cap", "hat", "beanie", "bonnet", "hood", "headband",
+            ],
+        }
+
         synonyms = {
             # shoes / footwear
             "shoe": ["shoes", "sneaker", "sneakers", "boots", "boot", "sandals", "slippers", "loafers"],
@@ -3556,6 +3576,7 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
         def token_options(tok: str) -> list[str]:
             opts = [tok]
             opts += synonyms.get(tok, [])
+            opts += phrase_synonyms.get(tok, [])
             return list(dict.fromkeys([o for o in opts if o]))
 
         for q in q_list:
@@ -3567,6 +3588,12 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
             toks = [x for x in toks if len(x) >= 2]
             if not toks:
                 toks = [qq]
+
+            # Phrase collapsing for better Hebrew->English matching while keeping strictness.
+            if strict:
+                tset = set(toks)
+                if "head" in tset and ("cover" in tset or "covering" in tset):
+                    toks = ["head cover"]
 
             # Build per-token options (synonyms)
             per_tok_opts = [token_options(tok) for tok in toks]
@@ -3589,28 +3616,32 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
     except Exception:
         return False
 
-def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
+def _ms_eval_row_filters(row: dict, *, min_orders: int | None = None, min_rating: float | None = None, min_commission: float | None = None) -> tuple[bool, str]:
     """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
+    mo = MIN_ORDERS if min_orders is None else int(min_orders)
+    mr = MIN_RATING if min_rating is None else float(min_rating)
+    mc = MIN_COMMISSION if min_commission is None else float(min_commission)
+
     # Price buckets
     if AE_PRICE_BUCKETS:
         sale_num = _extract_float(row.get("SalePrice") or "")
         if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
             return False, "מחוץ לסינון מחיר"
     # Orders
-    if MIN_ORDERS:
+    if mo:
         o = safe_int(row.get("Orders") or "0", 0)
-        if o < int(MIN_ORDERS):
+        if o < int(mo):
             return False, f"פחות מ-{MIN_ORDERS} הזמנות"
     # Rating
-    if MIN_RATING:
+    if mr:
         r = _extract_float(row.get("Rating") or "")
-        if r is None or float(r) < float(MIN_RATING):
+        if r is None or float(r) < float(mr):
             return False, f"דירוג נמוך מ-{MIN_RATING}%"
     # Commission
-    if MIN_COMMISSION:
+    if mc:
         c = _commission_percent(row.get("CommissionRate") or "")
         c = float(c or 0.0)
-        if c < float(MIN_COMMISSION):
+        if c < float(mc):
             return False, f"עמלה נמוכה מ-{MIN_COMMISSION:g}%"
     # FREE_SHIP_ONLY: Affiliate responses don't reliably include shipping cost; skip filtering here.
     # Buy link
@@ -3645,19 +3676,25 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     keyword_rejected_rows = []  # rows that pass filters but fail strict keyword match
     raw_count = 0
     reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "commission": 0, "free_ship": 0, "other": 0}
+    # Manual-search thresholds (defaults are independent from auto-refill filters)
+    min_orders = int(prev.get("min_orders") if prev.get("min_orders") is not None else MS_MIN_ORDERS_DEFAULT)
+    min_rating = float(prev.get("min_rating") if prev.get("min_rating") is not None else MS_MIN_RATING_DEFAULT)
+    min_commission = float(prev.get("min_commission") if prev.get("min_commission") is not None else MS_MIN_COMMISSION_DEFAULT)
+    free_ship_only = bool(prev.get("free_ship_only") if prev.get("free_ship_only") is not None else MS_FREE_SHIP_ONLY_DEFAULT)
+
 
     for p in (products or []):
         raw_count += 1
         row = _map_affiliate_product_to_row(p)
-        ok, reason = _ms_eval_row_filters(row)
-        if ok and len(passed_filters_rows) < 50:
-            passed_filters_rows.append(row)
-
-        # Extra strictness: reduce unrelated results (keyword must match title)
-        if ok and not _ms_keyword_match(row.get("Title") or "", q_variants, strict=not relaxed_match):
+        # Keyword match first (precision):
+        if not _ms_keyword_match(row.get("Title") or "", q_variants, strict=not relaxed_match):
             ok, reason = False, "לא תואם מילת החיפוש"
             if len(keyword_rejected_rows) < 50:
                 keyword_rejected_rows.append(row)
+        else:
+            ok, reason = _ms_eval_row_filters(row, min_orders=min_orders, min_rating=min_rating, min_commission=min_commission)
+            if ok and len(passed_filters_rows) < 50:
+                passed_filters_rows.append(row)
 
         if not ok:
             # bucket reasons (best-effort)
@@ -3737,6 +3774,25 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     # Debug log (helps diagnose empty results / filters)
     try:
         ok_count = sum(1 for it in results if it.get("ok"))
+        if MS_AUTO_RELAX_COMMISSION_ON_EMPTY and ok_count == 0 and reasons.get('commission', 0) > 0 and float(min_commission or 0) > 0:
+            # Re-run numeric filter with commission=0 while keeping strict keyword matching.
+            for it in results:
+                if it.get('ok'):
+                    continue
+                if it.get('reason') != 'commission':
+                    continue
+                row = it.get('row') or {}
+                if not _ms_keyword_match(row.get('Title') or '', q_variants, strict=not relaxed_match):
+                    continue
+                ok2, _ = _ms_eval_row_filters(row, min_orders=min_orders, min_rating=min_rating, min_commission=0.0)
+                if ok2:
+                    it['ok'] = True
+                    it['reason'] = ''
+            ok_count = sum(1 for it in results if it.get('ok'))
+            if ok_count > 0:
+                note = (note + '\n' if note else '') + f"ℹ️ שוחרר סף עמלה ({min_commission}%) לחיפוש הזה כדי להחזיר תוצאות (ההתאמה למילות החיפוש נשארה קפדנית)."
+                min_commission = 0.0
+
     except Exception:
         ok_count = 0
 
