@@ -1,6 +1,6 @@
-pyTelegramBotAPI>=4.0.0
-requests>=2.0.0
-openai>=1.30.0
-Flask>=3.0.0
-gunicorn>=21.2.0
-tzdata>=2024.1
+pyTelegramBotAPI>=4.14.0
+requests>=2.31.0
+urllib3>=2.0.0
+flask>=3.0.0
+gunicorn>=22.0.0
+tzdata

@@ -4600,6 +4600,7 @@ def _rate_panel_kb() -> "types.InlineKeyboardMarkup":
     kb.add(InlineKeyboardButton("↩️ חזרה", callback_data="rate_back"))
     return kb
 
+@bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
 
@@ -4611,6 +4612,7 @@ def on_inline_click(c):
     chat_id = c.message.chat.id
     msg_id = c.message.message_id
 
+    log_info(f\"[IN] cb={data} from uid={getattr(c.from_user,'id',None)} chat={chat_id}\")
     # Handle filter menus / callbacks
     if handle_filters_callback(c, data, chat_id):
         return
@@ -6042,123 +6044,104 @@ try:
     log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} (effective={OPENAI_MODEL_EFFECTIVE}) | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
 except Exception:
     pass
-    # ========= BOOTSTRAP / RUN MODES =========
-# Railway recommendation:
-# - Use webhook + gunicorn:  gunicorn -w 1 -b 0.0.0.0:$PORT main:app
-# - Set WEBHOOK_BASE_URL to your public domain (https://xxxx.up.railway.app)
+    _lock_handle = acquire_single_instance_lock(LOCK_PATH)
+    if _lock_handle is None:
+        print("Another instance is running (lock failed). Exiting.", flush=True)
+        sys.exit(1)
 
-USE_WEBHOOK = env_bool("USE_WEBHOOK", default=True)
-AUTO_SET_WEBHOOK_ON_STARTUP = env_bool("AUTO_SET_WEBHOOK_ON_STARTUP", default=True)
-STRICT_SINGLE_INSTANCE = env_bool("STRICT_SINGLE_INSTANCE", default=False)
-
-_bg_started = False
-_bg_lock = threading.Lock()
-
-def start_background_tasks():
-    """Start background loops once per process."""
-    global _bg_started
-    with _bg_lock:
-        if _bg_started:
-            return
-        _bg_started = True
-
+    print_webhook_info()
+    try:
+        force_delete_webhook()
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
         try:
-            if not os.path.exists(AUTO_FLAG_FILE):
-                write_auto_flag("on")
-        except Exception:
-            pass
+            bot.remove_webhook()
+        except Exception as e2:
+            print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+    print_webhook_info()
 
-        try:
-            t1 = threading.Thread(target=auto_post_loop, daemon=True)
-            t1.start()
-        except Exception as e:
-            log_warn(f"[BOOT] auto_post_loop thread failed to start: {e}")
+    if not os.path.exists(AUTO_FLAG_FILE):
+        write_auto_flag("on")
+    if not os.path.exists(BROADCAST_FLAG_FILE):
+        write_broadcast_flag("off")
 
-        try:
-            t2 = threading.Thread(target=refill_daemon, daemon=True)
-            t2.start()
-        except Exception as e:
-            log_warn(f"[BOOT] refill_daemon thread failed to start: {e}")
+    t1 = threading.Thread(target=auto_post_loop, daemon=True)
+    t1.start()
+# AI diagnostics (show clearly if AI is really enabled)
+try:
+    try:
+        import openai as _openai_pkg
+        log_info(f"[CFG] OPENAI_SDK_VERSION={getattr(_openai_pkg, '__version__', 'unknown')}")
+    except Exception:
+        pass
 
-        log_info("[BOOT] Background daemons started")
+    ai_state = "ON" if _ai_enabled() else "OFF"
+    ai_note = ""
+    if GPT_ENABLED and not OPENAI_API_KEY:
+        ai_note = " (missing OPENAI_API_KEY)"
+    elif GPT_ENABLED and OpenAI is None:
+        ai_note = " (missing 'openai' package)"
+    log_info(f"[CFG] AI={ai_state}{ai_note} | MODEL={OPENAI_MODEL} (effective={OPENAI_MODEL_EFFECTIVE}) | BATCH={GPT_BATCH_SIZE} | OVERWRITE={GPT_OVERWRITE} | ON_REFILL={GPT_ON_REFILL} | ON_UPLOAD={GPT_ON_UPLOAD}")
+except Exception as e:
+    log_error(f"[CFG] AI diagnostics failed: {e}")
+
+_lock_handle = acquire_single_instance_lock(LOCK_PATH)
+if _lock_handle is None:
+    print("Another instance is running (lock failed). Exiting.", flush=True)
+    sys.exit(1)
+
+print_webhook_info()
+try:
+    force_delete_webhook()
+    bot.delete_webhook(drop_pending_updates=True)
+except Exception:
+    try:
+        bot.remove_webhook()
+    except Exception as e2:
+        print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+print_webhook_info()
+
+if not os.path.exists(AUTO_FLAG_FILE):
+    write_auto_flag("on")
+
+t1 = threading.Thread(target=auto_post_loop, daemon=True)
+t1.start()
+
+t2 = threading.Thread(target=refill_daemon, daemon=True)
+t2.start()
+
 
 def _wait_for_telegram_ready(max_sleep: int = 60):
-    """Block until Telegram API responds to getMe (handles boot/network hiccups)."""
-    if not BOT_TOKEN:
-        return
+    """Block until Telegram API responds to getMe, to avoid noisy crashes on boot/network hiccups."""
     delay = 2
     while True:
         try:
             bot.get_me()
             return
         except Exception as e:
-            log_warn(f"[BOOT] Telegram getMe failed: {e}. Retrying in {delay}s...")
+            try:
+                log_error(f"Telegram getMe failed: {e}. Retrying in {delay}s...")
+            except Exception:
+                print(f"[ERROR] Telegram getMe failed: {e}. Retrying in {delay}s...", flush=True)
             time.sleep(delay)
             delay = min(max_sleep, delay * 2)
 
-def _run_polling_forever():
-    """Long-polling mode (works without public domain, but may conflict if multiple instances run)."""
-    log_info("[BOOT] Polling mode ON (getUpdates)")
-    # Ensure webhook is off to avoid conflicts
+# Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
+while True:
     try:
-        print_webhook_info()
-        force_delete_webhook()
-        bot.delete_webhook(drop_pending_updates=True)
-        print_webhook_info()
-    except Exception as e:
-        log_warn(f"[BOOT] deleteWebhook failed (continuing): {e}")
-
-    start_background_tasks()
-
-    while True:
+        _wait_for_telegram_ready()    if not USE_WEBHOOK:
+        # Legacy polling mode (not recommended on Railway)
         try:
-            _wait_for_telegram_ready()
-            try:
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, interval=1)
-            except TypeError:
-                # older pyTelegramBotAPI versions
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception as e:
-            msg = str(e)
-            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-            log_error(f"[BOOT] Polling error: {e}. Retrying in {wait}s...")
-            time.sleep(wait)
-
-def _ensure_webhook_once():
-    """Best-effort: wait for Telegram and set webhook."""
-    try:
-        _wait_for_telegram_ready()
-        ok = _set_webhook()
-        if not ok:
-            log_warn("[BOOT] setWebhook failed (see warnings above).")
-    except Exception as e:
-        log_warn(f"[BOOT] ensure_webhook failed: {e}")
-
-# Acquire single-instance lock (local FS). Optional: don't crash gunicorn workers by default.
-_lock_handle = None
-try:
-    _lock_handle = acquire_single_instance_lock(LOCK_PATH)
-    if _lock_handle is None and STRICT_SINGLE_INSTANCE:
-        print("Another instance is running (lock failed). Exiting.", flush=True)
-        sys.exit(1)
-except Exception as e:
-    log_warn(f"[BOOT] single-instance lock failed (continuing): {e}")
-
-# In webhook mode under gunicorn: do NOT start polling/app.run here.
-# We only start background tasks + setWebhook in a background thread.
-if USE_WEBHOOK:
-    start_background_tasks()
-    if AUTO_SET_WEBHOOK_ON_STARTUP:
-        threading.Thread(target=_ensure_webhook_once, daemon=True).start()
-
-if __name__ == "__main__":
-    # Local/dev execution (Railway should use gunicorn).
-    if USE_WEBHOOK:
-        start_background_tasks()
-        if AUTO_SET_WEBHOOK_ON_STARTUP:
-            _ensure_webhook_once()
-        port = int(os.getenv("PORT", "8080"))
-        print(f"[BOOT] Webhook DEV server listening on 0.0.0.0:{port}", flush=True)
-        app.run(host="0.0.0.0", port=port)
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, interval=1)
+        except TypeError:
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     else:
-        _run_polling_forever()
+        _set_webhook()
+        port = int(os.getenv('PORT', '8080'))
+        print(f"[BOOT] Webhook mode ON. Listening on 0.0.0.0:{port}", flush=True)
+        app.run(host='0.0.0.0', port=port)
+    except Exception as e:
+        msg = str(e)
+        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+        log_error(f"Polling error: {e}. Retrying in {wait}s...")
+        time.sleep(wait)
