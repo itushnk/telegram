@@ -274,7 +274,6 @@ PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
 PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 
 SCHEDULE_FLAG_FILE      = os.path.join(BASE_DIR, "schedule_enforced.flag")
-CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 BROADCAST_FLAG_FILE     = os.path.join(BASE_DIR, "broadcast_enabled.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
@@ -1494,12 +1493,15 @@ def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup
 
         try:
             bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception:
+        except Exception as e1:
             # Try caption edit (for media messages)
             try:
                 bot.edit_message_caption(chat_id=chat_id, message_id=message.message_id, caption=new_text, reply_markup=reply_markup, parse_mode=parse_mode)
-            except Exception:
-                pass
+            except Exception as e2:
+                try:
+                    log_error(f"safe_edit_message edit failed: {e1} | caption failed: {e2} | {cb_info or ''}")
+                except Exception:
+                    pass
 
         if cb_id:
             try:
@@ -3384,6 +3386,7 @@ def _translate_query_for_search(q: str) -> str:
         "נעלי ספורט": "running shoes",
         "סניקרס": "sneakers",
         "כפכפים": "slippers",
+        "נעלי בית": "house slippers",
         "מגפיים": "boots",
         "מעיל": "jacket",
         "מעילים": "jackets",
@@ -3405,6 +3408,8 @@ def _translate_query_for_search(q: str) -> str:
         "מצלמת רכב": "dash cam",
         "קופסה": "box",
         "כיסוי": "cover",
+        "כובע": "hat",
+        "כובע שמש": "sun hat",
         "מגן": "protector",
         "מגן מסך": "screen protector",
         "טלפון": "phone",
@@ -3455,24 +3460,31 @@ def _translate_query_for_search(q: str) -> str:
                 out.append(p2)
 
     fallback = " ".join(out).strip()
-    # If fallback is still identical Hebrew, we can try GPT if enabled; else return as-is.
-    if (GPT_ENABLED and GPT_TRANSLATE_SEARCH and OPENAI_API_KEY):
+    # If fallback is still Hebrew, try OpenAI translation (enabled by default when API key exists).
+    use_gpt = bool(OPENAI_API_KEY) and env_bool("MS_USE_GPT_TRANSLATE", True)
+    if use_gpt:
         try:
             resp = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "Translate Hebrew product search to short English shopping keywords. Output only keywords."},
+                    {"role": "system", "content": "Translate Hebrew to short English shopping keywords for AliExpress search. Output ONLY the keywords (no punctuation, no quotes)."},
                     {"role": "user", "content": q},
                 ],
                 temperature=0,
-                max_tokens=12,
+                max_tokens=18,
             )
             t = (resp.choices[0].message.content or "").strip()
             t = re.sub(r"[^0-9A-Za-z\s\-]", " ", t).strip()
             t = re.sub(r"\s+", " ", t).strip()
-            return t or fallback or q
-        except Exception:
-            return fallback or q
+            if t:
+                return t
+        except Exception as e:
+            try:
+                _logger.info(f"[MS] translate_query failed: {e}")
+            except Exception:
+                pass
+
+    return fallback or q
 
     return fallback or q
 
@@ -4538,7 +4550,6 @@ def inline_menu():
 
     kb.add(
         types.InlineKeyboardButton("🔎 חיפוש", callback_data="prod_search"),
-        types.InlineKeyboardButton("₪ המרת $→₪ (לקובץ הבא)", callback_data="convert_next"),
         types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"),
     )
 
@@ -5378,17 +5389,6 @@ def on_inline_click(c):
                           new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
                           reply_markup=inline_menu(), cb_id=c.id)
 
-    elif data == "convert_next":
-        try:
-            with open(CONVERT_NEXT_FLAG_FILE, "w", encoding="utf-8") as f:
-                f.write(str(USD_TO_ILS_RATE_DEFAULT))
-            safe_edit_message(
-                bot, chat_id=chat_id, message=c.message,
-                new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
-                reply_markup=inline_menu(), cb_id=c.id
-            )
-        except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
 
     elif data == "reset_from_data":
         src = read_products(DATA_CSV)
@@ -5703,16 +5703,10 @@ def on_document(msg):
         rows_raw = [dict(r) for r in raw_reader]
 
         convert_rate = None
-        if os.path.exists(CONVERT_NEXT_FLAG_FILE):
-            try:
-                with open(CONVERT_NEXT_FLAG_FILE, "r", encoding="utf-8") as f:
-                    convert_rate = float((f.read() or "").strip() or USD_TO_ILS_RATE_DEFAULT)
-            except Exception:
-                convert_rate = USD_TO_ILS_RATE_DEFAULT
-            try:
-                os.remove(CONVERT_NEXT_FLAG_FILE)
-            except Exception:
-                pass
+        try:
+            convert_rate = float(USD_TO_ILS_RATE)
+        except Exception:
+            convert_rate = USD_TO_ILS_RATE_DEFAULT
 
         rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
 

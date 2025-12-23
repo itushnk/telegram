@@ -1,0 +1,108 @@
+You reached the start of the range
+Dec 23, 2025, 4:21 PM
+Starting Container
+[2025-12-23 14:23:41 +0000] [1] [INFO] Starting gunicorn 23.0.0
+[2025-12-23 14:23:41 +0000] [1] [INFO] Listening at: http://0.0.0.0:8080 (1)
+[2025-12-23 14:23:41 +0000] [1] [INFO] Using worker: sync
+[2025-12-23 14:23:41 +0000] [4] [INFO] Booting worker with pid: 4
+[CFG] Telegram HTTP session configured (retries/backoff/timeout).
+[INFO] Refill daemon started
+[CFG] setWebhook -> True | url=https://telegram-production-4654.up.railway.app/webhook/8301372230:AAHYyvCYjuzFwIFy5fG_b_uNsrFXzeUsWkc
+[2025-12-23 14:23:44,260] INFO [CFG] AI=ON | MODEL=gpt-4.1 (effective=gpt-4.1) | BATCH=10 | OVERWRITE=True | ON_REFILL=True | ON_UPLOAD=True
+INFO:bot:[CFG] AI=ON | MODEL=gpt-4.1 (effective=gpt-4.1) | BATCH=10 | OVERWRITE=True | ON_REFILL=True | ON_UPLOAD=True
+[2025-12-23 14:23:44,260] INFO [CFG] OPENAI_SDK_VERSION=2.14.0
+INFO:bot:[CFG] OPENAI_SDK_VERSION=2.14.0
+[2025-12-23 14:23:44,260] INFO [CFG] AI=ON | MODEL=gpt-4.1 (effective=gpt-4.1) | BATCH=10 | OVERWRITE=True | ON_REFILL=True | ON_UPLOAD=True
+INFO:bot:[CFG] AI=ON | MODEL=gpt-4.1 (effective=gpt-4.1) | BATCH=10 | OVERWRITE=True | ON_REFILL=True | ON_UPLOAD=True
+getWebhookInfo: {'ok': True, 'result': {'url': 'https://telegram-production-4654.up.railway.app/webhook/8301372230:AAHYyvCYjuzFwIFy5fG_b_uNsrFXzeUsWkc', 'has_custom_certificate': False, 'pending_update_count': 0, 'max_connections': 40, 'ip_address': '66.33.22.119'}}
+getWebhookInfo: {'ok': True, 'result': {'url': 'https://telegram-production-4654.up.railway.app/webhook/8301372230:AAHYyvCYjuzFwIFy5fG_b_uNsrFXzeUsWkc', 'has_custom_certificate': False, 'pending_update_count': 0, 'max_connections': 40, 'ip_address': '66.33.22.119'}}
+[2025-12-23 14:24:08,983] INFO [IN] /start|/help|/menu from uid=535299257 chat=535299257
+INFO:bot:[IN] /start|/help|/menu from uid=535299257 chat=535299257
+[2025-12-23 14:24:09,086] INFO [OUT] menu sent to chat=535299257
+INFO:bot:[OUT] menu sent to chat=535299257
+[2025-12-23 14:24:17,878] INFO [IN] cb=convert_next from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=convert_next from uid=535299257 chat=535299257
+[2025-12-23 14:24:22,837] INFO [IN] cb=convert_next from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=convert_next from uid=535299257 chat=535299257
+[2025-12-23 14:24:39,774] INFO [IN] cb=flt_menu from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=flt_menu from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=pf_menu from uid=535299257 chat=535299257
+[2025-12-23 14:24:43,579] INFO [IN] cb=pf_menu from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=fcmm_menu from uid=535299257 chat=535299257
+[2025-12-23 14:25:03,123] INFO [IN] cb=fcmm_menu from uid=535299257 chat=535299257
+[2025-12-23 14:25:04,203] INFO [IN] cb=fcm_set_7 from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=fcm_set_7 from uid=535299257 chat=535299257
+[2025-12-23 14:25:07,734] INFO [IN] cb=flt_menu from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=flt_menu from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=fs_toggle from uid=535299257 chat=535299257
+[2025-12-23 14:25:09,823] INFO [IN] cb=fs_toggle from uid=535299257 chat=535299257
+[2025-12-23 14:25:12,338] INFO [IN] cb=flt_back from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=flt_back from uid=535299257 chat=535299257
+[2025-12-23 14:25:13,758] INFO [IN] cb=prod_search from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=prod_search from uid=535299257 chat=535299257
+[2025-12-23 14:25:15,483] INFO [IN] cb=ps_item from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=ps_item from uid=535299257 chat=535299257
+[2025-12-23 14:25:26,524] INFO [PRICE] item=1005008248145119 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.54' sale_txt='2.54' sale_disp=2.54 orig_key=target_original_price orig_raw='5.09' orig_txt='5.09' orig_disp=5.09
+INFO:bot:[PRICE] item=1005008248145119 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.54' sale_txt='2.54' sale_disp=2.54 orig_key=target_original_price orig_raw='5.09' orig_txt='5.09' orig_disp=5.09
+[2025-12-23 14:25:26,525] INFO [PRICE] item=1005008554771017 input=USD convert=False sale_key=target_app_sale_price sale_raw='6.13' sale_txt='6.13' sale_disp=6.13 orig_key=target_original_price orig_raw='12.25' orig_txt='12.25' orig_disp=12.25
+INFO:bot:[PRICE] item=1005008554771017 input=USD convert=False sale_key=target_app_sale_price sale_raw='6.13' sale_txt='6.13' sale_disp=6.13 orig_key=target_original_price orig_raw='12.25' orig_txt='12.25' orig_disp=12.25
+[2025-12-23 14:25:26,525] INFO [PRICE] item=1005006678251153 input=USD convert=False sale_key=target_app_sale_price sale_raw='3.17' sale_txt='3.17' sale_disp=3.17 orig_key=target_original_price orig_raw='6.34' orig_txt='6.34' orig_disp=6.34
+INFO:bot:[PRICE] item=1005006678251153 input=USD convert=False sale_key=target_app_sale_price sale_raw='3.17' sale_txt='3.17' sale_disp=3.17 orig_key=target_original_price orig_raw='6.34' orig_txt='6.34' orig_disp=6.34
+[2025-12-23 14:25:26,525] INFO [PRICE] item=1005008248057540 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.27' sale_txt='2.27' sale_disp=2.27 orig_key=target_original_price orig_raw='4.54' orig_txt='4.54' orig_disp=4.54
+INFO:bot:[PRICE] item=1005008248057540 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.27' sale_txt='2.27' sale_disp=2.27 orig_key=target_original_price orig_raw='4.54' orig_txt='4.54' orig_disp=4.54
+[2025-12-23 14:25:26,526] INFO [PRICE] item=1005008666353671 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.20' sale_txt='2.20' sale_disp=2.20 orig_key=target_original_price orig_raw='4.41' orig_txt='4.41' orig_disp=4.41
+INFO:bot:[PRICE] item=1005008666353671 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.20' sale_txt='2.20' sale_disp=2.20 orig_key=target_original_price orig_raw='4.41' orig_txt='4.41' orig_disp=4.41
+[2025-12-23 14:25:26,526] INFO [PRICE] item=1005008554736140 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.50' sale_txt='2.50' sale_disp=2.50 orig_key=target_original_price orig_raw='5.01' orig_txt='5.01' orig_disp=5.01
+INFO:bot:[PRICE] item=1005008554736140 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.50' sale_txt='2.50' sale_disp=2.50 orig_key=target_original_price orig_raw='5.01' orig_txt='5.01' orig_disp=5.01
+[2025-12-23 14:25:26,526] INFO [PRICE] item=1005008558884860 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.45' sale_txt='2.45' sale_disp=2.45 orig_key=target_original_price orig_raw='4.91' orig_txt='4.91' orig_disp=4.91
+INFO:bot:[PRICE] item=1005008558884860 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.45' sale_txt='2.45' sale_disp=2.45 orig_key=target_original_price orig_raw='4.91' orig_txt='4.91' orig_disp=4.91
+[2025-12-23 14:25:26,526] INFO [PRICE] item=1005006782807787 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.85' sale_txt='2.85' sale_disp=2.85 orig_key=target_original_price orig_raw='5.70' orig_txt='5.70' orig_disp=5.70
+INFO:bot:[PRICE] item=1005006782807787 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.85' sale_txt='2.85' sale_disp=2.85 orig_key=target_original_price orig_raw='5.70' orig_txt='5.70' orig_disp=5.70
+[2025-12-23 14:25:26,526] INFO [PRICE] item=1005007168655432 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.37' sale_txt='2.37' sale_disp=2.37 orig_key=target_original_price orig_raw='4.95' orig_txt='4.95' orig_disp=4.95
+INFO:bot:[MS] q_user='נעלי בית' q_sent='נעלי בית' page=1 raw=10 ok=1 resp_code=200 resp_msg='Call succeeds' reasons={'no_link': 0, 'price': 0, 'orders': 0, 'rating': 0, 'commission': 0, 'free_ship': 0, 'other': 10} min_orders=300 min_rating=90.0 min_commission=7.0 free_ship_only=True strict_match=True price_in=USD convert=False rate=3.55 display=USD
+INFO:bot:[PRICE] item=1005007168655432 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.37' sale_txt='2.37' sale_disp=2.37 orig_key=target_original_price orig_raw='4.95' orig_txt='4.95' orig_disp=4.95
+[2025-12-23 14:25:26,526] INFO [PRICE] item=1005008247990910 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.05' sale_txt='2.05' sale_disp=2.05 orig_key=target_original_price orig_raw='4.10' orig_txt='4.10' orig_disp=4.10
+INFO:bot:[PRICE] item=1005008247990910 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.05' sale_txt='2.05' sale_disp=2.05 orig_key=target_original_price orig_raw='4.10' orig_txt='4.10' orig_disp=4.10
+[2025-12-23 14:25:26,527] INFO [MS] q_user='נעלי בית' q_sent='נעלי בית' page=1 raw=10 ok=1 resp_code=200 resp_msg='Call succeeds' reasons={'no_link': 0, 'price': 0, 'orders': 0, 'rating': 0, 'commission': 0, 'free_ship': 0, 'other': 10} min_orders=300 min_rating=90.0 min_commission=7.0 free_ship_only=True strict_match=True price_in=USD convert=False rate=3.55 display=USD
+[2025-12-23 14:25:40,408] INFO [IN] cb=ms_next from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=ms_next from uid=535299257 chat=535299257
+[2025-12-23 14:25:57,571] INFO [IN] cb=ms_back from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=ms_back from uid=535299257 chat=535299257
+[2025-12-23 14:25:59,719] INFO [IN] cb=prod_search from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=prod_search from uid=535299257 chat=535299257
+[2025-12-23 14:26:02,029] INFO [IN] cb=ps_item from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=ps_item from uid=535299257 chat=535299257
+[2025-12-23 14:26:11,366] INFO [PRICE] item=1005008248145119 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.54' sale_txt='2.54' sale_disp=2.54 orig_key=target_original_price orig_raw='5.09' orig_txt='5.09' orig_disp=5.09
+INFO:bot:[PRICE] item=1005008248145119 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.54' sale_txt='2.54' sale_disp=2.54 orig_key=target_original_price orig_raw='5.09' orig_txt='5.09' orig_disp=5.09
+[2025-12-23 14:26:11,366] INFO [PRICE] item=1005008554771017 input=USD convert=False sale_key=target_app_sale_price sale_raw='6.13' sale_txt='6.13' sale_disp=6.13 orig_key=target_original_price orig_raw='12.25' orig_txt='12.25' orig_disp=12.25
+INFO:bot:[PRICE] item=1005008554771017 input=USD convert=False sale_key=target_app_sale_price sale_raw='6.13' sale_txt='6.13' sale_disp=6.13 orig_key=target_original_price orig_raw='12.25' orig_txt='12.25' orig_disp=12.25
+[2025-12-23 14:26:11,366] INFO [PRICE] item=1005006678251153 input=USD convert=False sale_key=target_app_sale_price sale_raw='3.17' sale_txt='3.17' sale_disp=3.17 orig_key=target_original_price orig_raw='6.34' orig_txt='6.34' orig_disp=6.34
+INFO:bot:[PRICE] item=1005006678251153 input=USD convert=False sale_key=target_app_sale_price sale_raw='3.17' sale_txt='3.17' sale_disp=3.17 orig_key=target_original_price orig_raw='6.34' orig_txt='6.34' orig_disp=6.34
+[2025-12-23 14:26:11,367] INFO [PRICE] item=1005009116309876 input=USD convert=False sale_key=target_app_sale_price sale_raw='6.64' sale_txt='6.64' sale_disp=6.64 orig_key=target_original_price orig_raw='13.28' orig_txt='13.28' orig_disp=13.28
+INFO:bot:[PRICE] item=1005009116309876 input=USD convert=False sale_key=target_app_sale_price sale_raw='6.64' sale_txt='6.64' sale_disp=6.64 orig_key=target_original_price orig_raw='13.28' orig_txt='13.28' orig_disp=13.28
+INFO:bot:[PRICE] item=1005008558884860 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.45' sale_txt='2.45' sale_disp=2.45 orig_key=target_original_price orig_raw='4.91' orig_txt='4.91' orig_disp=4.91
+[2025-12-23 14:26:11,367] INFO [PRICE] item=1005006782807787 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.85' sale_txt='2.85' sale_disp=2.85 orig_key=target_original_price orig_raw='5.70' orig_txt='5.70' orig_disp=5.70
+INFO:bot:[PRICE] item=1005006782807787 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.85' sale_txt='2.85' sale_disp=2.85 orig_key=target_original_price orig_raw='5.70' orig_txt='5.70' orig_disp=5.70
+[2025-12-23 14:26:11,367] INFO [PRICE] item=1005008666353671 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.20' sale_txt='2.20' sale_disp=2.20 orig_key=target_original_price orig_raw='4.41' orig_txt='4.41' orig_disp=4.41
+INFO:bot:[PRICE] item=1005008666353671 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.20' sale_txt='2.20' sale_disp=2.20 orig_key=target_original_price orig_raw='4.41' orig_txt='4.41' orig_disp=4.41
+[2025-12-23 14:26:11,367] INFO [PRICE] item=1005008554736140 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.50' sale_txt='2.50' sale_disp=2.50 orig_key=target_original_price orig_raw='5.01' orig_txt='5.01' orig_disp=5.01
+INFO:bot:[PRICE] item=1005008554736140 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.50' sale_txt='2.50' sale_disp=2.50 orig_key=target_original_price orig_raw='5.01' orig_txt='5.01' orig_disp=5.01
+[2025-12-23 14:26:11,367] INFO [PRICE] item=1005008558884860 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.45' sale_txt='2.45' sale_disp=2.45 orig_key=target_original_price orig_raw='4.91' orig_txt='4.91' orig_disp=4.91
+[2025-12-23 14:26:11,367] INFO [PRICE] item=1005007168655432 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.37' sale_txt='2.37' sale_disp=2.37 orig_key=target_original_price orig_raw='4.95' orig_txt='4.95' orig_disp=4.95
+INFO:bot:[PRICE] item=1005007168655432 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.37' sale_txt='2.37' sale_disp=2.37 orig_key=target_original_price orig_raw='4.95' orig_txt='4.95' orig_disp=4.95
+[2025-12-23 14:26:11,367] INFO [PRICE] item=1005008247990910 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.05' sale_txt='2.05' sale_disp=2.05 orig_key=target_original_price orig_raw='4.10' orig_txt='4.10' orig_disp=4.10
+INFO:bot:[PRICE] item=1005008247990910 input=USD convert=False sale_key=target_app_sale_price sale_raw='2.05' sale_txt='2.05' sale_disp=2.05 orig_key=target_original_price orig_raw='4.10' orig_txt='4.10' orig_disp=4.10
+[2025-12-23 14:26:11,367] INFO [MS] q_user='כובע שמש' q_sent='כובע שמש' page=1 raw=10 ok=0 resp_code=200 resp_msg='Call succeeds' reasons={'no_link': 0, 'price': 0, 'orders': 0, 'rating': 0, 'commission': 0, 'free_ship': 0, 'other': 10} min_orders=300 min_rating=90.0 min_commission=7.0 free_ship_only=True strict_match=True price_in=USD convert=False rate=3.55 display=USD
+INFO:bot:[MS] q_user='כובע שמש' q_sent='כובע שמש' page=1 raw=10 ok=0 resp_code=200 resp_msg='Call succeeds' reasons={'no_link': 0, 'price': 0, 'orders': 0, 'rating': 0, 'commission': 0, 'free_ship': 0, 'other': 10} min_orders=300 min_rating=90.0 min_commission=7.0 free_ship_only=True strict_match=True price_in=USD convert=False rate=3.55 display=USD
+[2025-12-23 14:26:16,242] INFO [IN] cb=ms_next from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=ms_next from uid=535299257 chat=535299257
+[2025-12-23 14:26:43,332] INFO [IN] /start|/help|/menu from uid=535299257 chat=535299257
+INFO:bot:[IN] /start|/help|/menu from uid=535299257 chat=535299257
+[2025-12-23 14:26:43,386] INFO [OUT] menu sent to chat=535299257
+INFO:bot:[OUT] menu sent to chat=535299257
+[2025-12-23 14:26:48,862] INFO [IN] cb=prod_search from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=prod_search from uid=535299257 chat=535299257
+[2025-12-23 14:26:51,394] INFO [IN] cb=ps_set_rate from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=ps_set_rate from uid=535299257 chat=535299257
+[2025-12-23 14:26:54,295] INFO [IN] cb=ps_set_rate from uid=535299257 chat=535299257
+INFO:bot:[IN] cb=ps_set_rate from uid=535299257 chat=535299257
