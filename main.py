@@ -6130,7 +6130,8 @@ def _wait_for_telegram_ready(max_sleep: int = 60):
 # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
 while True:
     try:
-        _wait_for_telegram_ready()    if not USE_WEBHOOK:
+        _wait_for_telegram_ready()
+    if not USE_WEBHOOK:
         # Legacy polling mode (not recommended on Railway)
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, interval=1)
