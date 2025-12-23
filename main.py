@@ -13,6 +13,19 @@ Changes vs previous:
 
 import html
 import os, sys
+
+def _set_state_float(key: str, value: float | None):
+    """
+    Persist an optional float in bot state.
+    - None clears the key.
+    """
+    if value is None:
+        _set_state_str(key, "")
+        return
+    _set_state_str(key, str(float(value)))
+
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     """Parse environment boolean flags safely.
     Accepts: 1/0, true/false, yes/no, on/off (case-insensitive).
@@ -103,14 +116,20 @@ def _get_state_int(key: str, default: int = 0) -> int:
     except Exception:
         return int(default)
 
-def _get_state_float(key: str, default: float = 0.0) -> float:
+def _get_state_float(key: str, default: float | None = 0.0) -> float | None:
+    """
+    Read a float from persistent bot state. If the key is missing/empty or parsing fails,
+    returns `default` (which may be None).
+    """
     try:
-        s = _get_state_str(key, str(default))
-        if s == "":
-            return float(default)
-        return float(s)
+        # Empty string means "unset"
+        raw_default = "" if default is None else str(default)
+        s = _get_state_str(key, raw_default)
+        if s is None or str(s).strip() == "":
+            return default
+        return float(str(s).strip())
     except Exception:
-        return float(default)
+        return default
 
 def _get_state_bool(key: str, default: bool = False) -> bool:
     s = _get_state_str(key, "1" if default else "0").lower()
@@ -2968,17 +2987,24 @@ def _price_filter_menu_kb():
         btns.append(types.InlineKeyboardButton(f"{mark}₪ {label}", callback_data="pf_" + suffix))
     kb.add(*btns)
 
+    pr_min = _get_state_float("PRICE_RANGE_MIN", None)
+    pr_max = _get_state_float("PRICE_RANGE_MAX", None)
+    pr_txt = "ללא"
+    if pr_min is not None or pr_max is not None:
+        a = "" if pr_min is None else f"{float(pr_min):g}"
+        b = "" if pr_max is None else f"{float(pr_max):g}"
+        pr_txt = f"{a}-{b}".strip("-") or "ללא"
+
+    kb.add(
+        types.InlineKeyboardButton("🎚️ טווח מותאם", callback_data="pf_range_custom"),
+        types.InlineKeyboardButton("🧽 נקה טווח", callback_data="pf_range_clear"),
+    )
     kb.add(
         types.InlineKeyboardButton("🧹 נקה סינון", callback_data="pf_clear"),
         types.InlineKeyboardButton("⬅️ חזרה", callback_data="pf_back"),
     )
-    kb.add(types.InlineKeyboardButton(f"מצב נוכחי: {AE_PRICE_BUCKETS_RAW or 'ללא'}", callback_data="noop_info"))
+    kb.add(types.InlineKeyboardButton(f"מצב נוכחי: סלים={AE_PRICE_BUCKETS_RAW or 'ללא'} | טווח={pr_txt} ({DISPLAY_CURRENCY})", callback_data="noop_info"))
     return kb
-
-
-# ========= Additional Filters UI & Category list =========
-CATEGORIES_CACHE_PATH = os.path.join(LOG_DIR, "categories_cache.json")
-_CATEGORIES_CACHE = None  # list of dicts: {"id": "...", "name": "..."}
 
 def _load_categories_cache():
     global _CATEGORIES_CACHE
@@ -3349,6 +3375,10 @@ RATE_SET_WAIT: dict[int, bool] = {}        # uid -> waiting for rate text?
 RATE_SET_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
 RATE_SET_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
 
+PRICE_RANGE_WAIT: dict[int, bool] = {}      # uid -> waiting for custom price range text?
+PRICE_RANGE_CTX: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, menu_message_id)
+PRICE_RANGE_PROMPT: dict[int, tuple[int, int]] = {}  # uid -> (chat_id, prompt_message_id)
+
 # --- Manual PRODUCT search preview session (per admin user) ---
 # Stores last fetched results for a keyword so you can review what was found BEFORE adding to queue.
 MANUAL_SEARCH_SESS: dict[int, dict] = {}  # uid -> {q, page, per_page, results:[{row,ok,reason}], idx}
@@ -3648,8 +3678,19 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
     except Exception:
         return False
 
-def _ms_eval_row_filters(row: dict, *, min_orders: int | None = None, min_rating: float | None = None, min_commission: float | None = None) -> tuple[bool, str]:
-    """Return (ok, reason_if_not_ok). Mirrors refill filters so preview matches what will be queued."""
+def _ms_eval_row_filters(
+    row: dict,
+    *,
+    min_orders: int | None = None,
+    min_rating: float | None = None,
+    min_commission: float | None = None,
+) -> tuple[bool, str]:
+    """
+    Return (ok, reason_if_not_ok).
+
+    Mirrors refill-style filters so the manual-search preview matches what will be queued.
+    Allows overriding thresholds (used for soft fallback/relax).
+    """
     mo = MIN_ORDERS if min_orders is None else int(min_orders)
     mr = MIN_RATING if min_rating is None else float(min_rating)
     mc = MIN_COMMISSION if min_commission is None else float(min_commission)
@@ -3659,26 +3700,44 @@ def _ms_eval_row_filters(row: dict, *, min_orders: int | None = None, min_rating
         sale_num = _extract_float(row.get("SalePrice") or "")
         if sale_num is None or not _price_in_buckets(float(sale_num), AE_PRICE_BUCKETS):
             return False, "מחוץ לסינון מחיר"
+
+    # Custom price range (display currency)
+    pr_min = _get_state_float("PRICE_RANGE_MIN", None)
+    pr_max = _get_state_float("PRICE_RANGE_MAX", None)
+    if pr_min is not None or pr_max is not None:
+        sale_num = _extract_float(row.get("SalePrice") or "")
+        if sale_num is None:
+            return False, "מחיר חסר"
+        v = float(sale_num)
+        if pr_min is not None and v < float(pr_min):
+            return False, f"מתחת לטווח מחיר ({pr_min:g})"
+        if pr_max is not None and v > float(pr_max):
+            return False, f"מעל טווח מחיר ({pr_max:g})"
+
     # Orders
     if mo:
         o = safe_int(row.get("Orders") or "0", 0)
         if o < int(mo):
-            return False, f"פחות מ-{MIN_ORDERS} הזמנות"
+            return False, f"פחות מ-{mo} הזמנות"
+
     # Rating
     if mr:
         r = _extract_float(row.get("Rating") or "")
         if r is None or float(r) < float(mr):
-            return False, f"דירוג נמוך מ-{MIN_RATING}%"
+            return False, f"דירוג מתחת ל-{mr:.0f}%"
+
     # Commission
     if mc:
-        c = _commission_percent(row.get("CommissionRate") or "")
-        c = float(c or 0.0)
-        if c < float(mc):
-            return False, f"עמלה נמוכה מ-{MIN_COMMISSION:g}%"
-    # FREE_SHIP_ONLY: Affiliate responses don't reliably include shipping cost; skip filtering here.
-    # Buy link
-    if not (row.get("BuyLink") or "").strip():
-        return False, "אין קישור רכישה"
+        c = _extract_float(row.get("Commission") or "")
+        if c is None or float(c) < float(mc):
+            return False, f"עמלה מתחת ל-{mc:.0f}%"
+
+    # Free shipping
+    if FREE_SHIP_ONLY:
+        ship_cost = _extract_float(row.get("ShipCost") or "0") or 0.0
+        if ship_cost > 0:
+            return False, "לא משלוח חינם"
+
     return True, ""
 
 def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False, relaxed_match: bool = False) -> dict:
@@ -4620,7 +4679,12 @@ def inline_menu():
 
     cur_mins = max(1, int(POST_DELAY_SECONDS // 60))
     kb.add(
-        types.InlineKeyboardButton(f"⏱️ מרווח פרסום: {cur_mins} דק׳ (עריכה)", callback_data="set_delay_minutes"),
+        types.InlineKeyboardButton("⏱️ 1 דק׳", callback_data="delay_set_60"),
+        types.InlineKeyboardButton("⏱️ 2 דק׳", callback_data="delay_set_120"),
+        types.InlineKeyboardButton("⏱️ 5 דק׳", callback_data="delay_set_300"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"✍️ מרווח מותאם: {cur_mins} דק׳", callback_data="set_delay_minutes"),
     )
 
     kb.add(
@@ -4690,10 +4754,9 @@ def _prod_search_menu_kb():
     )
     kb.add(
         types.InlineKeyboardButton("💰 עמלה", callback_data="ps_comm"),
-        types.InlineKeyboardButton("💱 מטבע/המרה", callback_data="ps_price_cfg"),
+        types.InlineKeyboardButton("💱 שער/המרה", callback_data="rate_panel"),
     )
     kb.add(
-        types.InlineKeyboardButton("🔢 קבע שער", callback_data="ps_set_rate"),
         types.InlineKeyboardButton("↩️ חזרה לתפריט", callback_data="ps_back_main"),
     )
     return kb
@@ -4737,6 +4800,9 @@ def on_inline_click(c):
         return
 
     data = c.data or ""
+    if data == "noop_info":
+        bot.answer_callback_query(c.id)
+        return
     chat_id = c.message.chat.id
     msg_id = c.message.message_id
 
@@ -4844,65 +4910,27 @@ def on_inline_click(c):
         return
 
     if data == "ps_price_cfg":
+        # Deprecated menu (kept for backward compatibility) -> redirect to the unified conversion/rate panel
         bot.answer_callback_query(c.id)
-        text = (
-            "💱 <b>תצורת מחיר</b>\n"
-            f"מטבע מקור: <b>{AE_PRICE_INPUT_CURRENCY}</b>\n"
-            f"המרה $→₪: <b>{'כן' if AE_PRICE_CONVERT_USD_TO_ILS else 'לא'}</b>\n"
-            f"שער USD→ILS: <b>{float(USD_TO_ILS_RATE):g}</b>"
+        safe_edit_message(
+            bot,
+            chat_id=chat_id,
+            message=c.message,
+            new_text=_rate_panel_text(),
+            reply_markup=_rate_panel_kb(),
+            parse_mode="HTML",
+            cb_id=c.id,
         )
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("מטבע: ILS", callback_data="ps_cur_ils"),
-            types.InlineKeyboardButton("מטבע: USD", callback_data="ps_cur_usd"),
-        )
-        kb.add(
-            types.InlineKeyboardButton("המרה: ON", callback_data="ps_conv_on"),
-            types.InlineKeyboardButton("המרה: OFF", callback_data="ps_conv_off"),
-        )
-        kb.add(
-            types.InlineKeyboardButton("🔢 קבע שער", callback_data="ps_set_rate"),
-            types.InlineKeyboardButton("↩️ חזרה", callback_data="ps_back"),
-        )
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=kb, parse_mode="HTML", cb_id=c.id)
         return
-
-    if data == "ps_cur_ils":
-        bot.answer_callback_query(c.id)
-        AE_PRICE_INPUT_CURRENCY = "ILS"
-        _set_state_str("price_input_currency", "ILS")
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
-        return
-
-    if data == "ps_cur_usd":
-        bot.answer_callback_query(c.id)
-        AE_PRICE_INPUT_CURRENCY = "USD"
-        _set_state_str("price_input_currency", "USD")
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
-        return
-
-    if data == "ps_conv_on":
-        bot.answer_callback_query(c.id)
-        AE_PRICE_CONVERT_USD_TO_ILS = True
-        _set_state_str("convert_usd_to_ils", "1")
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
-        return
-
-    if data == "ps_conv_off":
-        bot.answer_callback_query(c.id)
-        AE_PRICE_CONVERT_USD_TO_ILS = False
-        _set_state_str("convert_usd_to_ils", "0")
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
-        return
-
 
     if data == "ps_set_rate":
         # Show rate control panel (buttons)
         bot.answer_callback_query(c.id)
         safe_edit_message(
+            bot,
             chat_id=c.message.chat.id,
-            message_id=c.message.message_id,
-            text=_rate_panel_text(),
+            message=c.message,
+            new_text=_rate_panel_text(),
             reply_markup=_rate_panel_kb(),
             parse_mode="HTML",
             cb_id=c.id,
@@ -4932,9 +4960,10 @@ def on_inline_click(c):
         set_usd_to_ils_rate(new_rate)
 
         safe_edit_message(
+            bot,
             chat_id=c.message.chat.id,
-            message_id=c.message.message_id,
-            text=_rate_panel_text(),
+            message=c.message,
+            new_text=_rate_panel_text(),
             reply_markup=_rate_panel_kb(),
             parse_mode="HTML",
             cb_id=c.id,
@@ -4952,9 +4981,10 @@ def on_inline_click(c):
     if data == "rate_back":
         bot.answer_callback_query(c.id)
         safe_edit_message(
+            bot,
             chat_id=c.message.chat.id,
-            message_id=c.message.message_id,
-            text=_prod_search_menu_text(),
+            message=c.message,
+            new_text=_prod_search_menu_text(),
             reply_markup=_prod_search_menu_kb(),
             parse_mode="HTML",
             cb_id=c.id,
@@ -5301,13 +5331,37 @@ def on_inline_click(c):
                           new_text=text, reply_markup=inline_menu(), parse_mode='HTML', cb_id=c.id)
 
     elif data == "pf_menu":
-        cur_name = "ש\"ח" if _display_currency_code() == "ILS" else "$"
+        cur_name = 'ש"ח' if _display_currency_code() == "ILS" else "$"
         txt = f'💸 סינון מחיר ({cur_name})\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"}\nבחר טווחים:'
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=c.id)
 
     elif data == "pf_back":
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text="✅ תפריט ראשי", reply_markup=inline_menu(), cb_id=c.id)
 
+
+    elif data == "pf_range_custom":
+        bot.answer_callback_query(c.id)
+        uid = c.from_user.id
+        PRICE_RANGE_WAIT[uid] = True
+        PRICE_RANGE_CTX[uid] = (chat_id, c.message.message_id)
+        cur_name = "ש\"ח" if _display_currency_code() == "ILS" else "$"
+        sent = bot.send_message(
+            chat_id,
+            "🎚️ שלח טווח מחיר מותאם בפורמט: 10-30\n"
+            "(אפשר גם: 10-  או  -30).\n"
+            f"הטווח נבדק במטבע תצוגה: {cur_name} ({_display_currency_code()}).",
+        )
+        PRICE_RANGE_PROMPT[uid] = (chat_id, sent.message_id)
+        return
+
+    elif data == "pf_range_clear":
+        bot.answer_callback_query(c.id, "טווח מותאם נוקה.")
+        _set_state_float("PRICE_RANGE_MIN", None)
+        _set_state_float("PRICE_RANGE_MAX", None)
+        cur_name = 'ש"ח' if _display_currency_code() == "ILS" else "$"
+        txt = f'💸 סינון מחיר ({cur_name})\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"} | טווח: ללא\nבחר טווחים:'
+        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=txt, reply_markup=_price_filter_menu_kb(), cb_id=c.id)
+        return
     elif data == "pf_clear":
         with FILE_LOCK:
             set_price_buckets_raw("")
@@ -6097,6 +6151,58 @@ def on_text_input(m):
         return
 
     uid = m.from_user.id
+    # Custom price range (from price filter menu)
+    if PRICE_RANGE_WAIT.get(uid):
+        PRICE_RANGE_WAIT[uid] = False
+        chat_id, menu_msg_id = PRICE_RANGE_CTX.get(uid, (m.chat.id, None))
+        txt = (m.text or "").strip().replace("–", "-").replace("—", "-")
+        # Accept: "10-30", "10-", "-30", "10 30"
+        a = b = None
+        if "-" in txt:
+            parts = [p.strip() for p in txt.split("-", 1)]
+            a = parts[0] or None
+            b = parts[1] or None
+        else:
+            parts = [p for p in re.split(r"\s+", txt) if p]
+            if len(parts) >= 2:
+                a, b = parts[0], parts[1]
+        def _p(v):
+            if v is None:
+                return None
+            try:
+                return float(v.replace(",", "."))
+            except Exception:
+                return None
+        mn = _p(a)
+        mx = _p(b)
+        if mn is None and mx is None:
+            bot.send_message(chat_id, "❌ לא הצלחתי להבין את הטווח. דוגמה: 10-30 או 10- או -30")
+            return
+        if mn is not None and mx is not None and mn > mx:
+            mn, mx = mx, mn
+        _set_state_float("PRICE_RANGE_MIN", mn)
+        _set_state_float("PRICE_RANGE_MAX", mx)
+
+        # Clean up prompt if exists
+        p = PRICE_RANGE_PROMPT.pop(uid, None)
+        if p:
+            try:
+                bot.delete_message(p[0], p[1])
+            except Exception:
+                pass
+
+        cur_name = "ש\"ח" if _display_currency_code() == "ILS" else "$"
+        pr_txt = f"{'' if mn is None else mn:g}-{'' if mx is None else mx:g}".strip("-")
+        bot.send_message(chat_id, f"✅ עודכן טווח מחיר: {pr_txt} ({cur_name})")
+        # Refresh menu if we have message id
+        if menu_msg_id:
+            try:
+                txt_menu = f'💸 סינון מחיר ({cur_name})\nמצב נוכחי: {AE_PRICE_BUCKETS_RAW or "ללא"} | טווח: {pr_txt or "ללא"}\nבחר טווחים:'
+                bot.edit_message_text(txt_menu, chat_id=chat_id, message_id=menu_msg_id, reply_markup=_price_filter_menu_kb())
+            except Exception:
+                pass
+        return
+
     text = raw_text
 
     # Allow cancel
