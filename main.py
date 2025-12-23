@@ -6127,23 +6127,54 @@ def _wait_for_telegram_ready(max_sleep: int = 60):
             time.sleep(delay)
             delay = min(max_sleep, delay * 2)
 
-# Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
-while True:
-    try:
-        _wait_for_telegram_ready()
-    if not USE_WEBHOOK:
-        # Legacy polling mode (not recommended on Railway)
+# ---------------------------------------------------------------------------
+# Runtime entrypoints
+# ---------------------------------------------------------------------------
+
+def run_polling_forever():
+    """Run legacy polling mode (not recommended on Railway)."""
+    while True:
         try:
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, interval=1)
-        except TypeError:
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-    else:
-        _set_webhook()
-        port = int(os.getenv('PORT', '8080'))
+            _wait_for_telegram_ready()
+            try:
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, interval=1)
+            except TypeError:
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            msg = str(e)
+            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+            try:
+                log_error(f"Polling error: {e}. Retrying in {wait}s...")
+            except Exception:
+                print(f"[ERROR] Polling error: {e}. Retrying in {wait}s...", flush=True)
+            time.sleep(wait)
+
+
+def _startup_webhook_once():
+    """Bind Telegram webhook once (safe to call on each worker boot)."""
+    if not USE_WEBHOOK:
+        return
+    if os.getenv("DISABLE_SET_WEBHOOK", "").strip().lower() in ("1", "true", "yes"):
+        print("[CFG] DISABLE_SET_WEBHOOK=1 -> skipping setWebhook", flush=True)
+        return
+    _set_webhook()
+
+
+# When running under gunicorn, the module is imported and served as WSGI.
+# We *must not* start polling loops at import time.
+try:
+    _startup_webhook_once()
+except Exception as e:
+    try:
+        log_error(f"Webhook startup error: {e}")
+    except Exception:
+        print(f"[ERROR] Webhook startup error: {e}", flush=True)
+
+
+if __name__ == "__main__":
+    if USE_WEBHOOK:
+        port = int(os.getenv("PORT", "8080"))
         print(f"[BOOT] Webhook mode ON. Listening on 0.0.0.0:{port}", flush=True)
-        app.run(host='0.0.0.0', port=port)
-    except Exception as e:
-        msg = str(e)
-        wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-        log_error(f"Polling error: {e}. Retrying in {wait}s...")
-        time.sleep(wait)
+        app.run(host="0.0.0.0", port=port)
+    else:
+        run_polling_forever()
