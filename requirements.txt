@@ -4,3 +4,4 @@ urllib3>=2.0.0
 flask>=3.0.0
 gunicorn>=22.0.0
 tzdata
+openai>=1.40.0

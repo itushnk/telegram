@@ -1,3 +1,5 @@
+import os
+USE_WEBHOOK = os.getenv('USE_WEBHOOK','1').strip().lower() not in ('0','false','no')
 # -*- coding: utf-8 -*-
 """
 main.py — Telegram Post Bot + AliExpress Affiliate refill
@@ -6051,14 +6053,22 @@ except Exception:
         sys.exit(1)
 
     print_webhook_info()
-    try:
-        force_delete_webhook()
-        bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
+    # Webhook / Polling init (Railway uses webhook; local can use polling)
+    if USE_WEBHOOK:
+        # Webhook mode: set webhook once (do NOT delete it).
+        _startup_webhook_once()
+    else:
+        # Polling mode: remove webhook (so getUpdates can work).
+        try:
+            force_delete_webhook()
+            bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
         try:
             bot.remove_webhook()
         except Exception as e2:
             print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+
     print_webhook_info()
 
     if not os.path.exists(AUTO_FLAG_FILE):
@@ -6092,14 +6102,17 @@ if _lock_handle is None:
     sys.exit(1)
 
 print_webhook_info()
-try:
-    force_delete_webhook()
-    bot.delete_webhook(drop_pending_updates=True)
-except Exception:
+if not USE_WEBHOOK:
+    try:
+        force_delete_webhook()
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
     try:
         bot.remove_webhook()
     except Exception as e2:
         print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+
 print_webhook_info()
 
 if not os.path.exists(AUTO_FLAG_FILE):
@@ -6151,6 +6164,7 @@ def run_polling_forever():
 
 
 def _startup_webhook_once():
+    global USE_WEBHOOK
     """Bind Telegram webhook once (safe to call on each worker boot)."""
     if not USE_WEBHOOK:
         return
