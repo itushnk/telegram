@@ -3405,6 +3405,18 @@ def _translate_query_for_search(q: str) -> str:
         "מצלמת רכב": "dash cam",
         "קופסה": "box",
         "כיסוי": "cover",
+        "ראש": "head",
+        "כיסוי ראש": "head cover",
+        "כיסוי שיער": "hair cover",
+        "סרט לשיער": "hair band",
+        "כובע": "hat",
+        "כובעים": "hats",
+        "בנדנה": "bandana",
+        "צעיף": "scarf",
+        "חיג'אב": "hijab",
+        "חיגאב": "hijab",
+        "כיפה": "kippah",
+
         "מגן": "protector",
         "מגן מסך": "screen protector",
         "טלפון": "phone",
@@ -3431,6 +3443,17 @@ def _translate_query_for_search(q: str) -> str:
         "גימנסיה": "fitness",
         "מסך": "screen",
     }
+
+    # Phrase shortcuts (prefer longer multi-word keys)
+    try:
+        phrase_keys = [k for k in local_map.keys() if " " in k]
+        phrase_keys.sort(key=len, reverse=True)
+        for k in phrase_keys:
+            if k and k in q:
+                return local_map.get(k) or q
+    except Exception:
+        pass
+
 
     # Exact phrase first
     if q in local_map:
@@ -3516,6 +3539,16 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
             # phone accessories
             "phone": ["smartphone", "mobile"],
             "case": ["cover", "shell"],
+            # Hebrew helpers (common shopping terms)
+            "כיסוי": ["cover", "case", "cap", "headwear"],
+            "ראש": ["head", "headwear"],
+            "כיסוי ראש": ["head cover", "headwear", "bandana", "hijab", "cap", "hat", "scarf"],
+            "כובע": ["hat", "cap"],
+            "כובעים": ["hats", "hat", "cap"],
+            "צעיף": ["scarf"],
+            "בנדנה": ["bandana"],
+            "כיפה": ["kippah"],
+
             "charger": ["charging", "adapter", "power"],
             # generic (avoid too broad)
         }
@@ -3669,7 +3702,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
 
     # If strict matching produced no results, automatically fall back to a relaxed keyword match
     # (still relevant, but allows partial hits instead of requiring all tokens).
-    if (not relaxed_match):
+    if (not relaxed_match) and env_bool("MS_AUTO_RELAX", False):
         try:
             strict_ok = sum(1 for it in results if it.get("ok"))
         except Exception:
