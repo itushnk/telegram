@@ -3836,7 +3836,11 @@ def _ms_caption(uid: int) -> tuple[str, str | None]:
         else:
             comm_line = f"\n💸 עמלה: {comm_pct:g}%"
     link = str(row.get("BuyLink") or "").strip()
-    link_line = (f"{link_line}" if link else "🔗 (אין קישור)\n")
+    if link:
+        link_esc = html.escape(link, quote=True)
+        link_line = f'🔗 <a href="{link_esc}">קישור לרכישה</a>\n'
+    else:
+        link_line = "🔗 (אין קישור)\n"
     img = str(row.get("ImageURL") or "").strip() or None
 
     status_line = "✅ עומד בסינונים" if ok else f"🚫 נפסל: {html.escape(reason)}"
@@ -4653,13 +4657,31 @@ def on_inline_click(c):
         return
 
     if data == "ps_back_main":
+        uid = c.from_user.id
         bot.answer_callback_query(c.id)
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=c.id)
+        try:
+            _ms_clear(uid)
+        except Exception:
+            pass
+        try:
+            _safe_delete(chat_id, c.message.message_id)
+        except Exception:
+            pass
+        bot.send_message(chat_id, inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML")
         return
 
     if data == "ps_back":
+        uid = c.from_user.id
         bot.answer_callback_query(c.id)
-        safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
+        try:
+            _ms_clear(uid)
+        except Exception:
+            pass
+        try:
+            _safe_delete(chat_id, c.message.message_id)
+        except Exception:
+            pass
+        bot.send_message(chat_id, _prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML")
         return
 
     if data == "ps_best":
