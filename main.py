@@ -274,6 +274,7 @@ PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
 PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 
 SCHEDULE_FLAG_FILE      = os.path.join(BASE_DIR, "schedule_enforced.flag")
+CONVERT_NEXT_FLAG_FILE  = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 BROADCAST_FLAG_FILE     = os.path.join(BASE_DIR, "broadcast_enabled.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
@@ -1493,15 +1494,12 @@ def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup
 
         try:
             bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception as e1:
+        except Exception:
             # Try caption edit (for media messages)
             try:
                 bot.edit_message_caption(chat_id=chat_id, message_id=message.message_id, caption=new_text, reply_markup=reply_markup, parse_mode=parse_mode)
-            except Exception as e2:
-                try:
-                    log_error(f"safe_edit_message edit failed: {e1} | caption failed: {e2} | {cb_info or ''}")
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         if cb_id:
             try:
@@ -3386,7 +3384,6 @@ def _translate_query_for_search(q: str) -> str:
         "נעלי ספורט": "running shoes",
         "סניקרס": "sneakers",
         "כפכפים": "slippers",
-        "נעלי בית": "house slippers",
         "מגפיים": "boots",
         "מעיל": "jacket",
         "מעילים": "jackets",
@@ -3408,8 +3405,6 @@ def _translate_query_for_search(q: str) -> str:
         "מצלמת רכב": "dash cam",
         "קופסה": "box",
         "כיסוי": "cover",
-        "כובע": "hat",
-        "כובע שמש": "sun hat",
         "מגן": "protector",
         "מגן מסך": "screen protector",
         "טלפון": "phone",
@@ -3460,31 +3455,24 @@ def _translate_query_for_search(q: str) -> str:
                 out.append(p2)
 
     fallback = " ".join(out).strip()
-    # If fallback is still Hebrew, try OpenAI translation (enabled by default when API key exists).
-    use_gpt = bool(OPENAI_API_KEY) and env_bool("MS_USE_GPT_TRANSLATE", True)
-    if use_gpt:
+    # If fallback is still identical Hebrew, we can try GPT if enabled; else return as-is.
+    if (GPT_ENABLED and GPT_TRANSLATE_SEARCH and OPENAI_API_KEY):
         try:
             resp = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "Translate Hebrew to short English shopping keywords for AliExpress search. Output ONLY the keywords (no punctuation, no quotes)."},
+                    {"role": "system", "content": "Translate Hebrew product search to short English shopping keywords. Output only keywords."},
                     {"role": "user", "content": q},
                 ],
                 temperature=0,
-                max_tokens=18,
+                max_tokens=12,
             )
             t = (resp.choices[0].message.content or "").strip()
             t = re.sub(r"[^0-9A-Za-z\s\-]", " ", t).strip()
             t = re.sub(r"\s+", " ", t).strip()
-            if t:
-                return t
-        except Exception as e:
-            try:
-                _logger.info(f"[MS] translate_query failed: {e}")
-            except Exception:
-                pass
-
-    return fallback or q
+            return t or fallback or q
+        except Exception:
+            return fallback or q
 
     return fallback or q
 
@@ -3656,37 +3644,6 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["other"] += 1
 
         results.append({"row": row, "ok": ok, "reason": reason})
-
-    # Sort results so the preview shows the most relevant items first.
-    # We rank by: pass/fail, keyword overlap score, then orders.
-    def _ms_overlap_score(title: str) -> float:
-        t = (title or "").lower()
-        best = 0.0
-        for qv in (q_variants or []):
-            toks = [tok for tok in re.split(r"[^\w]+", (qv or "").lower()) if len(tok) > 1]
-            if not toks:
-                continue
-            hits = sum(1 for tok in toks if tok in t)
-            best = max(best, hits / max(1, len(toks)))
-        return best
-
-    for it in results:
-        try:
-            row = it.get("row") or {}
-            it["_ms_score"] = _ms_overlap_score(str(row.get("Title") or ""))
-            it["_ms_orders"] = int(float(str(row.get("Orders") or "0").replace(",", ".") or "0"))
-        except Exception:
-            it["_ms_score"] = 0.0
-            it["_ms_orders"] = 0
-
-    results.sort(
-        key=lambda it: (
-            1 if it.get("ok") else 0,
-            float(it.get("_ms_score") or 0.0),
-            int(it.get("_ms_orders") or 0),
-        ),
-        reverse=True,
-    )
 
     sess = {
         # what we show to the admin
@@ -3983,12 +3940,21 @@ def _ms_add_rows_to_queue(rows: list[dict]) -> tuple[int, int, int]:
         added = 0
         dups = 0
         for r in rows:
-            k = _key_of_row(r)
+            # Ensure the row is marked as "awaiting AI approval" when coming from manual search.
+            r2 = dict(r or {})
+            normalize_row_keys(r2)  # adds missing AI* fields safely
+            st = str(r2.get("AIState", "") or "").strip().lower()
+            if st not in ("approved", "rejected", "processed"):
+                r2["AIState"] = "raw"
+            if not r2.get("OrigTitle") and r2.get("Title"):
+                r2["OrigTitle"] = r2.get("Title")
+
+            k = _key_of_row(r2)
             if k in existing:
                 dups += 1
                 continue
             existing.add(k)
-            pending.append(r)
+            pending.append(r2)
             added += 1
         write_products(PENDING_CSV, pending)
         total = len(pending)
@@ -4525,6 +4491,14 @@ def inline_menu():
         types.InlineKeyboardButton("🚀 הרץ AI (מאושרים)", callback_data="ai_run_approved"),
     )
 
+
+    # Currency / conversion controls (affiliate prices)
+    conv_state = "פעיל" if (AE_PRICE_INPUT_CURRENCY == "USD" and AE_PRICE_CONVERT_USD_TO_ILS) else "כבוי"
+    kb.add(
+        types.InlineKeyboardButton(f"💱 מטבע מקור: {AE_PRICE_INPUT_CURRENCY}", callback_data="toggle_price_input_currency"),
+        types.InlineKeyboardButton(f"🔁 המרת $→₪: {conv_state}", callback_data="toggle_usd2ils_convert"),
+    )
+
     bc_state = "פעיל" if is_broadcast_enabled() else "כבוי"
     kb.add(
         types.InlineKeyboardButton(f"🎙️ שידור: {bc_state}", callback_data="toggle_broadcast"),
@@ -4581,8 +4555,7 @@ def _prod_search_menu_text() -> str:
         "בחר מצב חיפוש, ועדכן סינונים לפי צורך.\n\n"
         f"📦 מינ׳ הזמנות: <b>{int(MIN_ORDERS)}</b>\n"
         f"⭐ מינ׳ דירוג: <b>{float(MIN_RATING):g}%</b>\n"
-        f"💰 מינ׳ עמלה: <b>{float(MIN_COMMISSION):g}%</b>\n"
-        f"🔢 שער USD→ILS: <b>{float(USD_TO_ILS_RATE):g}</b>\n"
+        f"💰 מינ׳ עמלה: <b>{float(MIN_COMMISSION):g}%</b>\n"        f"🔢 שער USD→ILS: <b>{float(USD_TO_ILS_RATE):g}</b>\n"
     )
 
 def _prod_search_menu_kb():
@@ -4602,13 +4575,12 @@ def _prod_search_menu_kb():
     )
     kb.add(
         types.InlineKeyboardButton("💰 עמלה", callback_data="ps_comm"),
-        types.InlineKeyboardButton("💱 שער המרה", callback_data="ps_set_rate"),
     )
     kb.add(
+        types.InlineKeyboardButton("💱 שער המרה", callback_data="ps_set_rate"),
         types.InlineKeyboardButton("↩️ חזרה לתפריט", callback_data="ps_back_main"),
     )
     return kb
-
 
 
 def _rate_panel_text() -> str:
@@ -4625,20 +4597,16 @@ def _rate_panel_text() -> str:
 
 
 def _rate_panel_kb() -> "types.InlineKeyboardMarkup":
-    kb = InlineKeyboardMarkup(row_width=3)
+    # Minimal controls: manual set / reset / back (the +/- buttons were confusing)
+    kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("➖0.05", callback_data="rate_dec_005"),
-        InlineKeyboardButton("➖0.01", callback_data="rate_dec_001"),
         InlineKeyboardButton("✍️ הקלדה", callback_data="rate_manual"),
-    )
-    kb.add(
-        InlineKeyboardButton("➕0.01", callback_data="rate_inc_001"),
-        InlineKeyboardButton("➕0.05", callback_data="rate_inc_005"),
         InlineKeyboardButton("🔁 איפוס 3.70", callback_data="rate_reset_370"),
     )
     kb.add(InlineKeyboardButton("↩️ חזרה", callback_data="rate_back"))
     return kb
 
+@bot.callback_query_handler(func=lambda c: True)
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
     global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
@@ -4666,6 +4634,21 @@ def on_inline_click(c):
             return
         bot.answer_callback_query(c.id)
         _ms_start(uid=uid, chat_id=chat_id, q=q)
+        return
+        bot.answer_callback_query(c.id, "מחפש…")
+        # Run product search immediately and add to queue (no AI)
+        bot.send_message(chat_id, f"⏳ מחפש מוצרים עבור: {q}")
+        added, dups, total_after, last_page, err = refill_from_affiliate(AE_REFILL_MIN_QUEUE, keywords=q)
+        if err:
+            bot.send_message(chat_id, f"⚠️ החיפוש הסתיים עם הודעה: {err}")
+        bot.send_message(
+            chat_id,
+            f"✅ סיום חיפוש עבור: {q}\n"
+            f"נוספו לתור: {added}\n"
+            f"כפולים שנדחו: {dups}\n"
+            f"סה״כ בתור: {total_after}\n"
+            f"עמוד אחרון שנבדק: {last_page}"
+        )
         return
 
     if data == "prod_search":
@@ -4757,7 +4740,7 @@ def on_inline_click(c):
             types.InlineKeyboardButton("המרה: OFF", callback_data="ps_conv_off"),
         )
         kb.add(
-            types.InlineKeyboardButton("🔢 קבע שער", callback_data="ps_set_rate"),
+            types.InlineKeyboardButton("💱 שער המרה", callback_data="ps_set_rate"),
             types.InlineKeyboardButton("↩️ חזרה", callback_data="ps_back"),
         )
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=text, reply_markup=kb, parse_mode="HTML", cb_id=c.id)
@@ -4795,15 +4778,7 @@ def on_inline_click(c):
     if data == "ps_set_rate":
         # Show rate control panel (buttons)
         bot.answer_callback_query(c.id)
-        safe_edit_message(
-            bot,
-            chat_id=c.message.chat.id,
-            message=c.message,
-            new_text=_rate_panel_text(),
-            reply_markup=_rate_panel_kb(),
-            parse_mode="HTML",
-            cb_id=c.id,
-        )
+        safe_edit_message(bot, chat_id=c.message.chat.id, message=c.message, new_text=_rate_panel_text(), reply_markup=_rate_panel_kb(), parse_mode="HTML", cb_id=c.id)
         return
 
     if data in ("rate_dec_005", "rate_dec_001", "rate_inc_001", "rate_inc_005", "rate_reset_370"):
@@ -4828,43 +4803,22 @@ def on_inline_click(c):
         new_rate = max(0.1, round(new_rate, 2))
         set_usd_to_ils_rate(new_rate)
 
-        safe_edit_message(
-            bot,
-            chat_id=c.message.chat.id,
-            message=c.message,
-            new_text=_rate_panel_text(),
-            reply_markup=_rate_panel_kb(),
-            parse_mode="HTML",
-            cb_id=c.id,
-        )
+        safe_edit_message(bot, chat_id=c.message.chat.id, message=c.message, new_text=_rate_panel_text(), reply_markup=_rate_panel_kb(), parse_mode="HTML", cb_id=c.id)
         return
 
     if data == "rate_manual":
         bot.answer_callback_query(c.id)
         uid = c.from_user.id
         RATE_SET_WAIT[uid] = True
-        # Keep context so we can refresh the menu after setting the rate
         RATE_SET_CTX[uid] = (c.message.chat.id, c.message.message_id)
+        _set_state_str("awaiting", "RATE_SET_WAIT")
         txt = "🔢 שלח מספר (למשל 3.70) כדי לקבוע שער USD→ILS:"
-        try:
-            prompt = bot.send_message(c.message.chat.id, txt, reply_markup=telebot.types.ForceReply(selective=True))
-            RATE_SET_PROMPT[uid] = (prompt.chat.id, prompt.message_id)
-        except Exception:
-            bot.send_message(c.message.chat.id, txt)
-            RATE_SET_PROMPT.pop(uid, None)
+        bot.send_message(c.message.chat.id, txt)
         return
 
     if data == "rate_back":
         bot.answer_callback_query(c.id)
-        safe_edit_message(
-            bot,
-            chat_id=c.message.chat.id,
-            message=c.message,
-            new_text=_prod_search_menu_text(),
-            reply_markup=_prod_search_menu_kb(),
-            parse_mode="HTML",
-            cb_id=c.id,
-        )
+        safe_edit_message(bot, chat_id=c.message.chat.id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
         return
 
     if data == "ps_item":
@@ -4939,8 +4893,7 @@ def on_inline_click(c):
             bot.answer_callback_query(c.id, "אין סשן חיפוש פעיל.", show_alert=True)
             return
 
-        q_user = str(sess.get("q_user") or sess.get("q") or "").strip()
-        q_api = str(sess.get("q_api") or q_user).strip()
+        q = str(sess.get("q") or "").strip()
         page = int(sess.get("page") or 1)
         per_page = int(sess.get("per_page") or 10)
 
@@ -4973,7 +4926,7 @@ def on_inline_click(c):
 
         if data == "ms_page_next":
             bot.answer_callback_query(c.id, "טוען דף הבא…")
-            _ms_fetch_page(uid, q=q_api, page=page + 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")), relaxed_match=bool(sess.get("relaxed_match")))
+            _ms_fetch_page(uid, q=q, page=page + 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")), relaxed_match=bool(sess.get("relaxed_match")))
             _refresh()
             return
 
@@ -4982,7 +4935,7 @@ def on_inline_click(c):
                 bot.answer_callback_query(c.id, "זה כבר הדף הראשון.")
                 return
             bot.answer_callback_query(c.id, "טוען דף קודם…")
-            _ms_fetch_page(uid, q=q_api, page=page - 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")), relaxed_match=bool(sess.get("relaxed_match")))
+            _ms_fetch_page(uid, q=q, page=page - 1, per_page=per_page, use_selected_categories=bool(sess.get("use_selected_categories")), relaxed_match=bool(sess.get("relaxed_match")))
             _refresh()
             return
 
@@ -4991,7 +4944,7 @@ def on_inline_click(c):
             # Re-fetch the same page but allow partial title matches
             _ms_fetch_page(
                 uid,
-                q=q_api,
+                q=q,
                 page=page,
                 per_page=per_page,
                 use_selected_categories=bool(sess.get("use_selected_categories")),
@@ -5008,19 +4961,25 @@ def on_inline_click(c):
                 return
             idx = max(0, min(idx, len(results)-1))
             item = results[idx]
-            if not item.get("ok"):
-                bot.answer_callback_query(c.id, f"לא נוסף: {item.get('reason')}", show_alert=True)
-                return
             row = item.get("row") or {}
+            if not row:
+                bot.answer_callback_query(c.id, "אין נתונים להוספה בפריט הזה.", show_alert=True)
+                return
+
             added, dups, total = _ms_add_rows_to_queue([row])
-            bot.answer_callback_query(c.id, f"נוסף: {added} | כפול: {dups} | בתור: {total}")
+
+            reason = (item.get("reason") or "").strip()
+            note = f" | שים לב: {reason[:60]}" if (reason and not item.get("ok")) else ""
+            bot.answer_callback_query(c.id, f"נוסף לתור AI: {added} | כפול: {dups} | בתור: {total}{note}", show_alert=True)
             return
 
         if data == "ms_add_page":
             results = sess.get("results") or []
-            ok_rows = [it.get("row") for it in results if it.get("ok") and it.get("row")]
-            added, dups, total = _ms_add_rows_to_queue(ok_rows)
-            bot.answer_callback_query(c.id, f"נוספו: {added} | כפולים: {dups} | בתור: {total}", show_alert=True)
+            rows = [it.get("row") for it in results if it.get("row")]
+            not_ok = sum(1 for it in results if it.get("row") and (not it.get("ok")))
+            added, dups, total = _ms_add_rows_to_queue(rows)
+            extra = f" | לא עומדים בסינון: {not_ok}" if not_ok else ""
+            bot.answer_callback_query(c.id, f"נוספו לתור AI: {added} | כפולים: {dups} | בתור: {total}{extra}", show_alert=True)
             return
 
         bot.answer_callback_query(c.id)
@@ -5389,6 +5348,17 @@ def on_inline_click(c):
                           new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
                           reply_markup=inline_menu(), cb_id=c.id)
 
+    elif data == "convert_next":
+        try:
+            with open(CONVERT_NEXT_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write(str(USD_TO_ILS_RATE_DEFAULT))
+            safe_edit_message(
+                bot, chat_id=chat_id, message=c.message,
+                new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
+                reply_markup=inline_menu(), cb_id=c.id
+            )
+        except Exception as e:
+            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
 
     elif data == "reset_from_data":
         src = read_products(DATA_CSV)
@@ -5703,10 +5673,16 @@ def on_document(msg):
         rows_raw = [dict(r) for r in raw_reader]
 
         convert_rate = None
-        try:
-            convert_rate = float(USD_TO_ILS_RATE)
-        except Exception:
-            convert_rate = USD_TO_ILS_RATE_DEFAULT
+        if os.path.exists(CONVERT_NEXT_FLAG_FILE):
+            try:
+                with open(CONVERT_NEXT_FLAG_FILE, "r", encoding="utf-8") as f:
+                    convert_rate = float((f.read() or "").strip() or USD_TO_ILS_RATE_DEFAULT)
+            except Exception:
+                convert_rate = USD_TO_ILS_RATE_DEFAULT
+            try:
+                os.remove(CONVERT_NEXT_FLAG_FILE)
+            except Exception:
+                pass
 
         rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
 
@@ -6000,33 +5976,11 @@ def on_text_input(m):
 
     # 1) USD→ILS rate setter
     if RATE_SET_WAIT.get(uid):
-        # In group chats, only accept a reply to the prompt message (reduces accidental triggers)
-        prompt = RATE_SET_PROMPT.get(uid)
-        if getattr(m.chat, "type", "") in ("group", "supergroup") and prompt:
-            if not getattr(m, "reply_to_message", None) or m.reply_to_message.message_id != prompt[1]:
-                return
-
         RATE_SET_WAIT.pop(uid, None)
-        RATE_SET_PROMPT.pop(uid, None)
         try:
             v = float(text.replace(",", "."))
-            v = max(0.1, round(v, 2))
             set_usd_to_ils_rate(v)
             bot.reply_to(m, f"שער עודכן ✅ 1$ = ₪{USD_TO_ILS_RATE:g}")
-
-            # Refresh the rate panel/menu if we have context
-            ctx = RATE_SET_CTX.pop(uid, None)
-            if ctx:
-                try:
-                    bot.edit_message_text(
-                        _prod_search_menu_text(),
-                        chat_id=ctx[0],
-                        message_id=ctx[1],
-                        parse_mode="HTML",
-                        reply_markup=_prod_search_menu_kb(),
-                    )
-                except Exception:
-                    pass
         except Exception:
             bot.reply_to(m, "לא הצלחתי להבין את השער. נסה למשל: 3.70")
         return
@@ -6048,7 +6002,7 @@ def on_text_input(m):
         PROD_SEARCH_WAIT.pop(uid, None)
         query = text
         try:
-            _ms_start(uid=uid, chat_id=m.chat.id, q=query)
+            _run_product_search_flow(m.chat.id, query, strict=True, origin="item")
         except Exception as e:
             bot.reply_to(m, f"שגיאה בחיפוש: {e}")
         return
