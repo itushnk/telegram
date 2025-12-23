@@ -229,12 +229,15 @@ import socket
 import threading
 import hashlib
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
 import telebot
 from telebot import types
 
+from telebot import apihelper
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
@@ -622,6 +625,40 @@ if not BOT_TOKEN:
     print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יתחבר לטלגרם עד שתגדיר ENV.", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+# ---- Telegram HTTP hardening (Railway/network hiccups) ----
+def _configure_telegram_http():
+    try:
+        tg_session = requests.Session()
+        retries = Retry(
+            total=8,
+            connect=8,
+            read=8,
+            status=8,
+            backoff_factor=0.8,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
+        tg_session.mount("https://", adapter)
+        tg_session.mount("http://", adapter)
+        tg_session.headers.update({"User-Agent": "TelegramPostBot/1.0"})
+        apihelper.SESSION = tg_session
+
+        # Best-effort timeouts (depends on pyTelegramBotAPI version)
+        if hasattr(apihelper, "CONNECT_TIMEOUT"):
+            apihelper.CONNECT_TIMEOUT = 15
+        if hasattr(apihelper, "READ_TIMEOUT"):
+            apihelper.READ_TIMEOUT = 60
+        if hasattr(apihelper, "RETRY_ON_ERROR"):
+            apihelper.RETRY_ON_ERROR = True
+
+        print("[CFG] Telegram HTTP session configured (retries/backoff/timeout).", flush=True)
+    except Exception as e:
+        print(f"[WARN] Telegram HTTP session config failed: {e}", flush=True)
+
+_configure_telegram_http()
+# ----------------------------------------------------------
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -6031,7 +6068,10 @@ def _wait_for_telegram_ready(max_sleep: int = 60):
 while True:
     try:
         _wait_for_telegram_ready()
-        bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, interval=1)
+        except TypeError:
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
     except Exception as e:
         msg = str(e)
         wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
