@@ -231,6 +231,7 @@ import hashlib
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from flask import Flask, request
 from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
@@ -659,6 +660,65 @@ def _configure_telegram_http():
 
 _configure_telegram_http()
 # ----------------------------------------------------------
+# ---- Webhook server (Flask) ----
+app = Flask(__name__)
+
+def _infer_webhook_base_url():
+    """Infer the public HTTPS base URL for Railway."""
+    for k in ("WEBHOOK_BASE_URL", "PUBLIC_BASE_URL", "RAILWAY_STATIC_URL", "RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_URL"):
+        v = os.getenv(k, "").strip()
+        if not v:
+            continue
+        if v.startswith("http://") or v.startswith("https://"):
+            return v.rstrip("/")
+        return ("https://" + v).rstrip("/")
+    return None
+
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()
+if not WEBHOOK_PATH:
+    WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+
+def _set_webhook():
+    base = _infer_webhook_base_url()
+    if not base:
+        print("[WARN] Webhook base URL not set. Set WEBHOOK_BASE_URL to your Railway domain, e.g. https://<your-domain>.up.railway.app", flush=True)
+        return False
+    url = base + WEBHOOK_PATH
+    try:
+        res = bot.set_webhook(url=url, drop_pending_updates=True)
+        print(f"[CFG] setWebhook -> {res} | url={url}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[ERR] setWebhook failed: {e}", flush=True)
+        return False
+
+@app.get("/")
+def health():
+    return "ok", 200
+
+@app.post("/__force_webhook")
+def force_webhook():
+    secret = os.getenv("FORCE_WEBHOOK_SECRET", "").strip()
+    got = request.headers.get("X-Secret", "")
+    if secret and got != secret:
+        return "forbidden", 403
+    ok = _set_webhook()
+    return ("ok" if ok else "failed"), (200 if ok else 500)
+
+@app.post("/webhook/<path:token>")
+def telegram_webhook(token: str):
+    if token != BOT_TOKEN:
+        return "forbidden", 403
+    try:
+        update_json = request.get_data(as_text=True)
+        if update_json:
+            update = telebot.types.Update.de_json(update_json)
+            bot.process_new_updates([update])
+        return "ok", 200
+    except Exception as e:
+        print(f"[ERR] webhook processing failed: {e}", flush=True)
+        return "error", 500
+# -------------------------------
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -6067,11 +6127,17 @@ def _wait_for_telegram_ready(max_sleep: int = 60):
 # Polling loop with automatic recovery (network hiccups, Telegram timeouts, etc.)
 while True:
     try:
-        _wait_for_telegram_ready()
+        _wait_for_telegram_ready()    if not USE_WEBHOOK:
+        # Legacy polling mode (not recommended on Railway)
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, interval=1)
         except TypeError:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+    else:
+        _set_webhook()
+        port = int(os.getenv('PORT', '8080'))
+        print(f"[BOOT] Webhook mode ON. Listening on 0.0.0.0:{port}", flush=True)
+        app.run(host='0.0.0.0', port=port)
     except Exception as e:
         msg = str(e)
         wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
