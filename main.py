@@ -407,38 +407,39 @@ def set_usd_to_ils_rate(v: float):
     USD_TO_ILS_RATE = v
     _set_state_str("usd_to_ils_rate", str(USD_TO_ILS_RATE))
 
-# ========= PRICE CURRENCY MODE =========
-# AE affiliate API usually returns prices in the requested target_currency (default USD),
-# but sometimes the returned fields (especially app_* fields) may already be in ILS.
-# We support a runtime switch to tell the bot what currency the incoming prices are in,
-# and whether to convert USD→ILS for display.
-AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
-AE_PRICE_INPUT_CURRENCY = (_get_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY_DEFAULT) or AE_PRICE_INPUT_CURRENCY_DEFAULT).strip().upper()
-if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
-    AE_PRICE_INPUT_CURRENCY = "USD"
+# ========= PRICE & CONVERSION (SINGLE SOURCE OF TRUTH) =========
+# Goal (fixes all "double conversion" / wrong-currency issues):
+# - Always ingest prices from AliExpress Affiliate API in USD.
+# - Never convert during ingest/refill/search.
+# - Optional USD→ILS conversion happens ONLY after AI is completed/approved (end of the process).
+#
+# Controls in Telegram:
+# - Toggle: "המרה בסוף (אחרי AI)"  (DEFAULT: ON)
+# - Rate:   "שער USD→ILS"
 
-AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
+CONVERT_AFTER_AI_DEFAULT = (os.environ.get("CONVERT_AFTER_AI", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+CONVERT_AFTER_AI = _get_state_bool("convert_after_ai", CONVERT_AFTER_AI_DEFAULT)
+
+def set_convert_after_ai(v: bool):
+    global CONVERT_AFTER_AI
+    CONVERT_AFTER_AI = bool(v)
+    _set_state_bool("convert_after_ai", CONVERT_AFTER_AI)
+
+# We always fetch USD from API
+AE_PRICE_INPUT_CURRENCY = "USD"
+
+# We never convert during ingest (conversion is only after AI)
+AE_PRICE_CONVERT_USD_TO_ILS = False
+
+# Keep this flag for backwards-compatibility; always ON in this mode.
+AE_FORCE_USD_ONLY = True
 
 AE_PRICE_DEBUG_DEFAULT = bool(int(os.environ.get("AE_PRICE_DEBUG", "0") or "0"))
 AE_PRICE_DEBUG = _get_state_bool("price_debug", AE_PRICE_DEBUG_DEFAULT)
 
-# Force USD-only pricing mode (no conversions).
-# Default OFF so admins can enable conversion easily from the bot UI.
-AE_FORCE_USD_ONLY_DEFAULT = (os.environ.get("AE_FORCE_USD_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
-AE_FORCE_USD_ONLY = _get_state_bool("force_usd_only", AE_FORCE_USD_ONLY_DEFAULT)
-if AE_FORCE_USD_ONLY:
-    AE_PRICE_INPUT_CURRENCY = "USD"
-    AE_PRICE_CONVERT_USD_TO_ILS = False
-
 def _display_currency_code() -> str:
-    if AE_FORCE_USD_ONLY:
-        return "USD"
-    # If input is already ILS, never convert again.
-    if AE_PRICE_INPUT_CURRENCY == "ILS":
-        return "ILS"
-    # Input is USD: convert only when enabled
-    return "ILS" if AE_PRICE_CONVERT_USD_TO_ILS else "USD"
+    # Global display currency is USD; per-row DisplayCurrency overrides this when AI conversion ran.
+    return "USD"
 
 def _display_currency_suffix_he() -> str:
     return 'ש"ח' if _display_currency_code() == "ILS" else "$"
@@ -447,6 +448,7 @@ def _display_currency_symbol() -> str:
     return "₪" if _display_currency_code() == "ILS" else "$"
 
 PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "2") or "2")
+
 AE_USE_APP_PRICE = (os.environ.get("AE_USE_APP_PRICE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
 # If TOP returns integer-like prices that are actually cents (e.g. 3690 instead of 36.90), enable this.
 AE_PRICE_INT_IS_CENTS = (os.environ.get("AE_PRICE_INT_IS_CENTS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
@@ -1054,48 +1056,26 @@ def _normalize_price_text(price_text: str) -> str:
 
 
 def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str:
-    """Normalize incoming price text to what we display in the post.
+    """Normalize incoming AE price text to a USD numeric string.
 
-    Rules:
-    - If AE_FORCE_USD_ONLY is ON → never convert; always return normalized USD numeric text.
-    - If AE_PRICE_INPUT_CURRENCY=ILS → treat input as ILS and NEVER convert.
-    - If input is USD:
-        - If AE_PRICE_CONVERT_USD_TO_ILS is ON → convert USD→ILS using usd_to_ils_rate.
-        - If OFF → keep USD numeric text (no conversion).
-    - Cents-as-integer normalization (AE_PRICE_INT_IS_CENTS) is applied in all modes.
+    IMPORTANT:
+    - In this bot we ALWAYS ingest prices in USD.
+    - We NEVER convert during ingest/refill/search (to avoid double conversion).
+    - USD→ILS conversion (if enabled) happens ONLY after AI is completed/approved.
     """
-    if AE_FORCE_USD_ONLY:
-        return _normalize_price_text(price_text)
     if price_text is None:
         return ""
     raw = str(price_text)
-    raw_clean = clean_price_text(raw)
-    num = _extract_float(raw_clean)
+    norm = _normalize_price_text(raw)
+    if not norm:
+        return ""
+    num = _extract_float(clean_price_text(norm))
     if num is None:
         return ""
-
-    # Normalize integer-cents when configured
-    if AE_PRICE_INT_IS_CENTS and raw_clean and raw_clean.isdigit():
-        try:
-            ival = int(raw_clean)
-            if ival >= 1000 and ival <= 10000000:
-                num = ival / 100.0
-        except Exception:
-            pass
-
-    # If input currency is ILS, do not convert
-    if AE_PRICE_INPUT_CURRENCY == "ILS":
-        return _format_money(float(num), PRICE_DECIMALS)
-
-    # Input is USD
-    if not AE_PRICE_CONVERT_USD_TO_ILS:
-        return _format_money(float(num), PRICE_DECIMALS)
-
     try:
-        num = float(num) * float(usd_to_ils_rate)
+        return _format_money(float(num), PRICE_DECIMALS)
     except Exception:
-        pass
-    return _format_money(float(num), PRICE_DECIMALS)
+        return _normalize_price_text(norm)
 
 # === PRICE: convert USD→ILS only after AI ===
 # Enable with ENV: CONVERT_TO_ILS_AFTER_AI=1
@@ -1103,16 +1083,10 @@ def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str
 
 def maybe_convert_prices_after_ai(row: dict, reason: str = "") -> bool:
     # Convert stored USD prices to ILS after AI (in-place).
-    # NOTE: Prefer leaving CONVERT_TO_ILS_AFTER_AI=0 and using runtime display conversion.
     try:
-        if not env_bool("CONVERT_TO_ILS_AFTER_AI", False):
+        if not CONVERT_AFTER_AI:
             return False
         if not isinstance(row, dict):
-            return False
-        # If we already know this row is in ILS, never convert again (prevents double-conversion).
-        if str(row.get("DisplayCurrency") or "").strip().upper() == "ILS":
-            return False
-        if str(row.get("PriceCurrency") or "").strip().upper() == "ILS":
             return False
         if str(row.get("PriceConverted") or "").strip() == "1":
             return False
@@ -2769,7 +2743,7 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     if AE_PRICE_DEBUG:
         try:
             log_info(
-                f"[PRICE] item={product_id} input={AE_PRICE_INPUT_CURRENCY} convert={AE_PRICE_CONVERT_USD_TO_ILS} "
+                f"[PRICE] item={product_id} ingest=USD convert_after_ai={CONVERT_AFTER_AI} rate={float(USD_TO_ILS_RATE):g} "
                 f"sale_key={sale_key} sale_raw={sale_raw!r} sale_txt={sale_text!r} sale_disp={sale_disp} "
                 f"orig_key={orig_key} orig_raw={orig_raw!r} orig_txt={orig_text!r} orig_disp={orig_disp}"
             )
@@ -2793,14 +2767,14 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
             "ImageURL": (p.get("product_main_image_url") or "").strip(),
             "Title": (p.get("product_title") or "").strip(),
             "OriginalPrice": orig_disp,
-"OriginalPriceRaw": (orig_text or ""),
-"SalePrice": sale_disp,
-"SalePriceRaw": (sale_text or ""),
-"PriceInputCurrency": AE_PRICE_INPUT_CURRENCY,
-"DisplayCurrency": _display_currency_code(),
-"USDToILSRate": f"{float(USD_TO_ILS_RATE):g}",
-"OriginalIsFrom": ("1" if orig_is_from else ""),
-
+            "OriginalPriceUSD": orig_disp,
+            "OriginalPriceILS": "",
+            "OriginalIsFrom": ("1" if orig_is_from else ""),
+            "SalePrice": sale_disp,
+            "SalePriceUSD": sale_disp,
+            "SalePriceILS": "",
+            "DisplayCurrency": "USD",
+            "PriceConverted": "",
             "PriceIsFrom": ("1" if sale_is_from else ""),
             "Discount": (p.get("discount") or "").strip(),
             "Rating": (p.get("evaluate_rate") or "").strip(),
@@ -2834,8 +2808,8 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     min_commission = float(MIN_COMMISSION or 0.0)
 
     diversify = str(os.environ.get('AE_REFILL_DIVERSIFY', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
-    kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '10'), 6)
-    pages_per_kw = max(1, safe_int(os.environ.get('AE_REFILL_PAGES_PER_KEYWORD', '2'), 1))
+    kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '6'), 6)
+    pages_per_kw = max(1, safe_int(os.environ.get('AE_REFILL_PAGES_PER_KEYWORD', '1'), 1))
     max_per_bucket = max(1, safe_int(os.environ.get('AE_REFILL_MAX_PER_BUCKET', '4'), 4))
 
     with FILE_LOCK:
@@ -3053,13 +3027,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
         for kw_used in kw_list:
             if len(candidates) >= (max_needed * 5):
                 break
-            rand_start = str(os.environ.get('AE_REFILL_RANDOM_START_PAGE', '0') or '0').strip().lower() in ('1','true','yes','on')
-
-            start_page = 1
-
-            if rand_start:
-
-                start_page = random.randint(1, max(1, safe_int(os.environ.get('AE_REFILL_START_PAGE_MAX', '3'), 3)))
+            start_page = random.randint(1, max(1, safe_int(os.environ.get('AE_REFILL_START_PAGE_MAX', '3'), 3)))
 
             for page_no in range(start_page, start_page + pages_per_kw):
                 last_page = page_no
@@ -5879,68 +5847,40 @@ def on_inline_click(c):
 
 
     elif data == "toggle_price_input_currency":
-        # Toggle how we interpret incoming affiliate prices (USD vs ILS)
-        AE_PRICE_INPUT_CURRENCY = "ILS" if AE_PRICE_INPUT_CURRENCY == "USD" else "USD"
-        _set_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY)
-        # If switched away from USD, conversion is irrelevant (but we keep the stored flag)
-        bot.answer_callback_query(c.id, f"עודכן מטבע מקור למחירים: {AE_PRICE_INPUT_CURRENCY}")
-        # Refresh the same screen (search menu vs main menu)
+        bot.answer_callback_query(c.id, "בוט מוגדר תמיד למשוך USD ולהמיר רק בסוף (אחרי AI).", show_alert=True)
         if c.message and (c.message.text or "").startswith("🔎"):
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
         else:
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
 
     elif data == "toggle_usd2ils_convert":
-        if AE_PRICE_INPUT_CURRENCY != "USD":
-            bot.answer_callback_query(c.id, "כדי להפעיל המרה צריך שמטבע המקור יהיה USD.", show_alert=True)
-            return
-        if AE_FORCE_USD_ONLY:
-            bot.answer_callback_query(c.id, "מצב USD בלבד פעיל. כבה אותו כדי לאפשר המרה.", show_alert=True)
-            return
-        AE_PRICE_CONVERT_USD_TO_ILS = not bool(AE_PRICE_CONVERT_USD_TO_ILS)
-        _set_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS)
-        state_txt = "פעיל" if AE_PRICE_CONVERT_USD_TO_ILS else "כבוי"
-        bot.answer_callback_query(c.id, f"המרה $→₪: {state_txt}")
+        # Single-source mode: always ingest USD; optional conversion happens only after AI.
+        set_convert_after_ai(not bool(CONVERT_AFTER_AI))
+        state_txt = "פעיל" if CONVERT_AFTER_AI else "כבוי (דולר)"
+        bot.answer_callback_query(c.id, f"המרה בסוף (אחרי AI): {state_txt}")
+        # Refresh screen
         if c.message and (c.message.text or "").startswith("🔎"):
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
         else:
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
+
+    elif data == "toggle_convert_after_ai":
+        # Single-source mode: always ingest USD; optional conversion happens only after AI.
+        set_convert_after_ai(not bool(CONVERT_AFTER_AI))
+        state_txt = "פעיל" if CONVERT_AFTER_AI else "כבוי (דולר)"
+        bot.answer_callback_query(c.id, f"המרה בסוף (אחרי AI): {state_txt}")
+        # Refresh screen
+        if c.message and (c.message.text or "").startswith("🔎"):
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
+        else:
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
 
     elif data == "toggle_force_usd_only":
-        # Hard USD-only lock (disables conversion + forces input currency USD)
-        AE_FORCE_USD_ONLY = not bool(AE_FORCE_USD_ONLY)
-        _set_state_bool("force_usd_only", AE_FORCE_USD_ONLY)
-        if AE_FORCE_USD_ONLY:
-            AE_PRICE_INPUT_CURRENCY = "USD"
-            AE_PRICE_CONVERT_USD_TO_ILS = False
-            _set_state_str("price_input_currency", "USD")
-            _set_state_bool("convert_usd_to_ils", False)
-            bot.answer_callback_query(c.id, "מצב USD בלבד: פעיל")
-        else:
-            bot.answer_callback_query(c.id, "מצב USD בלבד: כבוי")
-
-        # Refresh the same screen (search menu vs main menu)
+        bot.answer_callback_query(c.id, "בוט מוגדר תמיד למשוך USD ולהמיר רק בסוף (אחרי AI).", show_alert=True)
         if c.message and (c.message.text or "").startswith("🔎"):
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
         else:
-            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
-
-    elif data.startswith("delay_"):
-        try:
-            seconds = int(data.split("_", 1)[1])
-            if seconds <= 0:
-                raise ValueError("מרווח חייב להיות חיובי")
-            POST_DELAY_SECONDS = seconds
-            save_delay_seconds(seconds)
-            write_auto_flag("off")
-            DELAY_EVENT.set()
-            mins = seconds // 60
-            safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                              new_text=f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות). (מצב ידני)",
-                              reply_markup=inline_menu(), cb_id=c.id)
-        except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
-
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, text=c.message.text, reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
 
     elif data == "toggle_broadcast":
         new_flag = not is_broadcast_enabled()
@@ -6047,12 +5987,7 @@ def on_inline_click(c):
                           new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id)
     elif data == "refill_now":
         max_needed = 80
-        q_before = len(read_pending())
         added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed)
-        try:
-            _notify_admins(_refill_status_text(added, dup, q_before, total_after, last_error))
-        except Exception:
-            pass
         text = (
             "🔥 מילוי מהאפילייט הושלם.\n"
             f"נוספו לתור: {added}\n"
@@ -6511,12 +6446,7 @@ def cmd_refill_now(msg):
         bot.reply_to(msg, "אין הרשאה.")
         return
     max_needed = 80
-    q_before = len(read_pending())
     added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed)
-    try:
-        _notify_admins(_refill_status_text(added, dup, q_before, total_after, last_error))
-    except Exception:
-        pass
     bot.reply_to(msg,
         "🔥 מילוי מהאפילייט הושלם.\n"
         f"נוספו לתור: {added}\n"
@@ -6574,38 +6504,6 @@ def auto_post_loop():
         DELAY_EVENT.wait(timeout=(POST_DELAY_SECONDS if sent else 60))
         DELAY_EVENT.clear()
 
-
-def _notify_admins(text: str, parse_mode: str = "HTML"):
-    """Send a message to all admins (best-effort)."""
-    try:
-        ids = list(ADMIN_USER_IDS) if isinstance(ADMIN_USER_IDS, (list, set, tuple)) else []
-        for uid in ids:
-            try:
-                bot.send_message(int(uid), text, parse_mode=parse_mode, disable_web_page_preview=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-def _refill_status_text(added: int, dup: int, q_before: int, q_after: int, last_error: str | None):
-    cats = get_selected_category_ids()
-    cats_lbl = f"{len(cats)}" if cats else "0"
-    sorts = (os.environ.get("AE_REFILL_SORTS") or AE_REFILL_SORT or "").strip()
-    err = ""
-    if last_error:
-        try:
-            err = "\n⚠️ <b>שגיאה</b>: <code>" + html.escape(str(last_error)) + "</code>"
-        except Exception:
-            err = "\n⚠️ שגיאה: " + str(last_error)
-    return (
-        "🔄 <b>Refill Affiliate</b>\n"
-        f"📥 לפני: <b>{q_before}</b> | ✅ נוספו: <b>{added}</b> | ♻️ כפולים: <b>{dup}</b> | 📤 אחרי: <b>{q_after}</b>\n"
-        f"🧩 קטגוריות נבחרות: <b>{cats_lbl}</b> | 🧠 AI: <b>{'ON' if _ai_enabled() else 'OFF'}</b>\n"
-        f"🔎 סינון: הזמנות≥<b>{MIN_ORDERS}</b> | דירוג≥<b>{MIN_RATING}</b>% | עמלה≥<b>{MIN_COMMISSION}</b>% | משלוח חינם בלבד: <b>{'כן' if FREE_SHIP_ONLY else 'לא'}</b>\n"
-        f"💱 מטבע מקור: <b>{AE_PRICE_INPUT_CURRENCY}</b> | המרה $→₪: <b>{'כן' if AE_PRICE_CONVERT_USD_TO_ILS else 'לא'}</b> | שער: <b>{float(USD_TO_ILS_RATE):g}</b> | תצוגה: <b>{_display_currency_code()}</b>\n"
-        f"⚙️ REFILL: interval=<b>{AE_REFILL_INTERVAL_SECONDS}s</b> | min_queue=<b>{AE_REFILL_MIN_QUEUE}</b> | page_size=<b>{AE_REFILL_PAGE_SIZE}</b> | max_pages=<b>{AE_REFILL_MAX_PAGES}</b> | sorts=<b>{html.escape(sorts or 'n/a')}</b>"
-        + err
-    )
 # ========= REFILL DAEMON =========
 def refill_daemon():
     if not AE_REFILL_ENABLED:
@@ -6614,17 +6512,8 @@ def refill_daemon():
     print("[INFO] Refill daemon started", flush=True)
 
     while True:
-        # If broadcast is OFF, we pause refill by default (prevents immediate fetch after deploy).
+        # Hard stop: if broadcast is OFF, do not refill (prevents immediate fetch after deploy)
         if not is_broadcast_enabled():
-            # notify admins at most once per 15 minutes
-            try:
-                now = int(time.time())
-                last = _get_state_int('refill_paused_note_ts', 0)
-                if now - last > 900:
-                    _set_state_str('refill_paused_note_ts', str(now))
-                    _notify_admins('⏸️ <b>Refill paused</b> כי שידור כבוי. הפעל שידור כדי לאפשר מילוי אפילייט.')
-            except Exception:
-                pass
             time.sleep(60)
             continue
 
@@ -6634,12 +6523,7 @@ def refill_daemon():
 
             if qlen < AE_REFILL_MIN_QUEUE:
                 need = max(AE_REFILL_MIN_QUEUE - qlen, 30)
-                q_before = qlen
                 added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=need)
-                try:
-                    _notify_admins(_refill_status_text(added, dup, q_before, total_after, last_error))
-                except Exception:
-                    pass
 
                 msg = (
                     "🔥 מילוי מהאפילייט הושלם.\n"
