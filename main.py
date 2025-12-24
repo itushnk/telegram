@@ -279,6 +279,114 @@ AUTO_FLAG_FILE          = os.path.join(BASE_DIR, "auto_delay.flag")
 BROADCAST_FLAG_FILE     = os.path.join(BASE_DIR, "broadcast_enabled.flag")
 ADMIN_CHAT_ID_FILE      = os.path.join(BASE_DIR, "admin_chat_id.txt")  # לשידורי סטטוס/מילוי
 
+# ========= DEDUP / DIVERSITY HISTORY =========
+# Keeps a rolling history of products we've already queued/sent, to avoid repeating the same product
+# (even when AliExpress returns multiple affiliate links for the same product_id).
+DEDUP_HISTORY_PATH = os.path.join(BASE_DIR, "dedup_history.json")
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
+
+DEDUP_KEEP_DAYS_DEFAULT = _env_int("AE_DEDUP_KEEP_DAYS", 7)
+DEDUP_KEEP_DAYS = _get_state_int("dedup_keep_days", DEDUP_KEEP_DAYS_DEFAULT)
+
+DEDUP_MAX_RECORDS = _env_int("AE_DEDUP_MAX_RECORDS", 3000)
+DEDUP_RECENT_CAT_WINDOW = _env_int("AE_DEDUP_RECENT_CAT_WINDOW", 200)
+
+def _load_dedup_history() -> dict:
+    try:
+        if not os.path.exists(DEDUP_HISTORY_PATH):
+            return {"items": []}
+        with open(DEDUP_HISTORY_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        if not isinstance(d, dict):
+            return {"items": []}
+        items = d.get("items") or []
+        if not isinstance(items, list):
+            items = []
+        d["items"] = items
+        return d
+    except Exception:
+        return {"items": []}
+
+def _save_dedup_history(d: dict):
+    try:
+        tmp = DEDUP_HISTORY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d or {"items": []}, f, ensure_ascii=False)
+        os.replace(tmp, DEDUP_HISTORY_PATH)
+    except Exception:
+        pass
+
+DEDUP_HISTORY = _load_dedup_history()
+
+def _dedup_cleanup():
+    try:
+        keep_seconds = max(1, int(DEDUP_KEEP_DAYS)) * 24 * 3600
+        now = time.time()
+        items = DEDUP_HISTORY.get("items") or []
+        cleaned = []
+        for it in items:
+            try:
+                ts = float(it.get("ts") or 0)
+            except Exception:
+                ts = 0
+            if ts and (now - ts) <= keep_seconds:
+                cleaned.append(it)
+        # cap
+        if len(cleaned) > DEDUP_MAX_RECORDS:
+            cleaned = cleaned[-DEDUP_MAX_RECORDS:]
+        DEDUP_HISTORY["items"] = cleaned
+    except Exception:
+        pass
+
+def _dedup_sets() -> tuple[set[str], set[str]]:
+    # returns (seen_ids, seen_titlefps)
+    _dedup_cleanup()
+    ids = set()
+    fps = set()
+    for it in (DEDUP_HISTORY.get("items") or []):
+        iid = str(it.get("id") or "").strip()
+        tfp = str(it.get("tfp") or "").strip()
+        if iid:
+            ids.add(iid)
+        if tfp:
+            fps.add(tfp)
+    return ids, fps
+
+def dedup_recent_category_counts() -> dict[str, int]:
+    """Counts categories in the most recent window, to prefer underused categories."""
+    _dedup_cleanup()
+    items = DEDUP_HISTORY.get("items") or []
+    tail = items[-DEDUP_RECENT_CAT_WINDOW:] if DEDUP_RECENT_CAT_WINDOW > 0 else items
+    counts: dict[str, int] = {}
+    for it in tail:
+        c = str(it.get("cat") or "").strip()
+        if not c:
+            continue
+        counts[c] = counts.get(c, 0) + 1
+    return counts
+
+def dedup_mark_seen(row: dict, source: str = ""):
+    try:
+        item_id = str(row.get("ItemId") or "").strip() or _extract_item_id_from_url(row.get("BuyLink") or "")
+        tfp = _title_fingerprint(str(row.get("Title") or ""))
+        cat = str(row.get("CategoryId") or "").strip()
+        if not item_id and not tfp:
+            return
+        DEDUP_HISTORY.setdefault("items", [])
+        DEDUP_HISTORY["items"].append({"ts": time.time(), "id": item_id, "tfp": tfp, "cat": cat, "src": source})
+        _dedup_cleanup()
+        _save_dedup_history(DEDUP_HISTORY)
+    except Exception:
+        pass
+
 USD_TO_ILS_RATE_DEFAULT = float(os.environ.get("USD_TO_ILS_RATE", "3.55") or "3.55")
 
 USD_TO_ILS_RATE = _get_state_float("usd_to_ils_rate", USD_TO_ILS_RATE_DEFAULT)
@@ -1847,6 +1955,11 @@ def send_next_locked(source: str = "loop") -> bool:
                 log_exc(f"{source}: write FAILED permanently: {e2}")
                 return False
 
+        try:
+            dedup_mark_seen(item, source="sent")
+        except Exception:
+            pass
+
         log_info(f"{source}: sent & advanced queue (ItemId={item_id})")
         return True
 
@@ -1993,11 +2106,55 @@ def cmd_ai_test(msg):
         bot.reply_to(msg, f"❌ בדיקת AI נכשלה: {e}")
 
 # ========= MERGE =========
+def _normalize_title_for_dedup(title: str) -> str:
+    """Normalize product titles for dedup across near-identical listings."""
+    s = str(title or "").strip().lower()
+    if not s:
+        return ""
+    # remove common noise tokens
+    s = re.sub(r"[\[\]{}()|]+", " ", s)
+    s = re.sub(r"[^\w\s-]", " ", s)
+    # remove very common marketing words
+    s = re.sub(r"\b(new|hot|sale|best|free|shipping|original|genuine|202\d|official|for|with)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _title_fingerprint(title: str) -> str:
+    s = _normalize_title_for_dedup(title)
+    if not s:
+        return ""
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+def _extract_item_id_from_url(url: str) -> str:
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    m = re.search(r"/item/(\d+)\.html", u)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]productId=(\d+)", u)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(\d{9,})\b", u)
+    return m.group(1) if m else ""
+
+# ========= MERGE =========
 def _key_of_row(r: dict):
+    """Stable key for dedup.
+
+    IMPORTANT: Do not include BuyLink in the key when ItemId exists.
+    AliExpress may return multiple affiliate URLs for the same product_id,
+    and we must treat them as the same product to avoid duplicates.
+    """
     item_id = (r.get("ItemId") or "").strip()
-    title   = (r.get("Title") or "").strip()
-    buy     = (r.get("BuyLink") or "").strip()
-    return (item_id if item_id else None, title if not item_id else None, buy)
+    if not item_id:
+        item_id = _extract_item_id_from_url(r.get("BuyLink") or "")
+    if item_id:
+        return ("id:" + item_id,)
+
+    title = (r.get("Title") or "").strip()
+    fp = _title_fingerprint(title) or _title_fingerprint(r.get("BuyLink") or "")
+    return ("t:" + (fp or "unknown"),)
 
 def merge_from_data_into_pending():
     """Merge rows from DATA_CSV into PENDING_CSV.
@@ -2578,6 +2735,22 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     orig_disp = price_text_to_display_amount(orig_text, USD_TO_ILS_RATE)
 
     product_id = str(p.get("product_id", "")).strip()
+    # category fields (used for diversification; keys vary across API responses)
+    cat_id = str(
+        p.get("first_level_category_id")
+        or p.get("category_id")
+        or p.get("categoryId")
+        or p.get("category_id1")
+        or p.get("category_id2")
+        or ""
+    ).strip()
+    cat_name = str(
+        p.get("first_level_category_name")
+        or p.get("category_name")
+        or p.get("categoryName")
+        or ""
+    ).strip()
+
 
     if AE_PRICE_DEBUG:
         try:
@@ -2601,6 +2774,8 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
     return normalize_row_keys(
         {
             "ItemId": product_id,
+            "CategoryId": cat_id,
+            "CategoryName": cat_name,
             "ImageURL": (p.get("product_main_image_url") or "").strip(),
             "Title": (p.get("product_title") or "").strip(),
             "OriginalPrice": orig_disp,
@@ -2641,11 +2816,14 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     diversify = str(os.environ.get('AE_REFILL_DIVERSIFY', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
     kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '6'), 6)
     pages_per_kw = max(1, safe_int(os.environ.get('AE_REFILL_PAGES_PER_KEYWORD', '1'), 1))
-    max_per_bucket = max(1, safe_int(os.environ.get('AE_REFILL_MAX_PER_BUCKET', '12'), 12))
+    max_per_bucket = max(1, safe_int(os.environ.get('AE_REFILL_MAX_PER_BUCKET', '4'), 4))
 
     with FILE_LOCK:
         pending_rows = read_products(PENDING_CSV)
         existing_keys = {_key_of_row(r) for r in pending_rows}
+
+    # global dedup history (already sent/queued in the past X days)
+    seen_ids, seen_tfps = _dedup_sets()
 
     added = 0
     dup = 0
@@ -2739,9 +2917,24 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
         if k in existing_keys:
             dup += 1
             return
+
+        # Strong dedup: same product_id or same normalized title (even if affiliate URL changes)
+        item_id = str(row.get("ItemId") or "").strip() or _extract_item_id_from_url(row.get("BuyLink") or "")
+        tfp = _title_fingerprint(str(row.get("Title") or ""))
+
+        if (item_id and item_id in seen_ids) or (tfp and tfp in seen_tfps):
+            dup += 1
+            return
+
         if not _passes_filters(row):
             return
+
         existing_keys.add(k)
+        if item_id:
+            seen_ids.add(item_id)
+        if tfp:
+            seen_tfps.add(tfp)
+
         candidates.append((row, bucket))
         bucket_after_filters[bucket] = bucket_after_filters.get(bucket, 0) + 1
 
@@ -2790,7 +2983,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
                     except Exception:
                         pass
 
-                    b = _bucket_key(kw_used) + f"|cat:{cat_id}"
+                    b = f"cat:{cat_id}"
                     bucket_raw_counts[b] = bucket_raw_counts.get(b, 0) + len(products)
                     for p in products:
                         row = _map_affiliate_product_to_row(p)
@@ -2843,11 +3036,14 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
                 except Exception:
                     pass
 
-                b = _bucket_key(kw_used)
-                bucket_raw_counts[b] = bucket_raw_counts.get(b, 0) + len(products)
+                # Track raw counts per keyword bucket, but select by category for better diversity
+                b_base = _bucket_key(kw_used)
+                bucket_raw_counts[b_base] = bucket_raw_counts.get(b_base, 0) + len(products)
 
                 for p in products:
                     row = _map_affiliate_product_to_row(p)
+                    cid = str(row.get("CategoryId") or "").strip()
+                    b = ("cat:" + cid) if cid else b_base
                     if not row.get("BuyLink"):
                         skipped_no_link += 1
                         continue
@@ -2869,8 +3065,28 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     selected_counts: dict[str, int] = {b: 0 for b in by_bucket}
 
     buckets = list(by_bucket.keys())
+
+    # Prefer buckets/categories that were used פחות לאחרונה (reduces repeats across refills)
+    recent_cat_counts = dedup_recent_category_counts()
+
+    def _bucket_score(bb: str) -> tuple[int, float]:
+        bb = str(bb or "")
+        if bb.startswith("cat:"):
+            cat = bb.split(":", 1)[1]
+            return (recent_cat_counts.get(cat, 0), random.random())
+        return (9999, random.random())
+
     try:
-        random.shuffle(buckets)
+        buckets.sort(key=_bucket_score)
+    except Exception:
+        pass
+
+    # light shuffle for variety among same-score buckets
+    try:
+        for i in range(len(buckets) - 1):
+            if random.random() < 0.2:
+                j = random.randrange(len(buckets))
+                buckets[i], buckets[j] = buckets[j], buckets[i]
     except Exception:
         pass
 
