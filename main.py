@@ -1,4 +1,5 @@
 import os
+import json
 USE_WEBHOOK = os.getenv('USE_WEBHOOK','1').strip().lower() not in ('0','false','no')
 # -*- coding: utf-8 -*-
 """
@@ -3328,6 +3329,19 @@ MANUAL_SEARCH_SESS: dict[int, dict] = {}  # uid -> {q, page, per_page, results:[
 MANUAL_SEARCH_MSG: dict[int, tuple[int,int]] = {}  # uid -> (chat_id, message_id) last preview message
 
 
+# AI re-rank for manual search (improves relevance with semantic scoring)
+MS_AI_RERANK_DEFAULT = env_bool("MS_AI_RERANK", True)
+MS_AI_RERANK = _get_state_bool("ms_ai_rerank", MS_AI_RERANK_DEFAULT)
+
+def ms_ai_rerank_enabled() -> bool:
+    return bool(MS_AI_RERANK) and _ai_enabled()
+
+def set_ms_ai_rerank(flag: bool) -> None:
+    global MS_AI_RERANK
+    MS_AI_RERANK = bool(flag)
+    _set_state_bool("ms_ai_rerank", MS_AI_RERANK)
+
+
 def _ms_clear(uid: int):
     """Clear manual search session and delete last preview message if exists."""
     try:
@@ -3597,6 +3611,116 @@ def _ms_eval_row_filters(row: dict) -> tuple[bool, str]:
         return False, "אין קישור רכישה"
     return True, ""
 
+
+# --- AI semantic rerank for manual search (optional) ---
+_RERANK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "i": {"type": "integer"},
+                    "score": {"type": "integer", "minimum": 0, "maximum": 100}
+                },
+                "required": ["i", "score"],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": ["scores"],
+    "additionalProperties": False
+}
+
+def _openai_structured_rerank(client, prompt: str) -> dict:
+    """Return parsed JSON dict in schema {scores:[{i:int,score:int}]}."""
+    # Prefer Responses API (Structured Outputs)
+    if hasattr(client, "responses") and hasattr(client.responses, "create"):
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL_EFFECTIVE,
+                input=prompt,
+                timeout=GPT_TIMEOUT_SECONDS,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "manual_search_rerank",
+                        "schema": _RERANK_SCHEMA,
+                        "strict": True,
+                    }
+                },
+            )
+            text_out = getattr(resp, "output_text", None) or ""
+            return json.loads(text_out)
+        except Exception as e:
+            logging.warning(f"[AI] rerank via Responses failed -> fallback: {e}")
+
+    # Fallback: Chat Completions (best effort JSON)
+    system = 'Return ONLY valid JSON matching: {"scores":[{"i":0,"score":0}]}'
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL_EFFECTIVE,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        temperature=0.2,
+        timeout=GPT_TIMEOUT_SECONDS,
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    return json.loads(content)
+
+def _ms_apply_ai_rerank(user_query: str, results: list[dict], max_items: int = 28) -> list[dict]:
+    """Add ai_score to results and reorder/filter based on semantic relevance."""
+    if not results or not ms_ai_rerank_enabled():
+        return results
+
+    # Build candidates (only those with a product row)
+    cand = []
+    for r in results:
+        row = r.get("row") or {}
+        title = (row.get("Title") or row.get("Product Desc") or "").strip()
+        if title:
+            cand.append((r, title))
+
+    if not cand:
+        return results
+
+    cand = cand[:max_items]
+    prompt_lines = [f"Query (user, Hebrew): {user_query}", "", "Products:"]
+    for idx, (_, title) in enumerate(cand):
+        # keep titles short to reduce tokens
+        t = re.sub(r"\s+", " ", title)[:160]
+        prompt_lines.append(f"{idx}. {t}")
+    prompt_lines.append(
+        "\nReturn JSON with a score 0-100 per item index. Higher=more relevant to the user's intent. " 
+        "Be strict: if it's not the same product family, score <=30."
+    )
+    prompt = "\n".join(prompt_lines)
+
+    client = _get_openai_client()
+    if client is None:
+        return results
+
+    data = _openai_structured_rerank(client, prompt)
+    scores = {int(x.get("i")): int(x.get("score")) for x in (data.get("scores") or []) if str(x.get("i")).isdigit()}
+
+    for idx, (r, _) in enumerate(cand):
+        sc = int(scores.get(idx, 0))
+        r["ai_score"] = sc
+
+        # Adjust ok flag with AI if needed
+        if sc >= 80 and not r.get("ok"):
+            r["ok"] = True
+            r["reason"] = (r.get("reason") or "") + " | 🤖 AI: רלוונטי"
+        elif sc <= 40 and r.get("ok"):
+            r["ok"] = False
+            r["reason"] = (r.get("reason") or "") + " | 🤖 AI: לא רלוונטי"
+
+    # Reorder: ok first, then ai_score, then existing overlap/orders sorting already in results
+    def _key(r):
+        return (1 if r.get("ok") else 0, int(r.get("ai_score", 0)))
+    results_sorted = sorted(results, key=_key, reverse=True)
+    return results_sorted
+
+
 def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected_categories: bool = False, relaxed_match: bool = False) -> dict:
     """Fetch one page from AliExpress Affiliate API and prepare preview session.
 
@@ -3687,6 +3811,15 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         ),
         reverse=True,
     )
+
+    # Optional: AI semantic rerank to improve relevance (can be toggled in menu)
+    try:
+        results = _ms_apply_ai_rerank(q_user, results)
+    except Exception as e:
+        try:
+            log_info(f"[MS] AI rerank failed: {e}")
+        except Exception:
+            pass
 
     sess = {
         # what we show to the admin
@@ -4583,6 +4716,7 @@ def _prod_search_menu_text() -> str:
         f"⭐ מינ׳ דירוג: <b>{float(MIN_RATING):g}%</b>\n"
         f"💰 מינ׳ עמלה: <b>{float(MIN_COMMISSION):g}%</b>\n"
         f"🔢 שער USD→ILS: <b>{float(USD_TO_ILS_RATE):g}</b>\n"
+        f"🧠 דיוק חיפוש AI: <b>{'פעיל' if ms_ai_rerank_enabled() else 'כבוי'}</b>\n"
     )
 
 def _prod_search_menu_kb():
@@ -4605,6 +4739,9 @@ def _prod_search_menu_kb():
         types.InlineKeyboardButton("💱 שער המרה", callback_data="ps_set_rate"),
     )
     kb.add(
+        types.InlineKeyboardButton("🧠 דיוק חיפוש AI", callback_data="ms_ai_toggle"),
+    )
+    kb.add(
         types.InlineKeyboardButton("↩️ חזרה לתפריט", callback_data="ps_back_main"),
     )
     return kb
@@ -4625,18 +4762,18 @@ def _rate_panel_text() -> str:
 
 
 def _rate_panel_kb() -> "types.InlineKeyboardMarkup":
-    kb = InlineKeyboardMarkup(row_width=3)
+    kb = types.InlineKeyboardMarkup(row_width=3)
     kb.add(
-        InlineKeyboardButton("➖0.05", callback_data="rate_dec_005"),
-        InlineKeyboardButton("➖0.01", callback_data="rate_dec_001"),
-        InlineKeyboardButton("✍️ הקלדה", callback_data="rate_manual"),
+        types.InlineKeyboardButton("➖0.05", callback_data="rate_dec_005"),
+        types.InlineKeyboardButton("➖0.01", callback_data="rate_dec_001"),
+        types.InlineKeyboardButton("✍️ הקלדה", callback_data="rate_manual"),
     )
     kb.add(
-        InlineKeyboardButton("➕0.01", callback_data="rate_inc_001"),
-        InlineKeyboardButton("➕0.05", callback_data="rate_inc_005"),
-        InlineKeyboardButton("🔁 איפוס 3.70", callback_data="rate_reset_370"),
+        types.InlineKeyboardButton("➕0.01", callback_data="rate_inc_001"),
+        types.InlineKeyboardButton("➕0.05", callback_data="rate_inc_005"),
+        types.InlineKeyboardButton("🔁 איפוס 3.70", callback_data="rate_reset_370"),
     )
-    kb.add(InlineKeyboardButton("↩️ חזרה", callback_data="rate_back"))
+    kb.add(types.InlineKeyboardButton("↩️ חזרה", callback_data="rate_back"))
     return kb
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -4791,6 +4928,24 @@ def on_inline_click(c):
         safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=c.id)
         return
 
+
+
+    if data == "ms_ai_toggle":
+        bot.answer_callback_query(c.id)
+        try:
+            set_ms_ai_rerank(not bool(MS_AI_RERANK))
+        except Exception:
+            pass
+        safe_edit_message(
+            bot,
+            chat_id=c.message.chat.id,
+            message=c.message,
+            new_text=_prod_search_menu_text(),
+            reply_markup=_prod_search_menu_kb(),
+            parse_mode="HTML",
+            cb_id=c.id,
+        )
+        return
 
     if data == "ps_set_rate":
         # Show rate control panel (buttons)
@@ -5613,6 +5768,10 @@ def handle_set_delay_minutes_text(m):
         POST_DELAY_SECONDS = seconds
         save_delay_seconds(POST_DELAY_SECONDS)
         try:
+            write_auto_flag("off")
+        except Exception:
+            pass
+        try:
             DELAY_EVENT.set()
         except Exception:
             pass
@@ -5880,8 +6039,7 @@ def cmd_refill_now(msg):
 
 # ========= SENDER LOOP =========
 def auto_post_loop():
-    if not os.path.exists(SCHEDULE_FLAG_FILE):
-        set_schedule_enforced(True)
+    # Do not force schedule enforcement by default; admin can toggle from the menu.
     init_pending()
 
     while True:
@@ -5963,132 +6121,6 @@ def refill_daemon():
         time.sleep(AE_REFILL_INTERVAL_SECONDS)
 
 # ========= MAIN =========
-
-# ========= TEXT INPUT ROUTER (for menus that expect typed input) =========
-@bot.message_handler(func=lambda m: True, content_types=['text'])
-def on_text_input(m):
-    # NOTE: This handler is a catch-all for free-typed text. To avoid making the bot look "dead",
-    # we must NOT swallow slash-commands (e.g. /start, /help, /myid). Let the dedicated command
-    # handlers process those.
-    raw_text = (m.text or "").strip()
-    try:
-        log_info(f"[IN] text from uid={getattr(m.from_user,'id',None)} chat={getattr(m.chat,'id',None)} len={len(raw_text)}")
-    except Exception:
-        pass
-    if raw_text.startswith("/"):
-        return
-
-    # Only admins can drive typed inputs
-    if not _is_admin(m):
-        try:
-            bot.reply_to(m, "⛔ אין לך הרשאה לבצע פעולה זו. אם אתה מנהל, ודא שה-ID שלך נמצא ב-ADMIN_USER_IDS ושלח /myid.")
-        except Exception:
-            pass
-        return
-
-    uid = m.from_user.id
-    text = raw_text
-
-    # Allow cancel
-    if text.lower() in ("/cancel", "cancel", "ביטול"):
-        # clear all pending waits for this user
-        PROD_SEARCH_WAIT.pop(uid, None)
-        RATE_SET_WAIT.pop(uid, None)
-        DELAY_SET_WAIT.pop(uid, None)
-        bot.reply_to(m, "בוטל ✅")
-        return
-
-    # 1) USD→ILS rate setter
-    if RATE_SET_WAIT.get(uid):
-        # In group chats, only accept a reply to the prompt message (reduces accidental triggers)
-        prompt = RATE_SET_PROMPT.get(uid)
-        if getattr(m.chat, "type", "") in ("group", "supergroup") and prompt:
-            if not getattr(m, "reply_to_message", None) or m.reply_to_message.message_id != prompt[1]:
-                return
-
-        RATE_SET_WAIT.pop(uid, None)
-        RATE_SET_PROMPT.pop(uid, None)
-        try:
-            v = float(text.replace(",", "."))
-            v = max(0.1, round(v, 2))
-            set_usd_to_ils_rate(v)
-            bot.reply_to(m, f"שער עודכן ✅ 1$ = ₪{USD_TO_ILS_RATE:g}")
-
-            # Refresh the rate panel/menu if we have context
-            ctx = RATE_SET_CTX.pop(uid, None)
-            if ctx:
-                try:
-                    bot.edit_message_text(
-                        _prod_search_menu_text(),
-                        chat_id=ctx[0],
-                        message_id=ctx[1],
-                        parse_mode="HTML",
-                        reply_markup=_prod_search_menu_kb(),
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            bot.reply_to(m, "לא הצלחתי להבין את השער. נסה למשל: 3.70")
-        return
-
-    # 2) Post delay (minutes)
-    if DELAY_SET_WAIT.get(uid):
-        DELAY_SET_WAIT.pop(uid, None)
-        try:
-            minutes = int(float(text))
-            minutes = max(1, min(minutes, 24*60))
-            _set_post_delay_seconds(minutes * 60)
-            bot.reply_to(m, f"מרווח פרסום עודכן ✅ כל {minutes} דקות")
-        except Exception:
-            bot.reply_to(m, "לא הצלחתי להבין. שלח מספר דקות (למשל 20).")
-        return
-
-    # 3) Product search typed query
-    if PROD_SEARCH_WAIT.get(uid):
-        PROD_SEARCH_WAIT.pop(uid, None)
-        query = text
-        try:
-            _ms_start(uid=uid, chat_id=m.chat.id, q=query)
-        except Exception as e:
-            bot.reply_to(m, f"שגיאה בחיפוש: {e}")
-        return
-
-    # Otherwise ignore (do not spam)
-    return
-
-
-if __name__ == "__main__":
-    log_info(f"[BOOT] main.py {CODE_VERSION} fp={_code_fingerprint()} commit={os.environ.get('RAILWAY_GIT_COMMIT_SHA') or os.environ.get('RAILWAY_COMMIT_SHA') or os.environ.get('GIT_COMMIT') or 'n/a'}")
-    BROADCAST_FORCE_OFF_ON_BOOT = env_bool("BROADCAST_FORCE_OFF_ON_BOOT", True)
-    if BROADCAST_FORCE_OFF_ON_BOOT:
-        try:
-            set_broadcast_enabled(False)
-            log_info("[BOOT] Broadcast forced OFF on boot (BROADCAST_FORCE_OFF_ON_BOOT=1)")
-        except Exception as e:
-            log_info(f"[BOOT] Broadcast force-off failed: {e}")
-
-    log_info(f"Instance: {socket.gethostname()}")
-
-    # הדפסה קצרה של קונפיג (מסכות)
-    print(f"[CFG] AE_TOP_URL={AE_TOP_URL} | CANDIDATES={' | '.join(AE_TOP_URL_CANDIDATES)}", flush=True)
-    print(f"[CFG] AE_APP_KEY={_mask(AE_APP_KEY)} | AE_APP_SECRET={_mask(AE_APP_SECRET)} | AE_TRACKING_ID={_mask(AE_TRACKING_ID)}", flush=True)
-    print(f"[CFG] AE_SHIP_TO_COUNTRY={AE_SHIP_TO_COUNTRY} | AE_TARGET_LANGUAGE={AE_TARGET_LANGUAGE} | SORT={AE_REFILL_SORT}", flush=True)
-
-    try:
-        me = bot.get_me()
-        print(f"Bot: @{me.username} ({me.id})", flush=True)
-    except Exception as e:
-        print("getMe failed:", e, flush=True)
-
-
-    # Extra runtime diagnostics (safe)
-    log_info(f"[CFG] PUBLIC_CHANNEL={os.environ.get('PUBLIC_CHANNEL', '')} | CURRENT_TARGET={CURRENT_TARGET}")
-    log_info(f"[CFG] JOIN_URL={JOIN_URL}")
-    log_info(f"[CFG] AE_PRICE_BUCKETS={AE_PRICE_BUCKETS_RAW or '(none)'} | parsed={AE_PRICE_BUCKETS}")
-    log_info(f"[CFG] PRICE_INPUT_CURRENCY={AE_PRICE_INPUT_CURRENCY} | CONVERT_USD_TO_ILS={AE_PRICE_CONVERT_USD_TO_ILS} | DISPLAY={_display_currency_code()}")
-    log_info(f"[CFG] MIN_ORDERS={MIN_ORDERS} | MIN_RATING={MIN_RATING:g}% | MIN_COMMISSION={MIN_COMMISSION:g}% | FREE_SHIP_ONLY={FREE_SHIP_ONLY} (threshold>=₪{AE_FREE_SHIP_THRESHOLD_ILS:g}) | CATEGORIES={CATEGORY_IDS_RAW or '(none)'}")
-    log_info(f"[CFG] PYTHONUNBUFFERED={os.environ.get('PYTHONUNBUFFERED', '')} | PID={os.getpid()}")
-
 
 # AI diagnostics
 try:
