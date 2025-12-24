@@ -2421,7 +2421,7 @@ def affiliate_product_query(page_no: int, page_size: int, category_id: str | Non
         "promotion_rate",
 
     ])
-biz = {
+    biz = {
         "tracking_id": AE_TRACKING_ID,
         "page_no": str(page_no),
         "page_size": str(page_size),
