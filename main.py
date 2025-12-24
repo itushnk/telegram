@@ -412,12 +412,12 @@ def set_usd_to_ils_rate(v: float):
 # but sometimes the returned fields (especially app_* fields) may already be in ILS.
 # We support a runtime switch to tell the bot what currency the incoming prices are in,
 # and whether to convert USD→ILS for display.
-AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "ILS") or "ILS").strip().upper()
+AE_PRICE_INPUT_CURRENCY_DEFAULT = (os.environ.get("AE_PRICE_INPUT_CURRENCY", "USD") or "USD").strip().upper()
 AE_PRICE_INPUT_CURRENCY = (_get_state_str("price_input_currency", AE_PRICE_INPUT_CURRENCY_DEFAULT) or AE_PRICE_INPUT_CURRENCY_DEFAULT).strip().upper()
 if AE_PRICE_INPUT_CURRENCY not in ("USD", "ILS"):
     AE_PRICE_INPUT_CURRENCY = "USD"
 
-AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT = (os.environ.get("AE_PRICE_CONVERT_USD_TO_ILS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS_DEFAULT)
 
 AE_PRICE_DEBUG_DEFAULT = bool(int(os.environ.get("AE_PRICE_DEBUG", "0") or "0"))
@@ -1103,10 +1103,16 @@ def price_text_to_display_amount(price_text: str, usd_to_ils_rate: float) -> str
 
 def maybe_convert_prices_after_ai(row: dict, reason: str = "") -> bool:
     # Convert stored USD prices to ILS after AI (in-place).
+    # NOTE: Prefer leaving CONVERT_TO_ILS_AFTER_AI=0 and using runtime display conversion.
     try:
         if not env_bool("CONVERT_TO_ILS_AFTER_AI", False):
             return False
         if not isinstance(row, dict):
+            return False
+        # If we already know this row is in ILS, never convert again (prevents double-conversion).
+        if str(row.get("DisplayCurrency") or "").strip().upper() == "ILS":
+            return False
+        if str(row.get("PriceCurrency") or "").strip().upper() == "ILS":
             return False
         if str(row.get("PriceConverted") or "").strip() == "1":
             return False
@@ -2787,8 +2793,14 @@ def _map_affiliate_product_to_row(p: dict) -> dict:
             "ImageURL": (p.get("product_main_image_url") or "").strip(),
             "Title": (p.get("product_title") or "").strip(),
             "OriginalPrice": orig_disp,
-            "OriginalIsFrom": ("1" if orig_is_from else ""),
-            "SalePrice": sale_disp,
+"OriginalPriceRaw": (orig_text or ""),
+"SalePrice": sale_disp,
+"SalePriceRaw": (sale_text or ""),
+"PriceInputCurrency": AE_PRICE_INPUT_CURRENCY,
+"DisplayCurrency": _display_currency_code(),
+"USDToILSRate": f"{float(USD_TO_ILS_RATE):g}",
+"OriginalIsFrom": ("1" if orig_is_from else ""),
+
             "PriceIsFrom": ("1" if sale_is_from else ""),
             "Discount": (p.get("discount") or "").strip(),
             "Rating": (p.get("evaluate_rate") or "").strip(),
@@ -2822,8 +2834,8 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     min_commission = float(MIN_COMMISSION or 0.0)
 
     diversify = str(os.environ.get('AE_REFILL_DIVERSIFY', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
-    kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '6'), 6)
-    pages_per_kw = max(1, safe_int(os.environ.get('AE_REFILL_PAGES_PER_KEYWORD', '1'), 1))
+    kw_per_cycle = safe_int(os.environ.get('AE_REFILL_KEYWORDS_PER_CYCLE', '10'), 6)
+    pages_per_kw = max(1, safe_int(os.environ.get('AE_REFILL_PAGES_PER_KEYWORD', '2'), 1))
     max_per_bucket = max(1, safe_int(os.environ.get('AE_REFILL_MAX_PER_BUCKET', '4'), 4))
 
     with FILE_LOCK:
@@ -3041,7 +3053,13 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
         for kw_used in kw_list:
             if len(candidates) >= (max_needed * 5):
                 break
-            start_page = random.randint(1, max(1, safe_int(os.environ.get('AE_REFILL_START_PAGE_MAX', '3'), 3)))
+            rand_start = str(os.environ.get('AE_REFILL_RANDOM_START_PAGE', '0') or '0').strip().lower() in ('1','true','yes','on')
+
+            start_page = 1
+
+            if rand_start:
+
+                start_page = random.randint(1, max(1, safe_int(os.environ.get('AE_REFILL_START_PAGE_MAX', '3'), 3)))
 
             for page_no in range(start_page, start_page + pages_per_kw):
                 last_page = page_no
@@ -6029,7 +6047,12 @@ def on_inline_click(c):
                           new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id)
     elif data == "refill_now":
         max_needed = 80
+        q_before = len(read_pending())
         added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed)
+        try:
+            _notify_admins(_refill_status_text(added, dup, q_before, total_after, last_error))
+        except Exception:
+            pass
         text = (
             "🔥 מילוי מהאפילייט הושלם.\n"
             f"נוספו לתור: {added}\n"
@@ -6488,7 +6511,12 @@ def cmd_refill_now(msg):
         bot.reply_to(msg, "אין הרשאה.")
         return
     max_needed = 80
+    q_before = len(read_pending())
     added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=max_needed)
+    try:
+        _notify_admins(_refill_status_text(added, dup, q_before, total_after, last_error))
+    except Exception:
+        pass
     bot.reply_to(msg,
         "🔥 מילוי מהאפילייט הושלם.\n"
         f"נוספו לתור: {added}\n"
@@ -6546,6 +6574,38 @@ def auto_post_loop():
         DELAY_EVENT.wait(timeout=(POST_DELAY_SECONDS if sent else 60))
         DELAY_EVENT.clear()
 
+
+def _notify_admins(text: str, parse_mode: str = "HTML"):
+    """Send a message to all admins (best-effort)."""
+    try:
+        ids = list(ADMIN_USER_IDS) if isinstance(ADMIN_USER_IDS, (list, set, tuple)) else []
+        for uid in ids:
+            try:
+                bot.send_message(int(uid), text, parse_mode=parse_mode, disable_web_page_preview=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _refill_status_text(added: int, dup: int, q_before: int, q_after: int, last_error: str | None):
+    cats = get_selected_category_ids()
+    cats_lbl = f"{len(cats)}" if cats else "0"
+    sorts = (os.environ.get("AE_REFILL_SORTS") or AE_REFILL_SORT or "").strip()
+    err = ""
+    if last_error:
+        try:
+            err = "\n⚠️ <b>שגיאה</b>: <code>" + html.escape(str(last_error)) + "</code>"
+        except Exception:
+            err = "\n⚠️ שגיאה: " + str(last_error)
+    return (
+        "🔄 <b>Refill Affiliate</b>\n"
+        f"📥 לפני: <b>{q_before}</b> | ✅ נוספו: <b>{added}</b> | ♻️ כפולים: <b>{dup}</b> | 📤 אחרי: <b>{q_after}</b>\n"
+        f"🧩 קטגוריות נבחרות: <b>{cats_lbl}</b> | 🧠 AI: <b>{'ON' if _ai_enabled() else 'OFF'}</b>\n"
+        f"🔎 סינון: הזמנות≥<b>{MIN_ORDERS}</b> | דירוג≥<b>{MIN_RATING}</b>% | עמלה≥<b>{MIN_COMMISSION}</b>% | משלוח חינם בלבד: <b>{'כן' if FREE_SHIP_ONLY else 'לא'}</b>\n"
+        f"💱 מטבע מקור: <b>{AE_PRICE_INPUT_CURRENCY}</b> | המרה $→₪: <b>{'כן' if AE_PRICE_CONVERT_USD_TO_ILS else 'לא'}</b> | שער: <b>{float(USD_TO_ILS_RATE):g}</b> | תצוגה: <b>{_display_currency_code()}</b>\n"
+        f"⚙️ REFILL: interval=<b>{AE_REFILL_INTERVAL_SECONDS}s</b> | min_queue=<b>{AE_REFILL_MIN_QUEUE}</b> | page_size=<b>{AE_REFILL_PAGE_SIZE}</b> | max_pages=<b>{AE_REFILL_MAX_PAGES}</b> | sorts=<b>{html.escape(sorts or 'n/a')}</b>"
+        + err
+    )
 # ========= REFILL DAEMON =========
 def refill_daemon():
     if not AE_REFILL_ENABLED:
@@ -6554,8 +6614,17 @@ def refill_daemon():
     print("[INFO] Refill daemon started", flush=True)
 
     while True:
-        # Hard stop: if broadcast is OFF, do not refill (prevents immediate fetch after deploy)
+        # If broadcast is OFF, we pause refill by default (prevents immediate fetch after deploy).
         if not is_broadcast_enabled():
+            # notify admins at most once per 15 minutes
+            try:
+                now = int(time.time())
+                last = _get_state_int('refill_paused_note_ts', 0)
+                if now - last > 900:
+                    _set_state_str('refill_paused_note_ts', str(now))
+                    _notify_admins('⏸️ <b>Refill paused</b> כי שידור כבוי. הפעל שידור כדי לאפשר מילוי אפילייט.')
+            except Exception:
+                pass
             time.sleep(60)
             continue
 
@@ -6565,7 +6634,12 @@ def refill_daemon():
 
             if qlen < AE_REFILL_MIN_QUEUE:
                 need = max(AE_REFILL_MIN_QUEUE - qlen, 30)
+                q_before = qlen
                 added, dup, total_after, last_page, last_error = refill_from_affiliate(max_needed=need)
+                try:
+                    _notify_admins(_refill_status_text(added, dup, q_before, total_after, last_error))
+                except Exception:
+                    pass
 
                 msg = (
                     "🔥 מילוי מהאפילייט הושלם.\n"
