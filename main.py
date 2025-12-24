@@ -315,8 +315,9 @@ AE_PRICE_CONVERT_USD_TO_ILS = _get_state_bool("convert_usd_to_ils", AE_PRICE_CON
 AE_PRICE_DEBUG_DEFAULT = bool(int(os.environ.get("AE_PRICE_DEBUG", "0") or "0"))
 AE_PRICE_DEBUG = _get_state_bool("price_debug", AE_PRICE_DEBUG_DEFAULT)
 
-# Force USD-only pricing mode (no conversions). Default ON to avoid double-conversion / mixed currencies.
-AE_FORCE_USD_ONLY_DEFAULT = (os.environ.get("AE_FORCE_USD_ONLY", "1") or "1").strip().lower() in ("1","true","yes","on")
+# Force USD-only pricing mode (no conversions).
+# Default OFF so admins can enable conversion easily from the bot UI.
+AE_FORCE_USD_ONLY_DEFAULT = (os.environ.get("AE_FORCE_USD_ONLY", "0") or "0").strip().lower() in ("1","true","yes","on")
 AE_FORCE_USD_ONLY = _get_state_bool("force_usd_only", AE_FORCE_USD_ONLY_DEFAULT)
 if AE_FORCE_USD_ONLY:
     AE_PRICE_INPUT_CURRENCY = "USD"
@@ -1806,7 +1807,23 @@ def send_next_locked(source: str = "loop") -> bool:
             log_info(f"{source}: no pending")
             return False
 
-        item = pending[0]
+        # ✅ SAFETY: never broadcast items that haven't passed AI.
+        def _is_done(r: dict) -> bool:
+            st = str((r or {}).get("AIState", "") or "").strip().lower()
+            if st == "done":
+                return True
+            # fallback: if AI filled the fields but AIState wasn't written
+            if str((r or {}).get("Opening", "")).strip() and str((r or {}).get("Title", "")).strip() and str((r or {}).get("Strengths", "")).strip():
+                return True
+            return False
+
+        idx = next((i for i, r in enumerate(pending) if _is_done(r)), None)
+        if idx is None:
+            counts = _count_ai_states(pending)
+            log_info(f"{source}: no AI-ready items (done=0, raw={counts.get('raw',0)}, approved={counts.get('approved',0)})")
+            return False
+
+        item = pending[idx]
         item_id = (item.get("ItemId") or "").strip()
         title = (item.get("Title") or "").strip()[:120]
         log_info(f"{source}: sending ItemId={item_id} | Title={title}")
@@ -1818,12 +1835,14 @@ def send_next_locked(source: str = "loop") -> bool:
             return False
 
         try:
-            write_products(PENDING_CSV, pending[1:])
+            new_pending = pending[:idx] + pending[idx+1:]
+            write_products(PENDING_CSV, new_pending)
         except Exception as e:
             log_info(f"{source}: write FAILED, retry once: {e}")
             time.sleep(0.2)
             try:
-                write_products(PENDING_CSV, pending[1:])
+                new_pending = pending[:idx] + pending[idx+1:]
+                write_products(PENDING_CSV, new_pending)
             except Exception as e2:
                 log_exc(f"{source}: write FAILED permanently: {e2}")
                 return False
@@ -3037,6 +3056,18 @@ def _filters_home_kb():
     ship_lbl = "✅" if FREE_SHIP_ONLY else "❌"
     kb.add(types.InlineKeyboardButton(f"🚚 משלוח חינם לישראל: {ship_lbl}", callback_data="fs_toggle"))
 
+    # Currency / conversion controls
+    conv_lbl = "✅" if (AE_PRICE_INPUT_CURRENCY == "USD" and AE_PRICE_CONVERT_USD_TO_ILS and (not AE_FORCE_USD_ONLY)) else "❌"
+    force_lbl = "✅" if AE_FORCE_USD_ONLY else "❌"
+    kb.add(
+        types.InlineKeyboardButton(f"💲/₪ מטבע מקור: {AE_PRICE_INPUT_CURRENCY}", callback_data="toggle_price_input_currency"),
+        types.InlineKeyboardButton(f"♻️ המרה $→₪: {conv_lbl}", callback_data="toggle_usd2ils_convert"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"🔒 מצב USD בלבד: {force_lbl}", callback_data="toggle_force_usd_only"),
+        types.InlineKeyboardButton(f"💱 שער USD→ILS: {float(USD_TO_ILS_RATE):g}", callback_data="ps_set_rate"),
+    )
+
     cats = get_selected_category_ids()
     cats_lbl = f"{len(cats)} נבחרו" if cats else "ללא"
     kb.add(types.InlineKeyboardButton(f"🧩 קטגוריות: {cats_lbl}", callback_data="fc_menu_0"))
@@ -3478,20 +3509,22 @@ def _translate_query_for_search(q: str) -> str:
     use_gpt = bool(OPENAI_API_KEY) and env_bool("MS_USE_GPT_TRANSLATE", True)
     if use_gpt:
         try:
-            resp = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "Translate Hebrew to short English shopping keywords for AliExpress search. Output ONLY the keywords (no punctuation, no quotes)."},
-                    {"role": "user", "content": q},
-                ],
-                temperature=0,
-                max_tokens=18,
-            )
-            t = (resp.choices[0].message.content or "").strip()
-            t = re.sub(r"[^0-9A-Za-z\s\-]", " ", t).strip()
-            t = re.sub(r"\s+", " ", t).strip()
-            if t:
-                return t
+            client = _get_openai_client()
+            if client:
+                resp = client.chat.completions.create(
+                    model=OPENAI_MODEL_EFFECTIVE,
+                    messages=[
+                        {"role": "system", "content": "Translate Hebrew to short English shopping keywords for AliExpress search. Output ONLY the keywords (no punctuation, no quotes)."},
+                        {"role": "user", "content": q},
+                    ],
+                    temperature=0,
+                    max_tokens=18,
+                )
+                t = (resp.choices[0].message.content or "").strip()
+                t = re.sub(r"[^0-9A-Za-z\s\-]", " ", t).strip()
+                t = re.sub(r"\s+", " ", t).strip()
+                if t:
+                    return t
         except Exception as e:
             try:
                 _logger.info(f"[MS] translate_query failed: {e}")
@@ -3500,16 +3533,94 @@ def _translate_query_for_search(q: str) -> str:
 
     return fallback or q
 
-    return fallback or q
+
+# --- Optional AI query rewrite for manual search (helps recall + precision) ---
+_MS_QUERY_REWRITE_CACHE = {}
+
+def _ms_ai_rewrite_query(q_user: str) -> tuple[str, list[str]]:
+    """Return (query_en, variants) for manual search.
+
+    Uses OpenAI when available to:
+    - translate Hebrew -> concise English shopping keywords
+    - suggest a few close synonyms (English) for better matching/rerank
+
+    Falls back to _translate_query_for_search when AI is unavailable.
+    """
+    q_user = (q_user or "").strip()
+    if not q_user:
+        return q_user, []
+    if q_user in _MS_QUERY_REWRITE_CACHE:
+        return _MS_QUERY_REWRITE_CACHE[q_user]
+
+    # Baseline translation (local + optional GPT)
+    baseline = _translate_query_for_search(q_user)
+    client = _get_openai_client() if (OPENAI_API_KEY and env_bool("MS_USE_GPT_REWRITE", True)) else None
+    if not client:
+        out = (baseline, [baseline] if baseline and baseline != q_user else [])
+        _MS_QUERY_REWRITE_CACHE[q_user] = out
+        return out
+
+    # Ask for short AliExpress keywords + a few tight synonyms (JSON)
+    try:
+        prompt = (
+            "Return STRICT JSON with keys: query_en (string), variants (array of strings).\n"
+            "Task: rewrite the user's query into concise English shopping keywords suitable for AliExpress.\n"
+            "Rules: keep it specific, avoid brands unless user wrote them, 2-4 words, no punctuation.\n"
+            "Variants: 3-6 close synonyms/alternatives in English (no duplicates).\n"
+            f"User query: {q_user}"
+        )
+
+        # Use chat.completions for compatibility
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL_EFFECTIVE,
+            messages=[
+                {"role": "system", "content": "You are a JSON generator."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=120,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        # Extract first JSON object
+        m = re.search(r"\{.*\}", txt, flags=re.DOTALL)
+        obj = json.loads(m.group(0)) if m else json.loads(txt)
+        q_en = str(obj.get("query_en") or "").strip()
+        vars_ = obj.get("variants") or []
+        variants = []
+        for v in (vars_ if isinstance(vars_, list) else []):
+            vv = str(v or "").strip()
+            if vv:
+                variants.append(vv)
+        # sanitize
+        def _clean_en(s: str) -> str:
+            s = re.sub(r"[^0-9A-Za-z\s\-]", " ", s or "").strip()
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+        q_en = _clean_en(q_en) or _clean_en(baseline)
+        variants = [_clean_en(v) for v in variants]
+        variants = [v for v in variants if v and v != q_en]
+        # keep a small list
+        variants = list(dict.fromkeys(variants))[:6]
+        out = (q_en, variants)
+        _MS_QUERY_REWRITE_CACHE[q_user] = out
+        return out
+    except Exception:
+        out = (baseline, [baseline] if baseline and baseline != q_user else [])
+        _MS_QUERY_REWRITE_CACHE[q_user] = out
+        return out
 
 
 def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
     """Keyword match for manual search.
 
-    - strict=True: require ALL tokens of at least one query variant to be present
-    - strict=False: require a minimal hit count (OR-like) for at least one query variant
+    Goal: reduce false negatives without letting in obviously unrelated results.
 
-    Includes a small synonym expansion for common categories (helps Hebrew->English matching).
+    - strict=True: require all *meaningful* tokens of at least one query variant to be present
+    - strict=False: require at least one (or two) token-group hits.
+
+    Notes:
+    - If the product title is Latin and a query variant is Hebrew, we ignore that Hebrew variant.
+    - We drop common stopwords ("for", "with", "house", etc.) so queries like "house slippers" don't fail.
     """
     try:
         t = (title or "").lower()
@@ -3524,6 +3635,27 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
 
         if not q_list:
             return True
+
+        heb_re = re.compile(r"[א-ת]")
+        lat_re = re.compile(r"[a-z]")
+        title_has_hebrew = bool(heb_re.search(t))
+        title_has_latin = bool(lat_re.search(t))
+
+        STOP = {
+            # English
+            "for","with","and","the","a","an","to","of","in","on","at","from","by","set","kit","pack","pcs","pc",
+            "new","hot","best","top","quality","original","sale","shipping","free","fast",
+            # Query-specific noise
+            "house","home","indoor","outdoor","men","man","women","woman","kids","kid","child","children","unisex",
+            "brand","model","size","color","colour","type",
+        }
+
+        def _norm_tok(tok: str) -> str:
+            x = (tok or "").strip().lower()
+            x = re.sub(r"[^0-9a-zA-Zא-ת]+", "", x)
+            if len(x) >= 4 and x.endswith("s") and (not heb_re.search(x)):
+                x = x[:-1]
+            return x
 
         synonyms = {
             # shoes / footwear
@@ -3547,25 +3679,50 @@ def _ms_keyword_match(title: str, queries, strict: bool = True) -> bool:
         }
 
         def token_options(tok: str) -> list[str]:
+            tok = _norm_tok(tok)
+            if not tok or tok in STOP:
+                return []
             opts = [tok]
             opts += synonyms.get(tok, [])
-            return list(dict.fromkeys([o for o in opts if o]))
+            # normalize + dedupe
+            clean = []
+            for o in opts:
+                oo = _norm_tok(o)
+                if oo and oo not in STOP:
+                    clean.append(oo)
+            return list(dict.fromkeys(clean))
+
+        # If title is not Hebrew, ignore Hebrew-only query variants (prevents accidental strict failures)
+        if title_has_latin and (not title_has_hebrew):
+            q_list = [qq for qq in q_list if not heb_re.search(str(qq or ""))] or q_list
 
         for q in q_list:
             qq = (q or "").lower().strip()
             if not qq:
                 continue
 
-            toks = [x for x in re.split(r"[^0-9a-zA-Zא-ת]+", qq) if x]
-            toks = [x for x in toks if len(x) >= 2]
+            toks_raw = [x for x in re.split(r"[^0-9a-zA-Zא-ת]+", qq) if x]
+            toks = []
+            for x in toks_raw:
+                nx = _norm_tok(x)
+                if nx and len(nx) >= 2 and nx not in STOP:
+                    toks.append(nx)
             if not toks:
-                toks = [qq]
+                # fallback to whole query (normalized)
+                nq = _norm_tok(qq)
+                if nq:
+                    toks = [nq]
+                else:
+                    continue
 
             # Build per-token options (synonyms)
             per_tok_opts = [token_options(tok) for tok in toks]
+            per_tok_opts = [opts for opts in per_tok_opts if opts]
+            if not per_tok_opts:
+                continue
 
             if strict:
-                # All tokens must match, but each token can match any of its options
+                # All token-groups must match, but each group can match any of its options
                 if all(any(opt in t for opt in opts) for opts in per_tok_opts):
                     return True
             else:
@@ -3732,6 +3889,13 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     q_user = str(prev.get("q_user") or prev.get("q") or q or "").strip()
     q_api = str(prev.get("q_api") or q or "").strip()
     q_variants = [q_user] + ([q_api] if q_api and q_api != q_user else [])
+    # Extra English variants (synonyms) from AI rewrite (if available)
+    try:
+        extra = prev.get("q_variants_extra") or []
+        if isinstance(extra, list):
+            q_variants += [str(x) for x in extra if str(x or "").strip()]
+    except Exception:
+        pass
 
     # IMPORTANT: For manual search we default to ALL categories (category_id=None),
     # so the keyword is the primary selector.
@@ -3747,7 +3911,7 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
     passed_filters_rows = []  # rows that pass all numeric/link filters (before keyword match)
     keyword_rejected_rows = []  # rows that pass filters but fail strict keyword match
     raw_count = 0
-    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "commission": 0, "free_ship": 0, "other": 0}
+    reasons = {"no_link": 0, "price": 0, "orders": 0, "rating": 0, "commission": 0, "free_ship": 0, "keyword": 0, "other": 0}
 
     for p in (products or []):
         raw_count += 1
@@ -3756,11 +3920,18 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         if ok and len(passed_filters_rows) < 50:
             passed_filters_rows.append(row)
 
-        # Extra strictness: reduce unrelated results (keyword must match title)
-        if ok and not _ms_keyword_match(row.get("Title") or "", q_variants, strict=not relaxed_match):
-            ok, reason = False, "לא תואם מילת החיפוש"
-            if len(keyword_rejected_rows) < 50:
-                keyword_rejected_rows.append(row)
+        # Keyword matching: when AI rerank is enabled and available, don't block on strict tokens.
+        # (AI will score semantic relevance). Otherwise, keep strict matching to reduce noise.
+        ai_on = bool(ms_ai_rerank_enabled() and _ai_enabled())
+        kw_strict = bool((not relaxed_match) and (not ai_on))
+        if ok and not _ms_keyword_match(row.get("Title") or "", q_variants, strict=kw_strict):
+            if ai_on:
+                # keep the item for AI to decide, but mark as partial match
+                reason = "התאמה חלקית למילת החיפוש"
+            else:
+                ok, reason = False, "לא תואם מילת החיפוש"
+                if len(keyword_rejected_rows) < 50:
+                    keyword_rejected_rows.append(row)
 
         if not ok:
             # bucket reasons (best-effort)
@@ -3776,6 +3947,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                 reasons["commission"] += 1
             elif "משלוח" in reason:
                 reasons["free_ship"] += 1
+            elif "מילת החיפוש" in reason:
+                reasons["keyword"] += 1
             else:
                 reasons["other"] += 1
 
@@ -3866,15 +4039,10 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
                     changed += 1
 
             if changed > 0:
-                # Mark session as relaxed so UI can show a hint
-                try:
-                    sess = MANUAL_SEARCH_SESS.get(uid) or {}
-                    sess["relaxed_match"] = True
-                    sess["strict_match"] = False
-                    sess["note"] = "לא נמצאו התאמות מדויקות, מציג התאמות חלקיות."
-                    MANUAL_SEARCH_SESS[uid] = sess
-                except Exception:
-                    pass
+                # Mark this page as relaxed so UI can show a hint
+                sess["relaxed_match"] = True
+                sess["strict_match"] = False
+                sess["note"] = "לא נמצאו התאמות מדויקות, מציג התאמות חלקיות."
 
 
     # Debug log (helps diagnose empty results / filters)
@@ -3882,6 +4050,8 @@ def _ms_fetch_page(uid: int, q: str, page: int, per_page: int = 10, use_selected
         ok_count = sum(1 for it in results if it.get("ok"))
     except Exception:
         ok_count = 0
+
+    sess["ok_count"] = int(ok_count)
 
     _logger.info(
         f"[MS] q_user='{q_user}' q_sent='{q}' page={page} raw={raw_count} ok={ok_count} "
@@ -4137,18 +4307,26 @@ def _ms_start(uid: int, chat_id: int, q: str):
     # Reset session and fetch first page
     _ms_clear(uid)
 
-    # Translate Hebrew queries (optional) so the API has a better chance to match titles
+    # Translate / rewrite query so the API has a better chance to match titles.
+    # If AI is enabled, we also fetch close English variants for better matching.
+    q_api = q
+    q_variants_extra = []
     try:
         ms_translate = env_bool("MS_TRANSLATE_QUERY", True)
         force_translate = any('֐' <= ch <= '׿' for ch in (q or ''))
-        q_api = _translate_query_for_search(q) if (ms_translate or force_translate) else q
+        if (ms_translate or force_translate):
+            q_api, q_variants_extra = _ms_ai_rewrite_query(q)
+        else:
+            q_api = q
     except Exception:
         q_api = q
+        q_variants_extra = []
 
     sess = MANUAL_SEARCH_SESS.get(uid) or {}
     sess["q"] = q
     sess["q_user"] = q
     sess["q_api"] = q_api
+    sess["q_variants_extra"] = q_variants_extra or []
     MANUAL_SEARCH_SESS[uid] = sess
 
     if q_api and q_api != q:
@@ -4709,12 +4887,16 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 def _prod_search_menu_text() -> str:
     # Main menu text for product search (manual)
+    conv_state = "פעיל" if (AE_PRICE_INPUT_CURRENCY == "USD" and AE_PRICE_CONVERT_USD_TO_ILS and (not AE_FORCE_USD_ONLY)) else "כבוי"
+    force_state = "פעיל" if AE_FORCE_USD_ONLY else "כבוי"
     return (
         "🔎 <b>חיפוש מוצרים</b>\n"
         "בחר מצב חיפוש, ועדכן סינונים לפי צורך.\n\n"
         f"📦 מינ׳ הזמנות: <b>{int(MIN_ORDERS)}</b>\n"
         f"⭐ מינ׳ דירוג: <b>{float(MIN_RATING):g}%</b>\n"
         f"💰 מינ׳ עמלה: <b>{float(MIN_COMMISSION):g}%</b>\n"
+        f"💱 מטבע מקור: <b>{AE_PRICE_INPUT_CURRENCY}</b> | המרה $→₪: <b>{conv_state}</b> | מציג: <b>{_display_currency_code()}</b>\n"
+        f"🔒 מצב USD בלבד: <b>{force_state}</b>\n"
         f"🔢 שער USD→ILS: <b>{float(USD_TO_ILS_RATE):g}</b>\n"
         f"🧠 דיוק חיפוש AI: <b>{'פעיל' if ms_ai_rerank_enabled() else 'כבוי'}</b>\n"
     )
@@ -4737,6 +4919,13 @@ def _prod_search_menu_kb():
     kb.add(
         types.InlineKeyboardButton("💰 עמלה", callback_data="ps_comm"),
         types.InlineKeyboardButton("💱 שער המרה", callback_data="ps_set_rate"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💲/₪ מטבע מקור", callback_data="toggle_price_input_currency"),
+        types.InlineKeyboardButton("♻️ המרה $→₪", callback_data="toggle_usd2ils_convert"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🔒 מצב USD בלבד", callback_data="toggle_force_usd_only"),
     )
     kb.add(
         types.InlineKeyboardButton("🧠 דיוק חיפוש AI", callback_data="ms_ai_toggle"),
@@ -4778,7 +4967,7 @@ def _rate_panel_kb() -> "types.InlineKeyboardMarkup":
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
-    global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS
+    global POST_DELAY_SECONDS, CURRENT_TARGET, AE_PRICE_BUCKETS_RAW, AE_PRICE_BUCKETS, AE_PRICE_INPUT_CURRENCY, AE_PRICE_CONVERT_USD_TO_ILS, AE_FORCE_USD_ONLY
 
     if not _is_admin(c):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
@@ -5321,7 +5510,7 @@ def on_inline_click(c):
             return
         ok = send_next_locked("manual")
         if not ok:
-            bot.answer_callback_query(c.id, "אין פריטים בתור או שגיאה בשליחה.", show_alert=True)
+            bot.answer_callback_query(c.id, "אין פריטים מוכנים לשידור (עברו AI) או שגיאה בשליחה.", show_alert=True)
             return
         safe_edit_message(bot, chat_id=chat_id, message=c.message,
                           new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
@@ -5437,10 +5626,32 @@ def on_inline_click(c):
         if AE_PRICE_INPUT_CURRENCY != "USD":
             bot.answer_callback_query(c.id, "כדי להפעיל המרה צריך שמטבע המקור יהיה USD.", show_alert=True)
             return
+        if AE_FORCE_USD_ONLY:
+            bot.answer_callback_query(c.id, "מצב USD בלבד פעיל. כבה אותו כדי לאפשר המרה.", show_alert=True)
+            return
         AE_PRICE_CONVERT_USD_TO_ILS = not bool(AE_PRICE_CONVERT_USD_TO_ILS)
         _set_state_bool("convert_usd_to_ils", AE_PRICE_CONVERT_USD_TO_ILS)
         state_txt = "פעיל" if AE_PRICE_CONVERT_USD_TO_ILS else "כבוי"
         bot.answer_callback_query(c.id, f"המרה $→₪: {state_txt}")
+        if c.message and (c.message.text or "").startswith("🔎"):
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
+        else:
+            safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=inline_menu_text(), reply_markup=inline_menu(), parse_mode="HTML", cb_id=None)
+
+    elif data == "toggle_force_usd_only":
+        # Hard USD-only lock (disables conversion + forces input currency USD)
+        AE_FORCE_USD_ONLY = not bool(AE_FORCE_USD_ONLY)
+        _set_state_bool("force_usd_only", AE_FORCE_USD_ONLY)
+        if AE_FORCE_USD_ONLY:
+            AE_PRICE_INPUT_CURRENCY = "USD"
+            AE_PRICE_CONVERT_USD_TO_ILS = False
+            _set_state_str("price_input_currency", "USD")
+            _set_state_bool("convert_usd_to_ils", False)
+            bot.answer_callback_query(c.id, "מצב USD בלבד: פעיל")
+        else:
+            bot.answer_callback_query(c.id, "מצב USD בלבד: כבוי")
+
+        # Refresh the same screen (search menu vs main menu)
         if c.message and (c.message.text or "").startswith("🔎"):
             safe_edit_message(bot, chat_id=chat_id, message=c.message, new_text=_prod_search_menu_text(), reply_markup=_prod_search_menu_kb(), parse_mode="HTML", cb_id=None)
         else:
@@ -6063,8 +6274,9 @@ def auto_post_loop():
                 DELAY_EVENT.clear()
                 continue
 
-            send_next_locked("auto")
-            DELAY_EVENT.wait(timeout=delay)
+            sent = send_next_locked("auto")
+            # If nothing was sent (e.g., no AI-ready items), poll again sooner.
+            DELAY_EVENT.wait(timeout=(delay if sent else 60))
             DELAY_EVENT.clear()
             continue
 
@@ -6080,8 +6292,8 @@ def auto_post_loop():
             DELAY_EVENT.clear()
             continue
 
-        send_next_locked("loop")
-        DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
+        sent = send_next_locked("loop")
+        DELAY_EVENT.wait(timeout=(POST_DELAY_SECONDS if sent else 60))
         DELAY_EVENT.clear()
 
 # ========= REFILL DAEMON =========
