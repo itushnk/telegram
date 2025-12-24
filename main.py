@@ -2833,10 +2833,6 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     # global dedup history (already sent/queued in the past X days)
     seen_ids, seen_tfps = _dedup_sets()
 
-    
-
-    # cycle-local title-fingerprint dedup (prevents near duplicates within the same refill batch)
-    seen_tfps_cycle: set[str] = set()
     added = 0
     dup = 0
     skipped_no_link = 0
@@ -2933,29 +2929,10 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
         # Strong dedup: same product_id or same normalized title (even if affiliate URL changes)
         item_id = str(row.get("ItemId") or "").strip() or _extract_item_id_from_url(row.get("BuyLink") or "")
         tfp = _title_fingerprint(str(row.get("Title") or ""))
-        # Strong dedup:
-        # - Always dedup by product_id (ItemId) across history.
-        # - Optionally dedup by normalized title fingerprint across history (can be too aggressive).
-        # - Always dedup by title fingerprint within this refill cycle to avoid near-duplicates in the same batch.
-        item_id = str(row.get("ItemId") or "").strip() or _extract_item_id_from_url(row.get("BuyLink") or "")
-        tfp = _title_fingerprint(str(row.get("Title") or ""))
 
-        dedup_title_global = str(os.environ.get("AE_DEDUP_TITLE_FINGERPRINT", "0")).strip() == "1"
-
-        # per-cycle title fingerprint dedup (lighter, prevents duplicates in the same refill)
-        nonlocal seen_tfps_cycle
-        if tfp and tfp in seen_tfps_cycle:
+        if (item_id and item_id in seen_ids) or (tfp and tfp in seen_tfps):
             dup += 1
             return
-
-        if item_id and item_id in seen_ids:
-            dup += 1
-            return
-
-        if dedup_title_global and tfp and tfp in seen_tfps:
-            dup += 1
-            return
-
 
         if not _passes_filters(row):
             return
@@ -2964,9 +2941,8 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
         if item_id:
             seen_ids.add(item_id)
         if tfp:
-            seen_tfps_cycle.add(tfp)
-            if str(os.environ.get("AE_DEDUP_TITLE_FINGERPRINT", "0")).strip() == "1":
-                seen_tfps.add(tfp)
+            seen_tfps.add(tfp)
+
         candidates.append((row, bucket))
         bucket_after_filters[bucket] = bucket_after_filters.get(bucket, 0) + 1
 
@@ -3041,9 +3017,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
         for kw_used in kw_list:
             if len(candidates) >= (max_needed * 5):
                 break
-            start_page = random.randint(1, max(1, safe_int(os.environ.get('AE_REFILL_START_PAGE_MAX', '3'), 3)))
-
-            for page_no in range(start_page, start_page + pages_per_kw):
+            for page_no in range(1, pages_per_kw + 1):
                 last_page = page_no
                 try:
                     if kw_used:
@@ -3155,7 +3129,7 @@ def refill_from_affiliate(max_needed: int, keywords: str | None = None, ignore_s
     # logs for debugging diversity
     try:
         top_buckets = sorted(selected_counts.items(), key=lambda x: x[1], reverse=True)
-        logging.info(f"[REFILL_SUM] need={max_needed} kw_cycle={len(kw_list)} candidates={len(candidates)} selected={len(selected)} added={added} dup={dup} no_link={skipped_no_link} price_skip={skipped_price} min_orders={min_orders} min_rating={min_rating} min_commission={min_commission} free_ship={free_ship_only} price_buckets={AE_PRICE_BUCKETS_RAW} buckets_selected={selected_counts}")
+        logging.info(f"[REFILL] kw_cycle={kw_list} raw_by_bucket={bucket_raw_counts} after_filters={bucket_after_filters} selected={dict(top_buckets)}")
     except Exception:
         pass
 
