@@ -1677,7 +1677,8 @@ def format_post(product):
     if cur_code == "ILS":
         sp = str(product.get("SalePriceILS") or sale_price or "").strip()
         op = str(product.get("OriginalPriceILS") or original_price or "").strip()
-        price_line = f'💰 {price_label}: {sp} ש"ח' + (f' (מחיר מקורי: {op} ש"ח)' if _orig_ok(sp, op) else "")
+        sp_disp = f'<a href="{buy_link_short}">{sp} ש"ח</a>' if buy_link_short else f'{sp} ש"ח'
+        price_line = f'💰 {price_label}: {sp_disp}' + (f' (מחיר מקורי: {op} ש"ח)' if _orig_ok(sp, op) else "")
         # Compute discount from the same prices we display (prevents mismatched %)
         try:
             spv = float(_extract_float(clean_price_text(sp)) or 0.0)
@@ -1692,7 +1693,8 @@ def format_post(product):
     else:
         sp = str(product.get("SalePriceUSD") or sale_price or "").strip()
         op = str(product.get("OriginalPriceUSD") or original_price or "").strip()
-        price_line = f'💰 {price_label}: ${sp}' + (f' (מחיר מקורי: ${op})' if _orig_ok(sp, op) else "")
+        sp_disp = f'<a href="{buy_link_short}">${sp}</a>' if buy_link_short else f'${sp}'
+        price_line = f'💰 {price_label}: {sp_disp}' + (f' (מחיר מקורי: ${op})' if _orig_ok(sp, op) else "")
         # Compute discount from the same prices we display (prevents mismatched %)
         try:
             spv = float(_extract_float(clean_price_text(sp)) or 0.0)
